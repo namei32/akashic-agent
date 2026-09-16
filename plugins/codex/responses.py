@@ -140,13 +140,11 @@ class CodexResponses:
             "model": self._descriptor.model,
             "instructions": instructions,
             "input": messages,
-            "extra_body": {
-                "client_metadata": {
-                    "x-codex-installation-id": self._installation_id,
-                    "session-id": self._session_id,
-                    "thread-id": self._thread_id,
-                    "x-codex-window-id": self._window_id,
-                }
+            "client_metadata": {
+                "x-codex-installation-id": self._installation_id,
+                "session-id": self._session_id,
+                "thread-id": self._thread_id,
+                "x-codex-window-id": self._window_id,
             },
             "tool_choice": tool_choice,
             "parallel_tool_calls": bool(
@@ -157,8 +155,8 @@ class CodexResponses:
             "stream": True,
             "include": ["reasoning.encrypted_content"],
         }
-        if request.max_output_tokens > 0:
-            payload["max_output_tokens"] = request.max_output_tokens
+        # The ChatGPT Codex backend rejects max_output_tokens. Its model
+        # service owns the output limit; this is not the public Responses API.
         reasoning: dict[str, str] = {}
         if self._descriptor.reasoning_effort and not request.disable_reasoning:
             reasoning["effort"] = _normalize_effort(

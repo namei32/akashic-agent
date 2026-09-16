@@ -22,11 +22,14 @@ async def test_frozen_request_can_be_estimated_and_sent(lite):
         "required": ["city"],
     }
     tools = [{"type": "function", "function": {"name": "weather", "parameters": schema}}]
-    request = ModelRequest(messages=messages, tools=tools)
+    request = ModelRequest(messages=messages, tools=tools, max_output_tokens=512)
     sent = []
 
     def handle(wire_request):
         sent.append(json.loads(wire_request.content))
+        assert "extra_body" not in sent[-1]
+        assert "max_output_tokens" not in sent[-1]
+        assert sent[-1]["client_metadata"]["session-id"] == wire_request.headers["session-id"]
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
