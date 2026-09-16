@@ -174,20 +174,22 @@ class CodexResponses:
             payload["tools"] = tools
         if request.prompt_cache_key or self._thread_id:
             payload["prompt_cache_key"] = request.prompt_cache_key or self._thread_id
-        return payload, previous_items
+        # ModelRequest freezes nested messages and tool schemas. HTTP JSON
+        # encoders need plain containers, while the original request stays frozen.
+        return _thaw(payload), previous_items
 
     def estimate_context_tokens(
         self,
         messages: Sequence[Mapping[str, Any]],
         tools: Sequence[Mapping[str, Any]] = (),
     ) -> int:
-        return max(1, len(json.dumps([messages, tools], ensure_ascii=False)) // 4)
+        return max(1, len(json.dumps(_thaw([messages, tools]), ensure_ascii=False)) // 4)
 
     def estimate_appended_message_tokens(
         self,
         messages: Sequence[Mapping[str, Any]],
     ) -> int:
-        return max(1, len(json.dumps(list(messages), ensure_ascii=False)) // 4)
+        return max(1, len(json.dumps(_thaw(messages), ensure_ascii=False)) // 4)
 
 
 class _CallbackError(RuntimeError):
@@ -500,7 +502,7 @@ def _responses_lite_input(
                 "content": [{"type": "input_text", "text": instructions}],
             }
         )
-    copied = cast(list[dict[str, Any]], json.loads(json.dumps(messages)))
+    copied = cast(list[dict[str, Any]], _thaw(messages))
     for item in copied:
         content = item.get("content")
         if isinstance(content, list):
