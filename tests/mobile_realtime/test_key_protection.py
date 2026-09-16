@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import secrets
@@ -117,7 +118,7 @@ def test_encrypted_blob_binds_header_aad_and_tag() -> None:
         )
 
 
-def test_keyset_never_writes_plaintext_private_keys_and_loads_via_memfd(
+def test_keyset_never_writes_plaintext_private_keys_and_loads_from_memory(
     tmp_path: Path,
 ) -> None:
     keys = _EphemeralMasterKeys()
@@ -134,6 +135,38 @@ def test_keyset_never_writes_plaintext_private_keys_and_loads_via_memfd(
         if path.is_file():
             assert b"BEGIN PRIVATE KEY" not in path.read_bytes()
             assert os.stat(path).st_mode & 0o777 == 0o600
+
+
+@pytest.mark.asyncio
+async def test_memory_loaded_key_completes_verified_tls_handshake(tmp_path: Path) -> None:
+    keyset = KeysetManager(tmp_path / "keys", _EphemeralMasterKeys()).initialize(
+        lan_hostname="127.0.0.1"
+    )
+    context = create_server_ssl_context(keyset)
+    finished = asyncio.Event()
+
+    async def handle(_reader, writer):
+        try:
+            writer.write(b"mobile-ready")
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            finished.set()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0, ssl=context)
+    async with server:
+        port = server.sockets[0].getsockname()[1]
+        trust = ssl.create_default_context(cafile=str(keyset.tls_certificate_path))
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection("127.0.0.1", port, ssl=trust), timeout=5,
+        )
+        try:
+            assert await asyncio.wait_for(reader.read(), timeout=5) == b"mobile-ready"
+        finally:
+            writer.close()
+            await writer.wait_closed()
+        await asyncio.wait_for(finished.wait(), timeout=5)
 
 
 def test_keyset_rotation_keeps_public_identity_and_old_version(tmp_path: Path) -> None:

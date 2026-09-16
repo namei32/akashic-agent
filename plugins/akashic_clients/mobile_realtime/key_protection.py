@@ -12,6 +12,7 @@ import shutil
 import ssl
 import stat
 import struct
+import sys
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -617,30 +618,46 @@ class KeysetManager:
 
 
 def create_server_ssl_context(keyset: LoadedKeyset) -> ssl.SSLContext:
-    """只通过 Linux memfd 把解密后的 TLS 私钥交给 OpenSSL。"""
+    """通过 Linux memfd 或 macOS 匿名管道把私钥交给 OpenSSL，不落明文文件。"""
 
-    if not Path("/proc/self/fd").is_dir():
-        raise KeyProtectionError("当前平台不支持 TLS 私钥 memfd 加载")
     private_bytes = bytearray(_serialize_private_key(keyset.tls_private_key))
     fd = -1
+    writer_fd = -1
     try:
-        fd = _create_memfd("akasic-mobile-tls-key")
-        os.fchmod(fd, 0o600)
-        with os.fdopen(os.dup(fd), "wb", closefd=True) as stream:
-            _ = stream.write(private_bytes)
-            stream.flush()
-            os.fsync(stream.fileno())
+        if sys.platform == "darwin" and Path("/dev/fd").is_dir():
+            # A P-256 PEM fits in one atomic pipe write. Close the writer so
+            # OpenSSL sees EOF; /dev/fd duplicates this process's read handle.
+            fd, writer_fd = os.pipe()
+            if len(private_bytes) > os.fpathconf(writer_fd, "PC_PIPE_BUF"):
+                raise KeyProtectionError("TLS 私钥超过匿名管道的原子写入范围")
+            if os.write(writer_fd, private_bytes) != len(private_bytes):
+                raise KeyProtectionError("TLS 私钥未完整写入匿名管道")
+            os.close(writer_fd)
+            writer_fd = -1
+            key_path = f"/dev/fd/{fd}"
+        elif Path("/proc/self/fd").is_dir():
+            fd = _create_memfd("akasic-mobile-tls-key")
+            os.fchmod(fd, 0o600)
+            with os.fdopen(os.dup(fd), "wb", closefd=True) as stream:
+                _ = stream.write(private_bytes)
+                stream.flush()
+                os.fsync(stream.fileno())
+            key_path = f"/proc/self/fd/{fd}"
+        else:
+            raise KeyProtectionError("当前平台不支持 TLS 私钥内存加载")
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(
             certfile=str(keyset.tls_certificate_path),
-            keyfile=f"/proc/self/fd/{fd}",
+            keyfile=key_path,
         )
         return context
     except (OSError, ssl.SSLError) as error:
         raise KeyProtectionError(f"LAN TLS SSLContext 初始化失败: {error}") from error
     finally:
         _zeroize(private_bytes)
+        if writer_fd != -1:
+            os.close(writer_fd)
         if fd != -1:
             os.close(fd)
 
