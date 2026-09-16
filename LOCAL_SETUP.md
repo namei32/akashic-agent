@@ -1,7 +1,17 @@
 # 本机学习与开发
 
 本次安装使用 macOS、Python 3.12 和独立虚拟环境。Web 入口为
-<http://127.0.0.1:2236>，仅供本机访问。
+<http://127.0.0.1:2238>，仅供本机访问。旧 SSH 隧道使用 2236，另一个现有服务使用
+2237，因此学习版独立使用 2238。
+
+网页导航现在包含“对话”“工作台”“知识与运行”“模型”：
+
+- 工作台：<http://127.0.0.1:2238/#workbench>，读取会话和消息记录。
+- 知识与运行：<http://127.0.0.1:2238/#runtime>，读取文档、能力目录和定时任务。
+- 模型管理：<http://127.0.0.1:2238/#models>。
+
+已补充安装 `scheduler`、`workbench-ui`、`runtime-ui`。没有配置外部 MCP、Skills
+或定时任务时，相应目录为空属于正常状态。
 
 ## 仓库与分支
 
@@ -15,26 +25,59 @@
 
 ## 启动、停止与日志
 
-在终端运行以下脚本可前台启动；退出时按 Ctrl+C：
+服务由当前用户的 macOS LaunchAgent 管理，登录后自动启动，进程退出后自动重启。
+查看进程及 Web 就绪状态：
 
 ```bash
-"$HOME/.local/share/akashic-learning/start.sh"
+"$HOME/.local/share/akashic-learning/service.sh" status
 ```
 
-停止后台运行的学习实例，在仓库根目录执行：
+统一启停入口：
 
 ```bash
-.venv/bin/python "$HOME/.local/share/akashic-learning/stop.py"
+"$HOME/.local/share/akashic-learning/service.sh" start
+"$HOME/.local/share/akashic-learning/service.sh" stop
+"$HOME/.local/share/akashic-learning/service.sh" restart
 ```
 
-查看本次后台启动日志：
+`stop` 暂停当前登录期间的服务，下次登录仍自动启动。要同时取消自动启动：
 
 ```bash
-tail -n 60 "$HOME/.local/share/akashic-learning/logs/runtime.log"
+"$HOME/.local/share/akashic-learning/service.sh" disable
 ```
 
-这些脚本位于本机数据目录，记录了当前源码目录的位置；移动源码目录时也要调整
-`start.sh` 中的 `cd` 路径。本次没有配置开机自动启动。
+再次执行 `start` 会重新启用自动启动。不要用单纯杀进程来停服，否则 launchd 会将它拉起。
+
+查看实时日志：
+
+```bash
+"$HOME/.local/share/akashic-learning/service.sh" logs
+```
+
+按 Ctrl+C 仅停止查看日志。需要前台调试时，先用 `service.sh stop` 停止常驻服务，
+然后运行 `$HOME/.local/share/akashic-learning/start.sh`。
+
+这些脚本位于本机数据目录，记录了当前源码目录的位置；移动源码目录时，需要同步调整
+脚本及 LaunchAgent 的工作目录。LaunchAgent 文件为
+`$HOME/Library/LaunchAgents/io.namei.akashic-learning.plist`。
+
+## 持续运行的范围
+
+- 原有 Akashic Supervisor 管理内部 Gateway；launchd 管理 Supervisor 进程。
+- `KeepAlive=true` 在进程退出后重新启动，`ThrottleInterval=10` 避免频繁启动循环。
+- 关闭浏览器、终端或 Codex 不影响服务；退出 macOS 用户会话后会停止，下次登录恢复。
+- 当前保留系统休眠设置。睡眠、合盖、关机、断电、网络中断或模型认证失效，仍可能中断使用。
+- 若要接通电源时防止系统自动休眠，可将本机 `service.json` 中的
+  `keep_awake_on_ac` 改为 `true`，然后 `service.sh restart`。它使用系统
+  `caffeinate -s`，只在该进程运行且接通电源时生效，不阻止屏幕熄灭。
+- launchd 负责退出恢复，不能判断所有“进程仍在但功能卡住”的情况；`service.sh status`
+  会额外检查 HTTP 就绪状态。需要脱离电脑状态的 24 小时服务，应部署到常开设备或 Linux 服务器。
+
+系统机制参考：<https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html>。
+
+2026-09-16 已验证：工作台会话与消息读取、三个运行目录接口、`service.sh restart`，
+以及向托管进程发送 SIGTERM 后由 launchd 自动拉起；本次约 4.2 秒恢复 Web 和聊天就绪。
+恢复证据保存在本机 `service-recovery-check.json`。
 
 ## 数据与模型
 
@@ -43,6 +86,7 @@ tail -n 60 "$HOME/.local/share/akashic-learning/logs/runtime.log"
 | 路径 | 内容 |
 | --- | --- |
 | `config.toml` | Core 配置 |
+| `service.json` | 本机端口及接电防休眠选项 |
 | `workspace/` | 会话、记忆、模型配置和插件数据 |
 | `plugin-home/` | 安装的插件制品与清单 |
 | `releases/` | 固定提交构建出的插件 bundle 和 Web 资源 |
