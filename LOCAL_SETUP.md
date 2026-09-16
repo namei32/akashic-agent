@@ -10,6 +10,8 @@
 - 知识与运行：<http://127.0.0.1:2238/#runtime>，读取文档、能力目录和定时任务。
 - 模型管理：<http://127.0.0.1:2238/#models>。
 
+Android 配对步骤见 [MOBILE_SETUP.md](MOBILE_SETUP.md)。本机移动网关已按 Tailscale 私有网络配置。
+
 已补充安装 `scheduler`、`workbench-ui`、`runtime-ui`。没有配置外部 MCP、Skills
 或定时任务时，相应目录为空属于正常状态。
 
