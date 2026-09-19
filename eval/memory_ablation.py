@@ -7,6 +7,7 @@ from agent.plugin_composition import CHAT_MODELS,EMBEDDINGS,ModelRequest
 from agent.plugins.snapshot import lease_runtime_snapshot
 from eval.longmemeval.runtime import create_runtime,close_runtime
 from eval.longmemeval.ingest import ingest_instance
+from eval.longmemeval.dataset import LMEInstance
 from session.embedding_store import MessageEmbeddings
 from session.message import ContentPart,Input,Output
 
@@ -41,11 +42,9 @@ async def trial(args):
     task=json.loads(args.task.read_text())
     if task['benchmark']=='longmemeval':
         from eval.longmemeval.dataset import load_dataset
-        from eval.longmemeval.qa_runner import run_qa_instance
         instance=load_dataset(task['input'])[0]
     else:
         from eval.personamem.dataset import load_dataset
-        from eval.personamem.qa_runner import run_qa_instance
         instance=load_dataset(task['input'],args.contexts)[0]
     assert instance.question_id==task['id']
     started=time.monotonic();rt=None
@@ -54,12 +53,18 @@ async def trial(args):
         t=time.monotonic();rt=await create_runtime(args.config,args.workspace)
         result['timings']['runtime_start_s']=time.monotonic()-t
         async with lease_runtime_snapshot(rt.core.plugin_manager.snapshot_store) as snapshot:
+            assert snapshot.composition_root is not None
             descriptor=snapshot.composition_root.context.require(EMBEDDINGS).describe()
         t=time.monotonic();result['history_messages']=await ingest_instance(rt,instance)
         result['embedding_cache']=seed_history_embeddings(rt,args.cache,model=descriptor.identity,dimension=descriptor.dimensions)
         result['timings']['history_import_and_seed_s']=time.monotonic()-t
         t=time.monotonic();await rt.start();result['timings']['start_consumers_s']=time.monotonic()-t
-        row=await run_qa_instance(rt,instance,timeout_s=300)
+        if isinstance(instance,LMEInstance):
+            from eval.longmemeval.qa_runner import run_qa_instance as run_lme
+            row=await run_lme(rt,instance,timeout_s=300)
+        else:
+            from eval.personamem.qa_runner import run_qa_instance as run_persona
+            row=await run_persona(rt,instance,timeout_s=300)
         result['qa']=row;result['timings']['qa_s']=row['elapsed_s']
         result['error']=row['error']
         if not result['error']:
@@ -68,12 +73,14 @@ async def trial(args):
                 label=extract_option_label(row['predicted_answer'],row['all_options'])
                 result['predicted_label']=label;result['correct']=label==row['gold_answer']
             else:
+                assert isinstance(instance,LMEInstance)
                 tree=ast.parse(args.judge.read_text())
                 fn=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='get_anscheck_prompt')
                 namespace={};exec(compile(ast.Module(body=[fn],type_ignores=[]),str(args.judge),'exec'),namespace)
                 prompt=namespace['get_anscheck_prompt'](instance.question_type,instance.question,instance.answer,row['predicted_answer'],abstention=instance.question_id.endswith('_abs'))
                 t=time.monotonic()
                 async with lease_runtime_snapshot(rt.core.plugin_manager.snapshot_store) as snapshot:
+                    assert snapshot.composition_root is not None
                     async with snapshot.composition_root.context.require(CHAT_MODELS).execution() as execution:
                         reply=await asyncio.wait_for(execution.chat('default').complete(ModelRequest(messages=({'role':'user','content':prompt},),max_output_tokens=10)),60)
                 result['timings']['judge_s']=time.monotonic()-t
