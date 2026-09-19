@@ -204,6 +204,7 @@ async def _consume_stream(
 ) -> LLMResponse:
     content: list[str] = []
     thinking: list[str] = []
+    text_parts: dict[tuple[str, str, int], list[str]] = {}
     tool_args: dict[str, dict[str, str]] = {}
     new_items: list[dict[str, Any]] = []
     usage: ModelUsage | None = None
@@ -226,16 +227,18 @@ async def _consume_stream(
             event_type = str(event.get("type") or "")
             delta = event.get("delta")
             if event_type == "response.output_text.delta" and isinstance(delta, str):
+                text_parts.setdefault(_text_part_key(event), []).append(delta)
                 content.append(delta)
                 delta_seen = True
                 await _emit(request.on_delta, {"content_delta": delta})
             elif event_type == "response.output_text.done":
                 delta_seen = (
                     await _append_done(
-                        content,
+                        text_parts.setdefault(_text_part_key(event), []),
                         event.get("text"),
                         request.on_delta,
                         "content_delta",
+                        aggregate=content,
                     )
                     or delta_seen
                 )
@@ -243,16 +246,18 @@ async def _consume_stream(
                 "response.reasoning_summary_text.delta",
                 "response.reasoning_text.delta",
             } and isinstance(delta, str):
+                text_parts.setdefault(_text_part_key(event), []).append(delta)
                 thinking.append(delta)
                 delta_seen = True
                 await _emit(request.on_delta, {"thinking_delta": delta})
-            elif event_type == "response.reasoning_summary_text.done":
+            elif event_type in {"response.reasoning_summary_text.done", "response.reasoning_text.done"}:
                 delta_seen = (
                     await _append_done(
-                        thinking,
+                        text_parts.setdefault(_text_part_key(event), []),
                         event.get("text"),
                         request.on_delta,
                         "thinking_delta",
+                        aggregate=thinking,
                     )
                     or delta_seen
                 )
@@ -342,11 +347,23 @@ async def _emit(
         raise _CallbackError(exc) from exc
 
 
+def _text_part_key(event: Mapping[str, Any]) -> tuple[str, str, int]:
+    """A done event finalizes one content/summary part, never the whole response."""
+    family = str(event.get("type") or "").rsplit(".", 1)[0]
+    identity = str(event.get("item_id") or event.get("output_index", ""))
+    index = event.get("summary_index", 0) if "summary" in family else event.get("content_index", 0)
+    if type(index) is not int or index < 0:
+        raise TransportError("Codex Responses text part index 无效")
+    return family, identity, index
+
+
 async def _append_done(
     target: list[str],
     done: object,
     callback: Callable[[dict[str, str]], Awaitable[None]] | None,
     key: str,
+    *,
+    aggregate: list[str] | None = None,
 ) -> bool:
     current = "".join(target)
     if isinstance(done, str):
@@ -355,6 +372,8 @@ async def _append_done(
         suffix = done[len(current) :]
         if suffix:
             target.append(suffix)
+            if aggregate is not None:
+                aggregate.append(suffix)
             await _emit(callback, {key: suffix})
             return True
     return False
