@@ -5,6 +5,7 @@ from __future__ import annotations
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Literal
 
 from .domain.model import MemoryConfig
 
@@ -18,6 +19,7 @@ class AkashaConfig:
     frozen_history_path: str = "memory/akasha-frozen-history.json"
     inject_max_chars: int = 12_000
     context_recall_limit: int = 40
+    retrieval_mode: Literal["full", "dense", "none"] = "full"
     restart: float = 0.25
     tolerance: float = 1e-7
     learning_rate: float = 0.5
@@ -35,6 +37,8 @@ class AkashaConfig:
             raise ValueError("inject_max_chars must be positive")
         if not 1 <= self.context_recall_limit <= 40:
             raise ValueError("context_recall_limit must be in [1, 40]")
+        if self.retrieval_mode not in {"full", "dense", "none"}:
+            raise ValueError("invalid retrieval_mode")
         self.memory_config()
 
     def memory_config(self) -> MemoryConfig:

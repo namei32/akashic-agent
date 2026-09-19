@@ -73,6 +73,18 @@ class Config(BaseModel):
     model_config = ConfigDict(extra="forbid")
     max_steps: int = Field(default=40, strict=True, ge=0)
     max_output_tokens: int = Field(default=4096, gt=0)
+    allowed_tool_names: tuple[str, ...] | None = None
+
+
+def restrict_tools(refs: tuple[object, ...], allowed: tuple[str, ...] | None) -> tuple[object, ...]:
+    """Restrict the actual execution view, including tool-search discovery."""
+    if allowed is None:
+        return refs
+    names = {getattr(ref, "name", None) for ref in refs}
+    missing = set(allowed) - names
+    if missing:
+        raise ValueError(f"Configured reply tools are unavailable: {sorted(missing)}")
+    return tuple(ref for ref in refs if getattr(ref, "name", None) in allowed)
 
 
 async def apply(ctx: Context) -> None:
@@ -135,7 +147,8 @@ async def apply(ctx: Context) -> None:
         if command is not None:
             return command
         tools = ctx.require(TOOLS)
-        view = tools.view(*ctx.require(ALL_TOOLS)().refs, *ctx.require(TOOL_SEARCH_TOOLS).refs)
+        refs = (*ctx.require(ALL_TOOLS)().refs, *ctx.require(TOOL_SEARCH_TOOLS).refs)
+        view = tools.view(*restrict_tools(refs, config.allowed_tool_names))
 
         async def authorize(binding_id: str, arguments: Mapping[str, object]) -> Mapping[str, object]:
             return {"source": source, "session_id": reader.session_id}

@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from .learning import Learning
 
 Text = Annotated[str, Field(min_length=1)]
+RetrievalMode = Literal["full", "dense", "none"]
 
 
 class ContextSource(BaseModel):
@@ -65,6 +66,7 @@ class Recall(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
     version: Literal[1] = 1
+    retrieval_mode: RetrievalMode = "full"
     learning_binding: Text
     graph_version: Annotated[int, Field(ge=0)]
     source: Annotated[ContextSource | ToolSource | ProgramSource, Field(discriminator="kind")]
@@ -132,12 +134,12 @@ class RecallRecords(RecallRecordsRead):
 
 
 def select_hits(
-    turns: list[Turn], state: Consumption, ticket: RetrievalTicket, cue: Turn,
+    turns: list[Turn], state: Consumption, ticket: RetrievalTicket | None, cue: Turn,
     *, inhibited: set[int], limit: int, strong: bool = False,
     time_start: datetime | None = None, time_end: datetime | None = None,
 ) -> tuple[Hit, ...]:
     """保留精确向量和联想两条通道，输出引用覆盖已学习的全部成员。"""
-    if ticket.state_version != len(turns):
+    if ticket is not None and ticket.state_version != len(turns):
         raise ValueError("召回票据与用于选择来源的图版本不一致")
     if not 1 <= limit <= 40:
         raise ValueError("召回 limit 必须在 1 到 40 之间")
@@ -169,7 +171,11 @@ def select_hits(
             if scores:
                 dense.append((max(scores), turn.node_id))
     dense.sort(key=lambda item: (-item[0], item[1]))
-    selected = [hit(turns[node], score, "dense", ("direct_dense",)) for score, node in dense[:min(5, limit)]]
+    dense_limit = limit if ticket is None else min(5, limit)
+    selected = [hit(turns[node], score, "dense", ("direct_dense",)) for score, node in dense[:dense_limit]]
+    if ticket is None:
+        # Dense baseline keeps cosine rank and shares the same text budget.
+        return tuple(selected)
     direct = {item.node_id for item in selected}
 
     # 2. 联想沿真实 ticket 顺序填充，与精确通道去重后才应用展示时间排序。
@@ -191,6 +197,7 @@ def query_memory(
     cycle: MemoryCycle, state: Consumption, *, learning_binding: str,
     text: str, dense: np.ndarray | None, stamp: datetime,
     source: ContextSource | ToolSource | ProgramSource, limit: int,
+    retrieval_mode: RetrievalMode = "full",
 ) -> Recall:
     """Context、工具与独立程序使用相同图查询；临时 cue 不写回学习状态。"""
     gap = None if not cycle.turns else (stamp - datetime.fromisoformat(cycle.turns[-1].committed_at)).total_seconds()
@@ -205,6 +212,16 @@ def query_memory(
         assistant_dense=None, user_terms=tuple(sorted(tokenize(text).items())), assistant_terms=(),
         inter_gap_seconds=gap,
     )
+    if retrieval_mode not in {"full", "dense", "none"}:
+        raise ValueError("invalid retrieval_mode")
+    if retrieval_mode != "full":
+        hits = (() if retrieval_mode == "none" else select_hits(
+            cycle.turns, state, None, cue, inhibited=cycle.inhibited_nodes, limit=limit))
+        return Recall(
+            retrieval_mode=retrieval_mode, learning_binding=learning_binding,
+            graph_version=cycle.state_version, source=source, timestamp=stamp,
+            limit=limit, hits=hits, active_basin_count=0, pushes=0, residual_l1=0.0,
+        )
     ticket = cycle.retrieve(cue)
     hits = select_hits(cycle.turns, state, ticket, cue, inhibited=cycle.inhibited_nodes, limit=limit)
     return Recall(

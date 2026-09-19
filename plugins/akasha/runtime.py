@@ -18,7 +18,7 @@ from .learning import AKASHA_LEARNING, Learning, LearningConfig
 from .application.cycle import MemoryCycle
 from .infrastructure.consumption import Consumption
 from .projection import input_features
-from .recalls import ContextSource, RecallRecords, query_memory, render_materials
+from .recalls import ContextSource, RecallRecords, RetrievalMode, query_memory, render_materials
 from .recall_tool import tool_references
 from .infrastructure.frozen_history import FrozenHistory
 
@@ -47,6 +47,7 @@ class MessageMemory:
         embeddings: MessageEmbeddings, bindings: Bindings, learning_binding: str,
         records: RecallRecords, embed_batch: Callable[[list[str]], Awaitable[list[list[float]]]],
         limit: int = 40, max_chars: int = 12000,
+        retrieval_mode: RetrievalMode = "full",
         frozen_history: FrozenHistory | None = None,
     ):
         if not 1 <= limit <= 40 or max_chars <= 0:
@@ -60,6 +61,7 @@ class MessageMemory:
         self._embed_batch = embed_batch
         self._limit = limit
         self._max_chars = max_chars
+        self._retrieval_mode: RetrievalMode = retrieval_mode
         self._frozen_history = frozen_history
         self._lock = asyncio.Lock()
         self._closing = False
@@ -108,6 +110,7 @@ class MessageMemory:
                     learning_binding=self._learning_binding, learning=learning, rule=rule,
                     records=self._records, embed_batch=self._embed_batch,
                     limit=self._limit, max_chars=self._max_chars,
+                    retrieval_mode=self._retrieval_mode,
                     frozen_history=self._frozen_history,
                 )
 
@@ -118,6 +121,7 @@ async def prepare_materials(
     learning_binding: str, learning: Learning, rule: LearningConfig, records: RecallRecords,
     embed_batch: Callable[[list[str]], Awaitable[list[list[float]]]], limit: int, max_chars: int,
     frozen_history: FrozenHistory | None = None,
+    retrieval_mode: RetrievalMode = "full",
 ) -> MaterialData:
     """在已核对空间的图上查询真实输入前缀，发布出处后交付材料。"""
     if not snapshot:
@@ -166,6 +170,7 @@ async def prepare_materials(
                 catalog=catalog, embeddings=embeddings, learning_binding=learning_binding,
                 learning=learning, rule=rule, records=records, embed_batch=embed_batch,
                 limit=limit, max_chars=max_chars,
+                retrieval_mode=retrieval_mode,
             )
     references = {cast(str, ref["ref"]): ref for ref in _reference_rows(material)}
     # 同一消息有多次真实查询时，当前工具结果的精确出处供后续 Citation 使用。
@@ -182,6 +187,7 @@ async def query_inputs(
     embeddings: MessageEmbeddings, learning_binding: str, learning: Learning,
     rule: LearningConfig, records: RecallRecords,
     embed_batch: Callable[[list[str]], Awaitable[list[list[float]]]], limit: int, max_chars: int,
+    retrieval_mode: RetrievalMode = "full",
 ) -> MaterialData:
     """真实用户输入首次准备时检索并保存结果，包括未命中。"""
     session_id = snapshot[0].session_id
@@ -203,6 +209,7 @@ async def query_inputs(
     recall = await run_memory_job(lambda: query_memory(
         cycle, state, learning_binding=learning_binding,
         text=text, dense=dense, stamp=stamp, source=origin, limit=limit,
+        retrieval_mode=retrieval_mode,
     ))
     material = render_materials(identity, recall, learning, catalog, max_chars=max_chars)
     recall = recall.model_copy(update={

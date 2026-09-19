@@ -68,6 +68,7 @@ class Config(BaseModel):
     frozen_history_path: str = AkashaConfig.frozen_history_path
     inject_max_chars: int = AkashaConfig.inject_max_chars
     context_recall_limit: int = AkashaConfig.context_recall_limit
+    retrieval_mode: Literal["full", "dense", "none"] = AkashaConfig.retrieval_mode
     restart: float = AkashaConfig.restart
     tolerance: float = AkashaConfig.tolerance
     learning_rate: float = AkashaConfig.learning_rate
@@ -289,6 +290,7 @@ async def apply(ctx: Context) -> None:
                         bindings=bindings, learning_binding=identity, learning=selected, rule=rule,
                         records=query_records, embed_batch=embedder(rule, model_id),
                         limit=settings.context_recall_limit, max_chars=settings.inject_max_chars,
+                        retrieval_mode=settings.retrieval_mode,
                         frozen_history=frozen_history,
                     )
         except EmbeddingSpaceMismatchError as error:
@@ -355,6 +357,7 @@ async def apply(ctx: Context) -> None:
             catalog=ctx.require(MESSAGE_CATALOG), embeddings=ctx.require(MESSAGE_EMBEDDINGS),
             bindings=bindings, select_learning=select, records=records(),
             open_embedding=partial(open_saved_embedding, bindings), max_chars=settings.inject_max_chars,
+            retrieval_mode=settings.retrieval_mode,
             frozen_history=frozen_history,
         )
 
@@ -401,6 +404,7 @@ async def apply(ctx: Context) -> None:
                 embed_batch=embedder(rule, model_id), limit=settings.context_recall_limit,
                 frozen_history=frozen_history,
                 max_chars=settings.inject_max_chars,
+                retrieval_mode=settings.retrieval_mode,
             )
             # 2. 新选择必须与已有图一致；失败先归还 writer，绝不自动重建。
             try:

@@ -23,7 +23,7 @@ from .application.consumer import run_memory_job
 from .application.snapshot import read_memory
 from .domain.model import MemoryConfig
 from .learning import AKASHA_LEARNING, Learning, LearningConfig
-from .recalls import ProgramSource, Recall, RecallRecords, ToolSource, query_memory, render_materials
+from .recalls import ProgramSource, Recall, RecallRecords, RetrievalMode, ToolSource, query_memory, render_materials
 from .infrastructure.frozen_history import FrozenHistory
 
 
@@ -45,6 +45,7 @@ class PreparedRecall(RecallArguments):
     learning_binding: str = Field(min_length=1)
     embedding_binding: str = Field(min_length=1)
     max_chars: int = Field(gt=0)
+    retrieval_mode: RetrievalMode = "full"
 
 
 class RecallReference(BaseModel):
@@ -109,6 +110,7 @@ class RecallTool:
         select_learning: Callable[[], tuple[str, str]], records: RecallRecords,
         open_embedding: Callable[[str], AbstractAsyncContextManager[BoundEmbeddingModel]],
         max_chars: int = 12000, frozen_history: FrozenHistory | None = None,
+        retrieval_mode: RetrievalMode = "full",
     ):
         if max_chars <= 0:
             raise ValueError("召回文本预算必须为正")
@@ -122,6 +124,7 @@ class RecallTool:
         self._records = records
         self._open_embedding = open_embedding
         self._max_chars = max_chars
+        self._retrieval_mode: RetrievalMode = retrieval_mode
         self._frozen_history = frozen_history
 
     async def prepare(
@@ -139,7 +142,8 @@ class RecallTool:
         return PreparedRecall(**request.model_dump(), source=origin,
                               learning_binding=binding,
                               embedding_binding=model_id,
-                              max_chars=self._max_chars).model_dump(mode="json")
+                              max_chars=self._max_chars,
+                              retrieval_mode=self._retrieval_mode).model_dump(mode="json")
 
     async def invoke(self, key: str, arguments: Mapping[str, object]) -> Result:
         """缺少原查询时才嵌入和读图；发布成功的重试返回原材料。"""
@@ -175,6 +179,7 @@ class RecallTool:
                 recall = await run_memory_job(lambda: query_memory(
                     cycle, state, learning_binding=request.learning_binding, text=request.query,
                     dense=dense, stamp=stamp, source=source, limit=request.limit,
+                    retrieval_mode=request.retrieval_mode,
                 ))
             # 2. 材料和呈现出处固定后一次发布；失败不能暴露成功 Result。
             material = render_materials(identity, recall, learning, self._catalog, max_chars=request.max_chars)
