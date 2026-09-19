@@ -11,6 +11,7 @@ from typing import cast
 from agent.plugin_composition.bindings import Bindings
 from agent.plugin_composition.messages import MessageCatalog, MessageEmbeddings
 from agent.plugin_contracts import Input, Message
+from agent.plugin_contracts import timekit
 
 from .application.consumer import MessageConsumer, run_memory_job
 from .learning import AKASHA_LEARNING, Learning, LearningConfig
@@ -197,7 +198,7 @@ async def query_inputs(
     text, dense = input_features(inputs, text=learning.text, embeddings=vectors,
                                  embedding_model=rule.embedding_model, dimension=rule.dimension)
     # 2. 图读取移出事件循环；取消仍先排空，再释放 binding 与串行锁。
-    stamp = datetime.now(UTC)
+    stamp = timekit.utcnow()
     origin = ContextSource(session_id=session_id, source=source, through_seq=snapshot[-1].seq)
     recall = await run_memory_job(lambda: query_memory(
         cycle, state, learning_binding=learning_binding,

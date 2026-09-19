@@ -1,10 +1,9 @@
 """Scoring functions for LongMemEval results.
 
-Primary metric: token-level F1 (same as SQuAD / LoCoMo papers).
-Secondary: exact match (normalised).
-Tertiary: LLM-as-judge (semantic correctness, handles paraphrase/translation).
-Both are computed per question_type so you can see where the system
-is strong vs weak (single-session vs multi-session vs temporal etc.).
+Primary metric: verified semantic success over all attempted questions.
+Errors and missing judgments remain in the denominator; missing judgments
+are also reported separately and must be resolved before a final quality claim.
+F1 and EM are auxiliary lexical-overlap metrics, not abstention metrics.
 """
 
 from __future__ import annotations
@@ -74,6 +73,7 @@ async def judge_answer(
     question: str,
     gold: str,
     predicted: str,
+    abstention: bool = False,
 ) -> bool:
     """Single LLM call: returns True if predicted is semantically correct."""
     if not predicted or not predicted.strip():
@@ -83,6 +83,13 @@ async def judge_answer(
         gold=gold.strip(),
         predicted=predicted.strip(),
     )
+    if abstention:
+        prompt = (
+            "Judge an unanswerable long-term memory question. The necessary evidence is absent. "
+            "Answer yes only if the response clearly acknowledges insufficient information "
+            "without inventing the requested fact; otherwise answer no. Reply yes or no only.\n"
+            f"Question: {question}\nResponse: {predicted}"
+        )
     response = await model.complete(
         ModelRequest(
             messages=({"role": "user", "content": prompt},),
@@ -110,7 +117,7 @@ def score_results(results: list[dict]) -> dict:
     """
     by_type: dict[str, list[dict]] = {}
     for r in results:
-        qt = r.get("question_type") or "unknown"
+        qt = "abstention" if str(r.get("question_id", "")).endswith("_abs") else r.get("question_type") or "unknown"
         by_type.setdefault(qt, []).append(r)
 
     def _agg(items: list[dict]) -> dict:
@@ -134,12 +141,9 @@ def score_results(results: list[dict]) -> dict:
             for r in items
             if r.get("judge_correct") is not None and not r.get("error")
         ]
-        judge_acc = (
-            round(sum(1 for r in judged if r["judge_correct"]) / len(judged), 4)
-            if judged
-            else None
-        )
         n = len(items)
+        correct = sum(1 for r in judged if r["judge_correct"])
+        judge_acc = round(correct / n, 4) if n else None
         if n == 0:
             return {"f1": 0.0, "em": 0.0, "judge_acc": None, "n": 0, "errors": 0}
         result = {
@@ -147,6 +151,9 @@ def score_results(results: list[dict]) -> dict:
             "em": round(sum(ems) / n, 4),
             "n": n,
             "errors": errors,
+            "judge_missing": sum(1 for r in items if not r.get("error") and r.get("judge_correct") is None),
+            "judged": len(judged),
+            "judge_conditional_acc": round(correct / len(judged), 4) if judged else None,
         }
         if judge_acc is not None:
             result["judge_acc"] = judge_acc

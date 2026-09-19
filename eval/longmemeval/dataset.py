@@ -18,6 +18,9 @@ SUPPORTED_QUESTION_TYPES = (
     "single-session-user",
     "single-session-preference",
     "knowledge-update",
+    "single-session-assistant",
+    "multi-session",
+    "temporal-reasoning",
 )
 
 

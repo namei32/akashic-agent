@@ -16,6 +16,7 @@ from agent.plugin_composition.models import BoundEmbeddingModel
 from agent.plugin_composition.messages import MessageCatalog, MessageEmbeddings
 from agent.plugin_contracts import ContentPart, ContentReferences, Message, Output, ToolCall, ToolResult
 from agent.plugin_contracts import json_value
+from agent.plugin_contracts import timekit
 from ._boundaries import CallSource, Result, TOOLS
 
 from .application.consumer import run_memory_job
@@ -170,7 +171,7 @@ class RecallTool:
                 if not np.isfinite(norm) or norm <= 0.0:
                     raise ValueError("召回 embedding 必须具有有限正模长")
                 dense = dense / norm
-                stamp = datetime.now(UTC)
+                stamp = timekit.utcnow()
                 recall = await run_memory_job(lambda: query_memory(
                     cycle, state, learning_binding=request.learning_binding, text=request.query,
                     dense=dense, stamp=stamp, source=source, limit=request.limit,

@@ -197,9 +197,9 @@ def _workspace_has_partial_data(workspace: Path, question_id: str) -> bool:
 
 
 def _reset_instance_workspace(workspace: Path) -> None:
-    if workspace.exists():
-        shutil.rmtree(workspace)
-    workspace.mkdir(parents=True, exist_ok=True)
+    from eval.longmemeval.runtime import archive_partial_workspace
+    archive_partial_workspace(workspace)
+
 
 
 # ── per-instance worker ───────────────────────────────────────────────────────
@@ -335,6 +335,7 @@ async def _process_instance(
                             question=result["question"],
                             gold=result["gold_answer"],
                             predicted=result["predicted_answer"],
+                            abstention=inst.question_id.endswith("_abs"),
                         )
             else:
                 result["judge_correct"] = None
@@ -408,7 +409,7 @@ async def _process_instance(
             progress.update(overall_task, advance=1)
             judged = [r for r in results if r.get("judge_correct") is not None]
             if judged:
-                acc = sum(1 for r in judged if r["judge_correct"]) / len(judged)
+                acc = sum(1 for r in judged if r["judge_correct"] and not r.get("error")) / len(results)
                 f1avg = sum(
                     token_f1(r["predicted_answer"], r["gold_answer"]) for r in results
                 ) / len(results)
@@ -424,6 +425,8 @@ async def _process_instance(
 
 
 async def _run(args: argparse.Namespace) -> None:
+    from .runtime import prepare_experiment
+    prepare_experiment(args)
     import sys
 
     from agent.config import load_config
@@ -514,10 +517,7 @@ async def _run(args: argparse.Namespace) -> None:
     scores = score_results(results)
     ov = scores["overall"]
 
-    judged = [r for r in results if r.get("judge_correct") is not None]
-    judge_acc = (
-        sum(1 for r in judged if r["judge_correct"]) / len(judged) if judged else 0.0
-    )
+    judge_acc = ov.get("judge_acc", 0.0) or 0.0
 
     table = Table(
         title=f"Results  —  elapsed {elapsed/3600:.1f}h",
@@ -542,16 +542,7 @@ async def _run(args: argparse.Namespace) -> None:
         end_section=True,
     )
     for qt, s in sorted(scores["by_type"].items()):
-        qt_judged = [
-            r
-            for r in results
-            if r.get("question_type") == qt and r.get("judge_correct") is not None
-        ]
-        qt_acc = (
-            sum(1 for r in qt_judged if r["judge_correct"]) / len(qt_judged)
-            if qt_judged
-            else 0.0
-        )
+        qt_acc = s.get("judge_acc", 0.0) or 0.0
         table.add_row(
             qt,
             f"{qt_acc:.1%}",

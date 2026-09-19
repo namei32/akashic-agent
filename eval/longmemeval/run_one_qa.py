@@ -47,6 +47,7 @@ async def _run(args: argparse.Namespace) -> None:
                     question=result["question"],
                     gold=result["gold_answer"],
                     predicted=result["predicted_answer"],
+                    abstention=inst.question_id.endswith("_abs"),
                 )
     finally:
         await close_runtime(rt)

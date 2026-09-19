@@ -6,9 +6,7 @@ import asyncio
 import logging
 import time
 
-from datetime import datetime, timezone
 
-from bus.events import InboundMessage
 
 from .dataset import LMEInstance
 from .runtime import BenchmarkRuntime
@@ -17,15 +15,6 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT_S = 180.0
 
-
-def _parse_question_date(raw: str) -> datetime:
-    raw = (raw or "").strip()
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d"):
-        try:
-            return datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
-        except ValueError:
-            continue
-    return datetime.now(tz=timezone.utc)
 
 _TOOL_EMOJI = {
     "recall_memory":    "🔍",
@@ -37,19 +26,6 @@ _TOOL_EMOJI = {
     "shell":            "💻",
 }
 _DEFAULT_TOOL_EMOJI = "🔧"
-
-
-def _extract_tool_trace(session_manager, qa_key: str) -> list[dict]:
-    """Pull the tool_chain from the last assistant message in the QA session."""
-    try:
-        session_manager._cache.pop(qa_key, None)
-        session = session_manager.get_or_create(qa_key)
-        for msg in reversed(session.messages):
-            if msg.get("role") == "assistant" and msg.get("tool_chain"):
-                return msg["tool_chain"]
-    except Exception as e:
-        logger.debug("tool_trace extraction failed: %s", e)
-    return []
 
 
 def format_tool_trace(tool_chain: list[dict], *, width: int = 90) -> str:
@@ -100,29 +76,18 @@ async def run_qa_instance(
     timeout_s: float = _DEFAULT_TIMEOUT_S,
 ) -> dict:
     """Run one QA turn and return a result dict with tool trace."""
-    loop = rt.core.loop
+    from .runtime import ask
     qa_key = instance.qa_session_key
-
-    rt.core.session_manager._cache.pop(qa_key, None)
+    tool_chain = []
 
     t0 = time.monotonic()
     error: str | None = None
     predicted = ""
 
     try:
-        question_dt = _parse_question_date(instance.question_date)
-        msg = InboundMessage(
-            channel="benchmark",
-            sender="user",
-            chat_id=instance.question_id,
-            content=instance.question + "\n\n[Respond in English only. One sentence or short phrase.]",
-            timestamp=question_dt,
-        )
-        outbound = await asyncio.wait_for(
-            loop._process(msg, session_key=qa_key, dispatch_outbound=False),
-            timeout=timeout_s,
-        )
-        predicted = outbound.content if outbound else ""
+        predicted, tool_chain, qa_key = await ask(rt,
+            question=instance.question + "\n\n[Respond in English only. One sentence or short phrase.]",
+            question_date=instance.question_date, session_prefix=qa_key, timeout_s=timeout_s)
     except asyncio.TimeoutError:
         error = f"timeout after {timeout_s}s"
         logger.warning("QA timeout: %s", instance.question_id)
@@ -131,9 +96,8 @@ async def run_qa_instance(
         logger.exception("QA error: %s", instance.question_id)
 
     elapsed = time.monotonic() - t0
-    tool_chain = _extract_tool_trace(rt.core.session_manager, qa_key)
-
     return {
+        "qa_session_id": qa_key,
         "question_id": instance.question_id,
         "question_type": instance.question_type,
         "question": instance.question,

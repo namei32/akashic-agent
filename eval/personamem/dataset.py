@@ -17,6 +17,9 @@ SUPPORTED_QUESTION_TYPES = (
     "revisit_reasons_behind_preference_updates",
     "suggest_new_ideas",
     "track_full_preference_evolution",
+    "recalling_the_reasons_behind_previous_updates",
+    "generalizing_to_new_scenarios",
+    "recalling_facts_mentioned_by_the_user",
 )
 
 _LABEL_RE = re.compile(r"\(([a-z])\)")

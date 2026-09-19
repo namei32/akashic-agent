@@ -1,336 +1,60 @@
-# LongMemEval Benchmark
+# LongMemEval：Message Runtime 评测
 
-这个目录保留一版可提交的 LongMemEval 子集 benchmark。
+2026-09-19：入口已适配 MessageLog、普通插件组合与 programmatic API。
+它评测完整 Agent 回答能力；不是纯向量检索排名。
 
-当前 benchmark 只测三类题：
+## 前置条件
 
-```text
-┌────────────────────────────┐
-│ single-session-user        │
-├────────────────────────────┤
-│ single-session-preference  │
-├────────────────────────────┤
-│ knowledge-update           │
-└────────────────────────────┘
-```
-
-对应数据文件：
-
-- `eval/longmemeval/data/longmemeval_akashic.json`
-
-## 它在测什么
-
-这不是纯 retrieval benchmark。
-它测的是 `akashic-agent` 这套记忆系统在真实 AgentLoop 里的端到端效果：
-
-```text
-┌────────────────────┐
-│ haystack 回放        │
-├────────────────────┤
-│ 正式 provider compaction │
-├────────────────────┤
-│ recall/search/fetch │
-├────────────────────┤
-│ 最终 QA + judge      │
-└────────────────────┘
-```
-
-所以它更接近：
-
-```text
-┌────────────────────┐
-│ memory-enabled agent│
-│ benchmark           │
-└────────────────────┘
-```
-
-不是：
-
-```text
-┌────────────────────┐
-│ 纯 memory engine     │
-│ benchmark           │
-└────────────────────┘
-```
-
-## 适用边界
-
-这版 benchmark 适合回答：
-
-- 单 session 用户事实记忆是否可用
-- 单 session 偏好记忆是否可用
-- knowledge update 场景里，系统最终能否选对更新后的答案
-- 改 compaction / recall / prompt 后，端到端有没有回归
-
-它不适合直接回答：
-
-- 纯 retrieval engine 排名
-- multi-session 能力
-- 时间推理的完整上限
-- “是否已经把旧记忆真正 supersede 掉”
-
-## 运行方式
-
-全量自动续跑：
+- 独立安装的插件组合，包含 models、聊天与 Embedding driver、Akasha、Prompt、Context、ReAct、programmatic 等依赖。
+- 空白模板包含经过验证的 `model-registry.sqlite3`、`memory/VEDA.md`、空白用户档案及插件 `config.input.json`。
+- 设置 `AKASHIC_EVAL_TEMPLATE` 与独立 `AKASHIC_PLUGIN_HOME`。不得指向日常运行 workspace。
+- Core 配置参考 `config.example.toml`；模型和行为设置由相应插件拥有。
 
 ```bash
+export AKASHIC_EVAL_TEMPLATE=/absolute/experiment/template
+export AKASHIC_PLUGIN_HOME=/absolute/experiment/plugin-home
 python -m eval.longmemeval.run \
-  --config eval/longmemeval/config.toml \
-  --data eval/longmemeval/data/longmemeval_akashic.json \
-  --workspace /tmp/lme_bench \
-  --workers 4 \
-  --resume-auto
+  --config /absolute/experiment/config.toml \
+  --data /absolute/data/longmemeval_s_cleaned.json \
+  --workspace /absolute/experiment/runs/run-001 \
+  --workers 1 --limit 1 --resume-auto \
+  --output /absolute/experiment/report-001.json
 ```
 
-只跑某一类：
+`--limit 0` 为全量；先跑一题检查费用、时延和日志。当前只能串行共享插件安装，
+多实例实验应使用独立进程、workspace 与 plugin home。
+
+## 数据与运行语义
+
+支持数据集的六个 question_type；question_id 以 `_abs` 结束时使用无答案裁判规则。
+数据版本、文件摘要和样本范围必须在实验报告中明确。
+
+1. 历史按源日期回放到不同 Session，通过公开 MessageLog writer 保存完整原文。
+2. 不修改已写入的历史。相同输入重复导入幂等，变化的输入需要新 workspace。
+3. 评测时钟仅用于保存历史和问题时间。没有日期的数据使用单调合成时钟，不代表真实日期。
+4. Akasha 通过生产消费者学习；QA 使用新的 programmatic Session，并明确排除长期学习。
+5. 不强制调用 recall_memory，不假定所有问题都能回答；是否调用工具由普通 Agent 决定。
+6. 摘要沿真实模型窗口触发，不另设手工压缩旁路；独立 QA 不保证历史先形成 Markdown profile。
+
+每题保存预测、错误、QA Session ID、工具轨迹及耗时。重复 QA 保留原消息；
+不再使用旧的 SessionManager、Loop 私有接口或删除旧 QA 消息。
+
+## 评分
+
+- `judge_acc`：已核验语义正确数 / 全部尝试题数。执行失败及缺失裁判留在分母。
+- `judge_conditional_acc`：只在已完成裁判的有效回答上计算，供诊断。
+- `judge_missing`：裁判缺失数，正式发布结果前应补评。
+- F1、EM：辅助词面指标，不作为无答案问题的质量结论。
+- 报告按题型拆分；`abstention` 独立成组。
+
+实验根目录保存输入身份，代码、配置、模型、数据或超时预算变化时拒绝复用缓存。
+中断导入目录先归档保存，不物理删除。合成冒烟的通过率不能当作公开 benchmark 成绩。
+
+## 验证
 
 ```bash
-python -m eval.longmemeval.run \
-  --config eval/longmemeval/config.toml \
-  --data eval/longmemeval/data/longmemeval_akashic.json \
-  --workspace /tmp/lme_bench_user \
-  --type single-session-user \
-  --workers 4 \
-  --resume-auto
+python -m pytest -q tests/test_eval_message_runtime.py
 ```
 
-只跑 smoke：
-
-```bash
-python -m eval.longmemeval.run \
-  --config eval/longmemeval/config.toml \
-  --data eval/longmemeval/data/longmemeval_akashic.json \
-  --workspace /tmp/lme_bench_smoke \
-  --limit 3 \
-  --workers 1 \
-  --resume-auto
-```
-
-单题只重跑 QA：
-
-```bash
-python -m eval.longmemeval.run_one_qa \
-  --config eval/longmemeval/config.toml \
-  --data eval/longmemeval/data/longmemeval_akashic.json \
-  --workspace /tmp/lme_one_case \
-  --question-id 94f70d80
-```
-
-## `resume-auto`
-
-推荐始终使用 `--resume-auto`。
-
-语义如下：
-
-```text
-┌─────────────────────────────┐
-│ workspace/<qid>/result.json │
-└────────────┬────────────────┘
-             │ yes
-             v
-      ┌──────────────┐
-      │ 直接复用结果  │
-      └──────────────┘
-             │ no
-             v
-┌─────────────────────────────┐
-│ ingest_state.json.completed │
-└────────────┬────────────────┘
-             │ yes
-             v
-      ┌──────────────┐
-      │ 只跑 QA+judge │
-      └──────────────┘
-             │ no
-             v
-      ┌──────────────┐
-      │ ingest+QA+judge │
-      └──────────────┘
-```
-
-每题会落盘：
-
-- `workspace/<question_id>/result.json`
-- `workspace/<question_id>/trace.log`
-- `workspace/<question_id>/ingest_state.json`
-
-## 评分解释
-
-主看：
-
-- `judge`
-
-辅看：
-
-- `F1`
-- `EM`
-
-建议按下面顺序解读：
-
-```text
-┌──────────────┐
-│ 先看 judge    │
-├──────────────┤
-│ 再看 F1 / EM  │
-└──────────────┘
-```
-
-原因很简单：
-
-- `judge` 更接近“最终回答在语义上对没对”
-- `F1 / EM` 容易受句式影响
-
-例如：
-
-- `Four bikes.` vs `4`
-- `Above your bed in the bedroom.` vs `in my bedroom`
-
-这种题常见 `judge=✅` 但 `F1` 不高。
-
-## 当前实现里的关键点
-
-### 1. judge 固定走默认模型
-
-现在 judge 通过 Models 插件绑定 `default` 角色，不再读取 Core 模型配置。
-
-### 2. benchmark persona 是硬约束
-
-`SELF.md` 会在 benchmark runtime 里覆盖为专用 prompt，要求：
-
-- 英文短答
-- 所有题答案都假定存在于记忆里
-- 必须先 `recall_memory`
-- 必要时继续 `search_messages`
-- 具体事实题必须 `fetch_messages`
-- 允许中英混合 query
-
-### 3. ingest 不提供手动压缩旁路
-
-haystack 只追加进权威 SessionStore。Markdown 沉淀和 session checkpoint 与生产环境一致，
-只会在 QA 的真实 provider 调用达到模型上下文水位时发生。
-
-### 4. 每个回放 session 会跑一次 post-response invalidation
-
-benchmark ingest 在每个回放 session 后运行一次 `post_response_worker`。
-
-但要注意：
-
-```text
-┌────────────────────┐
-│ 它只更偏向处理        │
-│ 显式 invalidation    │
-├────────────────────┤
-│ 不是完整的            │
-│ “自然知识更新替换器”   │
-└────────────────────┘
-```
-
-## 当前观察到的结论
-
-### single-session-user
-
-这类题现在已经接近天花板。
-主要意义更偏回归基线，而不是继续深挖。
-
-### single-session-preference
-
-能测到：
-
-- 是否召回偏好相关证据
-- 是否把具体事件抽象成偏好
-
-这类题比 `single-session-user` 更容易暴露“召回到了但不会用”的问题。
-
-### knowledge-update
-
-这是当前最值得看的部分。
-
-现在测出来的真实情况更像：
-
-```text
-┌────────────────────┐
-│ 新旧记忆经常同时存在   │
-├────────────────────┤
-│ agent 通过 recall +   │
-│ search + fetch 选对新值│
-├────────────────────┤
-│ 但旧值未必真的被退休   │
-└────────────────────┘
-```
-
-所以目前 `knowledge-update` 的成功更常代表：
-
-- 检索和取证够强
-- agent 能在冲突里选对新值
-
-不自动代表：
-
-- supersede 机制已经稳定生效
-
-## 当前 stance
-
-这版 benchmark 的目标不是把 supersede 调得很激进。
-
-当前更偏保守策略：
-
-```text
-┌────────────────────┐
-│ 保留旧值             │
-├────────────────────┤
-│ 让新值更容易被找出来  │
-├────────────────────┤
-│ 由 agent 最终选新版   │
-└────────────────────┘
-```
-
-这个策略对产品可接受，但要明确：
-
-- 它保证的是最终答案正确率
-- 不是记忆库内部的一致性最优
-
-## 看 trace 的方式
-
-单题 trace 在：
-
-- `/tmp/.../<question_id>/trace.log`
-
-看 trace 时建议按这个顺序：
-
-```text
-┌────────────────────┐
-│ recall_memory       │
-├────────────────────┤
-│ fetch_messages      │
-├────────────────────┤
-│ search_messages     │
-├────────────────────┤
-│ 最终回答             │
-└────────────────────┘
-```
-
-如果答对了，要再问一句：
-
-```text
-┌────────────────────┐
-│ 是 recall 直接命中新值 │
-├────────────────────┤
-│ 还是 search/fetch    │
-│ 把新旧都拉出来后选对   │
-└────────────────────┘
-```
-
-这两种成功含义不一样。
-
-## 保留的脚本
-
-目录里只保留 benchmark 主路径需要的脚本：
-
-- `run.py`
-- `run_one_qa.py`
-- `ingest.py`
-- `runtime.py`
-- `qa_runner.py`
-- `metrics.py`
-- `dataset.py`
-
-不再保留一次性的 case runner。
+这组测试验证原文/日期/会话边界、重复导入、QA 排除学习、错误分母及部分结果保留。
+真实 Chat、Embedding 与安装插件链仍需独立冒烟。

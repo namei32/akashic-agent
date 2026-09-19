@@ -133,9 +133,9 @@ def _workspace_has_partial_data(workspace: Path, question_id: str) -> bool:
 
 
 def _reset_instance_workspace(workspace: Path) -> None:
-    if workspace.exists():
-        shutil.rmtree(workspace)
-    workspace.mkdir(parents=True, exist_ok=True)
+    from eval.longmemeval.runtime import archive_partial_workspace
+    archive_partial_workspace(workspace)
+
 
 
 async def _process_instance(
@@ -311,6 +311,8 @@ async def _process_instance(
 
 
 async def _run(args: argparse.Namespace) -> None:
+    from eval.longmemeval.runtime import prepare_experiment
+    prepare_experiment(args)
     import sys
 
     from .dataset import SUPPORTED_QUESTION_TYPES, load_dataset
