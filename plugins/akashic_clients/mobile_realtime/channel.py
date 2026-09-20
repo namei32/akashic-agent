@@ -143,6 +143,10 @@ _DIRECT_MESSAGE_CATALOG: ContextVar[MessageCatalog | None] = ContextVar(
 
 _EPHEMERAL_QUERY_COMMAND_TYPES = frozenset(
     {
+        # 同步读取当前目录和 Message 页；投递事件由 inbox 独立确认，
+        # 不把一次可重读查询占用成长期副作用回执。
+        "session.list",
+        "history.get",
         "command.list",
         "model.catalog.get",
         "model.call.get",

@@ -32,3 +32,38 @@ def test_current_sync_protocol_keeps_successful_reply(gateway,caplog):
         assert reply['type']=='session.list.ok'
     assert 'type=session.list message_log_version=2' in caplog.text
     assert 'mobile.command.rejected' not in caplog.text
+
+
+def test_snapshot_queries_work_at_receipt_capacity_without_deleting_receipts(gateway,monkeypatch):
+    from datetime import datetime,timezone
+    from uuid import uuid4
+    from session.message import Input,ContentPart
+    from tests.test_mobile_message_log import append
+    from plugins.akashic_clients.mobile_realtime import storage as storage_module
+    log,runtime,_client,device,_private=gateway
+    session=f'akashic:{uuid4()}'
+    append(log,session,'history-input',Input((ContentPart('text','retained conversation'),)))
+    now=datetime.now(timezone.utc)
+    receipt,_=runtime.storage.reserve_command(device_id=device,command_id='existing',
+        command_type='device.update',request_hash='preserved',created_at=now)
+    runtime.storage.complete_command(device_id=device,command_id='existing',reply_type='device.update.ok',
+        reply_payload_json='{}',session_id=None,turn_id=None,completed_at=now)
+    original=runtime.storage.read_command(device_id=device,command_id='existing')
+    monkeypatch.setattr(storage_module,'_COMMAND_RECEIPT_MAX_COUNT',1)
+    with connected(gateway) as (ws,epoch):
+        ws.send_json({'v':1,'kind':'command','type':'session.list','id':'01ARZ3NDEKTSV4RRFFQ69G5FAV',
+            'connection_epoch':epoch,'payload':{'message_log_version':2,'page_size':200}})
+        assert ws.receive_json()['type']=='session.list'
+        assert ws.receive_json()['type']=='session.list.ok'
+        ws.send_json({'v':1,'kind':'command','type':'history.get','id':'01ARZ3NDEKTSV4RRFFQ69G5FAW',
+            'connection_epoch':epoch,'session_id':session,'payload':{'message_log_version':2,'page_size':50}})
+        event=ws.receive_json();reply=ws.receive_json()
+        assert event['type']=='history.page'
+        assert reply['type']=='history.get.ok'
+        ws.send_json({'v':1,'kind':'command','type':'device.update','id':'01ARZ3NDEKTSV4RRFFQ69G5FAX',
+            'connection_epoch':epoch,'payload':{'capabilities':['chat']}})
+        assert ws.receive_json()['payload']['code']=='mobile_command_receipt_capacity_reached'
+    assert runtime.storage.read_command(device_id=device,command_id='existing')==original
+    assert runtime.storage.read_command(device_id=device,command_id='01ARZ3NDEKTSV4RRFFQ69G5FAV') is None
+    assert runtime.storage.read_command(device_id=device,command_id='01ARZ3NDEKTSV4RRFFQ69G5FAW') is None
+    assert log.reader(session).get('history-input') is not None
