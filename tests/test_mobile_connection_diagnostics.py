@@ -67,3 +67,34 @@ def test_snapshot_queries_work_at_receipt_capacity_without_deleting_receipts(gat
     assert runtime.storage.read_command(device_id=device,command_id='01ARZ3NDEKTSV4RRFFQ69G5FAV') is None
     assert runtime.storage.read_command(device_id=device,command_id='01ARZ3NDEKTSV4RRFFQ69G5FAW') is None
     assert log.reader(session).get('history-input') is not None
+
+
+@pytest.mark.parametrize('static_active', [None,False])
+def test_incompatible_optional_inspection_returns_error_and_keeps_socket(gateway,static_active):
+    from copy import deepcopy
+    from types import SimpleNamespace
+    _log,runtime,_client,_device,_private=gateway
+    fiber={'name':'plugin','parent':None,'state':'active','required':True,'dependencies':[],
+           'missing_services':[],'error':None}
+    if static_active is not None:fiber['static_active']=static_active
+    payload={'snapshot_id':'fixed','plugins':[{'id':'plugin','revision':'r','generation_id':'g',
+        'api_version':3,'composition':{'ready':True,'topology_identity':'t','composition_revision':1,
+        'fibers':[fiber],'health':[],'incident_count':0,'recent_incidents':[],'incident_overflowed':False}}],
+        'mcp_servers':[],'skills':[]}
+    before=deepcopy(payload)
+    async def capabilities():return payload
+    runtime.channel.bind_runtime_inspection(SimpleNamespace(list_capabilities=capabilities))
+    with connected(gateway) as (ws,epoch):
+        ws.send_json({'v':1,'kind':'command','type':'runtime.capability.list',
+            'id':'01ARZ3NDEKTSV4RRFFQ69G5FAV','connection_epoch':epoch,'payload':{}})
+        reply=ws.receive_json()
+        if static_active is None:
+            assert reply['type']=='runtime.capability.list.error'
+            assert reply['payload']['code']=='runtime_catalog_client_incompatible'
+        else:
+            assert reply['type']=='runtime.capability.list.ok'
+            assert reply['payload']==payload
+        ws.send_json({'v':1,'kind':'command','type':'ping',
+            'id':'01ARZ3NDEKTSV4RRFFQ69G5FAW','connection_epoch':epoch,'payload':{}})
+        assert ws.receive_json()['type']=='ping.ok'
+    assert payload==before
