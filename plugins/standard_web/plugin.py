@@ -3,6 +3,7 @@ from agent.plugin_composition import Context, ServiceKey
 from ._tool_boundary import TOOLS, ToolView
 
 from .web import register_web
+from .network import Config
 
 api_version = 3
 name = "standard_web"
@@ -16,5 +17,5 @@ STANDARD_WEB_TOOLS = ServiceKey[ToolView]("standard-web.tools.v1")
 async def apply(ctx: Context) -> None:
     catalog = ctx.require(TOOLS)
     _ = await catalog.declare_group(ctx, always_on=True, description=desc)
-    refs = await register_web(ctx)
+    refs = await register_web(ctx, config=Config.model_validate(ctx.config))
     _ = await ctx.provide(STANDARD_WEB_TOOLS, catalog.view(*refs))

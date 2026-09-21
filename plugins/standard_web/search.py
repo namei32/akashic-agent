@@ -7,6 +7,7 @@ from collections.abc import Iterator
 from typing import Any, cast
 
 import httpx
+from .network import Config, client_options
 
 _MCP_URL = "https://mcp.exa.ai/mcp"
 _DEFAULT_NUM_RESULTS = 8
@@ -14,6 +15,9 @@ _DEFAULT_NUM_RESULTS = 8
 
 class WebSearchTool:
     """用关键词通过 Exa 搜索互联网，返回标题、内容摘要、URL 列表"""
+
+    def __init__(self, *, config: Config | None = None):
+        self._config = config or Config()
 
     name = "web_search"
     description = (
@@ -70,7 +74,7 @@ class WebSearchTool:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=25.0) as client:
+            async with httpx.AsyncClient(timeout=25.0, **client_options(self._config)) as client:
                 response = await client.post(
                     _MCP_URL,
                     json=payload,

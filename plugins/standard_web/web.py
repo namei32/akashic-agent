@@ -14,6 +14,7 @@ from agent.tool_catalog import (
 )
 from .fetch import WebFetchTool
 from .search import WebSearchTool
+from .network import Config, client_options
 from core.net.http import HttpRequester, RequestBudget, RetryPolicy
 from agent.plugin_contracts import ContentPart
 from agent.plugin_contracts import json_value
@@ -48,17 +49,18 @@ class WebTool:
         return None
 
 
-async def register_web(ctx: Context) -> tuple[ToolRef, ...]:
+async def register_web(ctx: Context, *, config: Config | None = None) -> tuple[ToolRef, ...]:
     """复用 HTTP 预算与重试实现，每次资源 scope 自行关闭客户端。"""
+    config = config or Config()
     @asynccontextmanager
     async def open_fetch(_state: Mapping[str, object]) -> AsyncGenerator[WebTool]:
-        async with httpx.AsyncClient(limits=httpx.Limits(max_connections=20, max_keepalive_connections=10)) as client:
+        async with httpx.AsyncClient(limits=httpx.Limits(max_connections=20, max_keepalive_connections=10), **client_options(config)) as client:
             requester = HttpRequester(client, RetryPolicy(), 30.0, RequestBudget(total_timeout_s=45.0))
             yield WebTool(WebFetchTool(requester))
 
     @asynccontextmanager
     async def open_search(_state: Mapping[str, object]) -> AsyncGenerator[WebTool]:
-        yield WebTool(WebSearchTool())
+        yield WebTool(WebSearchTool(config=config))
 
     refs: list[ToolRef] = []
     for backend, open_tool in ((WebFetchTool, open_fetch), (WebSearchTool, open_search)):
