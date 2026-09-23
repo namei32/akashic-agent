@@ -65,6 +65,21 @@ class Corpus(Record):
         })
 
 
+class EvidenceReference(Record):
+    """Evaluation annotation audit, excluded from the indexed corpus and reader prompts."""
+    source_id: str
+    resolved_id: str | None
+    resolution: Literal["exact", "normalized_numeric", "missing", "ambiguous"]
+
+    @model_validator(mode="after")
+    def check(self):
+        if (self.resolved_id is None) != (self.resolution in {"missing", "ambiguous"}):
+            raise ValueError("Evidence reference resolution does not match its target")
+        if self.resolution == "exact" and self.source_id != self.resolved_id:
+            raise ValueError("Exact evidence references must retain their source ID")
+        return self
+
+
 class Case(Record):
     id: str
     dataset: Literal["longmemeval", "locomo"]
@@ -81,6 +96,16 @@ class Case(Record):
     gold_level: Literal["message", "session", "none"] = "none"
     official_category: int | None = None
     data_issues: tuple[str, ...] = ()
+    evidence_references: tuple[EvidenceReference, ...] = ()
+
+    @property
+    def evidence_label_issues(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(f"{ref.resolution}_evidence_id" for ref in self.evidence_references
+                                   if ref.resolved_id is None))
+
+    @property
+    def evidence_scorable(self) -> bool:
+        return bool(self.gold_ids) and not self.unanswerable and not self.evidence_label_issues
 
 
 class Suite(Record):
@@ -100,7 +125,21 @@ class Suite(Record):
                 raise ValueError("Question references an unknown history")
             messages = [m for u in corpora[case.corpus_id].visible(case.cutoff).units for m in u.messages]
             known = {m.id if case.gold_level == "message" else (m.source_session_id or m.session_id) for m in messages}
-            if not set(case.gold_ids) <= known:
+            unresolved = set()
+            if case.evidence_references:
+                if case.gold_level != "message" or case.unanswerable:
+                    raise ValueError("Evidence reference audit requires answerable message-level labels")
+                expected_gold = tuple(ref.resolved_id or ref.source_id for ref in case.evidence_references)
+                if case.gold_ids != expected_gold:
+                    raise ValueError("Gold evidence differs from its source annotation audit")
+                all_known = {m.id for u in corpora[case.corpus_id].units for m in u.messages}
+                if any(ref.resolved_id is not None and ref.resolved_id not in all_known
+                       for ref in case.evidence_references):
+                    raise ValueError("Resolved evidence target does not exist")
+                unresolved = {ref.source_id for ref in case.evidence_references if ref.resolved_id is None}
+                if unresolved & all_known:
+                    raise ValueError("An existing exact evidence ID cannot be marked unresolved")
+            if set(case.gold_ids) - known - unresolved:
                 if "gold_after_question_time" not in case.data_issues:
                     raise ValueError(f"Gold evidence absent at query time: {case.id}")
             if case.gold_level == "none" and case.gold_ids:

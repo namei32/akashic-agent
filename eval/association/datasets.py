@@ -8,7 +8,7 @@ import random
 import re
 from typing import Literal, cast
 
-from .schema import Case, Corpus, Evidence, Suite, Unit, file_digest
+from .schema import Case, Corpus, Evidence, EvidenceReference, Suite, Unit, file_digest
 
 LOCOMO_CATEGORIES = {1: "multi-hop", 2: "temporal", 3: "open-domain", 4: "single-hop", 5: "adversarial"}
 
@@ -94,6 +94,36 @@ def longmemeval(path: Path, split: str, *, time_policy: str = "strict") -> tuple
     return corpora, cases
 
 
+def locomo_evidence_references(identity: str, labels: list[str], known_ids: set[str]) -> tuple[EvidenceReference, ...]:
+    """Normalize numeric zero-padding only when it resolves to one real source message."""
+    def numeric_key(value: str):
+        match = re.fullmatch(r"D([0-9]+):([0-9]+)", value)
+        return None if match is None else (int(match[1]), int(match[2]))
+
+    numeric: dict[tuple[int, int], list[str]] = {}
+    for value in sorted(known_ids):
+        key = numeric_key(value)
+        if key is not None:
+            numeric.setdefault(key, []).append(value)
+    references = []
+    for label in labels:
+        if not isinstance(label, str):
+            raise ValueError("LoCoMo evidence IDs must be strings")
+        source = f"{identity}:{label}"
+        if label in known_ids:
+            references.append(EvidenceReference(source_id=source, resolved_id=source, resolution="exact"))
+            continue
+        key = numeric_key(label)
+        matches = [] if key is None else numeric.get(key, [])
+        if len(matches) == 1:
+            references.append(EvidenceReference(source_id=source, resolved_id=f"{identity}:{matches[0]}",
+                                                resolution="normalized_numeric"))
+        else:
+            references.append(EvidenceReference(source_id=source, resolved_id=None,
+                                                resolution="ambiguous" if matches else "missing"))
+    return tuple(references)
+
+
 def locomo(path: Path, *, seed: int = 20260923, dev_conversations: int = 2,
            targets: dict[str, int] | None = None) -> tuple[list[Corpus], list[Case]]:
     rows = json.loads(path.read_text(encoding="utf-8"))
@@ -110,9 +140,11 @@ def locomo(path: Path, *, seed: int = 20260923, dev_conversations: int = 2,
         sessions = sorted((k for k in conversation if re.fullmatch(r"session_\d+", k)),
                           key=lambda key: int(key.split("_")[1]))
         units = []
+        known_ids = set()
         for session in sessions:
             at = timestamp(conversation[f"{session}_date_time"])
             for item in conversation[session]:
+                known_ids.add(item["dia_id"])
                 # Each observed utterance is one event, not a fabricated user/assistant pair.
                 evidence = Evidence(id=f"{identity}:{item['dia_id']}", session_id=f"{identity}:{session}",
                                     speaker=item["speaker"], role="observation", at=at, text=item["text"])
@@ -127,13 +159,16 @@ def locomo(path: Path, *, seed: int = 20260923, dev_conversations: int = 2,
             if category == "open-domain":
                 continue
             absent = category == "adversarial"
-            gold = tuple(f"{identity}:{item}" for item in question.get("evidence", [])) if not absent else ()
+            references = locomo_evidence_references(identity, question.get("evidence", []), known_ids) if not absent else ()
+            # Keep unresolved original IDs. Dropping them would silently shrink the recall denominator.
+            gold = tuple(ref.resolved_id or ref.source_id for ref in references)
             cases.append(Case(id=f"{identity}:q{index}", dataset="locomo", corpus_id=identity,
                               cluster_id=identity, split="dev" if str(row["sample_id"]) in dev else "holdout",
                               category=category, official_category=int(question["category"]),
                               question=question["question"], cutoff=cutoff,
                               answer=str(question.get("answer", "")), unanswerable=absent,
-                              gold_ids=gold, gold_level="message" if gold else "none"))
+                              gold_ids=gold, gold_level="message" if gold else "none",
+                              evidence_references=references))
     # Round-robin across whole conversations; never sample on model outcomes.
     targets = targets if targets is not None else {"multi-hop": 60, "single-hop": 20, "temporal": 20, "adversarial": 20}
     selected = [case for case in cases if case.split == "dev"]
@@ -173,6 +208,7 @@ def prepare(*, lme_dev: Path | None = None, lme_holdout: Path | None = None,
         corpora.extend(cs)
         cases.extend(qs)
         sources["locomo_sha256"] = file_digest(locomo_path)
+        sources["locomo_evidence_policy"] = "numeric-id-audit-v1;unresolved-excluded-from-evidence-metrics-only"
     if not cases:
         raise ValueError("No evaluation cases supplied")
     return Suite(sources=sources, corpora=tuple(corpora), cases=tuple(cases))

@@ -5,12 +5,12 @@ import json
 import numpy as np
 import pytest
 
-from eval.association.datasets import locomo, longmemeval, prepare
+from eval.association.datasets import locomo, locomo_evidence_references, longmemeval, prepare
 from eval.association.embeddings import VectorCache, populate
 from eval.association.retrieval import Full, Hybrid, cycle_fingerprint, evidence_metrics, materialize, render
 from eval.association.runner import jsonl, run_answers, run_retrieval
 from eval.association.runner import select_cases
-from eval.association.schema import Case, Corpus, Evidence, Settings, Suite, Unit, digest
+from eval.association.schema import Case, Corpus, Evidence, EvidenceReference, Settings, Suite, Unit, digest
 from eval.association.schema import file_digest
 from eval.association.report import build_report, paired_interval
 from eval.association.scoring import OfficialScorers, run_judgments
@@ -187,6 +187,68 @@ def test_locomo_split_keeps_conversations_and_original_speakers(tmp_path):
     assert all("WRONG-ANSWER" not in c.model_dump_json() and "DO NOT IMPORT" not in c.model_dump_json() for c in corpora)
 
 
+def test_locomo_evidence_normalizes_only_unique_numeric_aliases():
+    refs = locomo_evidence_references("locomo:c", ["D30:05", "D4:36", "D30:6"],
+                                     {"D30:5", "D30:6", "D4:25"})
+    assert refs[0].source_id == "locomo:c:D30:05"
+    assert refs[0].resolved_id == "locomo:c:D30:5"
+    assert refs[0].resolution == "normalized_numeric"
+    assert refs[1].source_id == "locomo:c:D4:36" and refs[1].resolved_id is None
+    assert refs[1].resolution == "missing"
+    assert refs[2].resolution == "exact"
+    # Two real messages may have numerically equivalent IDs. Never guess between them.
+    ambiguous = locomo_evidence_references("locomo:c", ["D030:005", "D30:05"], {"D30:5", "D30:05"})
+    assert ambiguous[0].resolution == "ambiguous" and ambiguous[0].resolved_id is None
+    assert ambiguous[1].resolution == "exact" and ambiguous[1].resolved_id == "locomo:c:D30:05"
+    assert locomo_evidence_references("locomo:c", ["D30-5"], {"D30:5"})[0].resolution == "missing"
+
+
+def test_locomo_adapter_preserves_source_and_does_not_shrink_bad_gold(tmp_path):
+    rows = [{"sample_id": str(i), "conversation": {
+        "session_30_date_time": "10:54 am on 17 November, 2023",
+        "session_30": [{"dia_id": "D30:5", "speaker": "Dave", "text": "I bought a camera this month."}],
+    }, "qa": [
+        {"category": 2, "question": "When was the camera bought?", "answer": "November 2023", "evidence": ["D30:05", "D30:05"]},
+        {"category": 1, "question": "What changed?", "answer": "original reference", "evidence": ["D30:5", "D30:99"]},
+    ]} for i in range(3)]
+    path = tmp_path / "source.json"
+    path.write_text(json.dumps(rows))
+    before = file_digest(path)
+    suite = prepare(locomo_path=path)
+    assert file_digest(path) == before
+    assert len(suite.cases) == 6
+    for case in suite.cases:
+        assert not case.data_issues  # Missing retrieval labels do not disable answer scoring.
+        if case.category == "temporal":
+            assert case.gold_ids == (f"{case.corpus_id}:D30:5",) * 2
+            assert case.evidence_references[0].source_id.endswith(":D30:05")
+            assert case.evidence_scorable and case.answer == "November 2023"
+        else:
+            assert len(case.gold_ids) == 2 and case.gold_ids[-1].endswith(":D30:99")
+            assert case.evidence_label_issues == ("missing_evidence_id",)
+            assert not case.evidence_scorable and case.answer == "original reference"
+    assert all("D30:05" not in corpus.model_dump_json() and "D30:99" not in corpus.model_dump_json()
+               for corpus in suite.corpora)
+
+
+def test_evidence_audit_cannot_hide_an_unlisted_or_falsely_missing_label():
+    suite = sample()
+    raw = suite.model_dump(mode="json")
+    raw["cases"][0]["gold_ids"] = ["not-in-history"]
+    with pytest.raises(ValueError, match="Gold evidence absent"):
+        Suite.model_validate(raw)
+    raw["cases"][0]["gold_ids"] = ["m0"]
+    raw["cases"][0]["evidence_references"] = [
+        {"source_id": "m0", "resolved_id": None, "resolution": "missing"}]
+    with pytest.raises(ValueError, match="existing exact"):
+        Suite.model_validate(raw)
+    raw["cases"][0]["gold_ids"] = ["not-in-history"]
+    raw["cases"][0]["evidence_references"] = [
+        {"source_id": "source-id", "resolved_id": "not-in-history", "resolution": "normalized_numeric"}]
+    with pytest.raises(ValueError, match="Resolved evidence target"):
+        Suite.model_validate(raw)
+
+
 class Reader:
     def __init__(self):
         self.requests = []
@@ -234,6 +296,43 @@ def official_fixture(tmp_path):
     path.write_text("def eval_question_answering(qas, eval_key='prediction'):\n"
                     "    return [0.5 for q in qas], 0, [1 for q in qas]\n")
     return OfficialScorers(locomo=path, locomo_sha256=file_digest(path))
+
+
+@pytest.mark.asyncio
+async def test_missing_evidence_is_unscored_but_answer_attempts_are_retained(tmp_path):
+    original, config = sample(), settings()
+    case = original.cases[0].model_copy(update={
+        "gold_ids": ("m0", "missing-label"),
+        "evidence_references": (
+            EvidenceReference(source_id="m0", resolved_id="m0", resolution="exact"),
+            EvidenceReference(source_id="missing-label", resolved_id=None, resolution="missing"),
+        ),
+    })
+    suite = Suite(sources=original.sources, corpora=original.corpora, cases=(case, original.cases[1]))
+    with closing(cache_for(tmp_path, suite)) as cache:
+        run_retrieval(suite, cache, tmp_path / "retrieval", config, split="dev")
+    retrieved = [r for r in jsonl(tmp_path / "retrieval/retrieval.jsonl") if r["case_id"] == case.id]
+    assert all(r["error"] is None and r["metrics"]["recall"] is None for r in retrieved)
+    assert all(r["metrics"]["complete"] is None and r["metrics"]["recall_at_5"] is None for r in retrieved)
+    assert all(r["metrics"]["gold_hit_ids"] == [] and r["evidence_label_issues"] == ["missing_evidence_id"] for r in retrieved)
+    reader = Reader()
+    await run_answers(suite, tmp_path / "retrieval", tmp_path / "answers", config, reader)
+    assert len(reader.requests) == 8 and all("missing-label" not in request[1] for request in reader.requests)
+
+    class Judge:
+        async def complete(self, system, user, output_tokens):
+            return {"model": "fixture-reader", "effort": "max", "text": "yes"}
+
+    await run_judgments(suite, tmp_path / "answers", tmp_path / "judgments", config, Judge(), official_fixture(tmp_path))
+    result = build_report(suite, tmp_path / "retrieval", tmp_path / "report", config,
+                          answers=tmp_path / "answers", judgments=tmp_path / "judgments")
+    assert result["eligible_case_count"] == 2 and result["evidence_metric_eligible_case_count"] == 0
+    assert result["data_invalid_cases"] == {} and result["quality_final_ready"]
+    assert result["evidence_scoring_exclusions"][case.id]["gold_ids"] == ["m0", "missing-label"]
+    assert result["retrieval"]["message"]["recall"]["locomo/all"]["hybrid"]["n"] == 0
+    assert result["semantic_accuracy"]["locomo/all"]["hybrid"]["n"] == 2
+    assert result["paired_evidence"] == [] and result["answer_failures"] == 0
+    assert "missing-label" in (tmp_path / "report/report.md").read_text()
 
 
 @pytest.mark.asyncio

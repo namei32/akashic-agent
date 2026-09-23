@@ -98,7 +98,10 @@ def main(argv=None):
         args.out.parent.mkdir(parents=True, exist_ok=True)
         write_json(args.out, suite)
         print(json.dumps({"corpora": len(suite.corpora), "questions": len(suite.cases),
-                          "data_invalid": sum(bool(c.data_issues) for c in suite.cases)}))
+                          "data_invalid": sum(bool(c.data_issues) for c in suite.cases),
+                          "evidence_scoring_excluded": sum(bool(c.evidence_label_issues) for c in suite.cases),
+                          "evidence_id_normalizations": sum(ref.resolution == "normalized_numeric"
+                                                            for c in suite.cases for ref in c.evidence_references)}))
         return
     if args.command == "smoke":
         from .smoke import smoke

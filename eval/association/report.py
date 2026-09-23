@@ -69,7 +69,7 @@ def build_report(suite: Suite, retrieval: Path, output: Path, settings: Settings
         if case.data_issues:
             continue
         metrics = row.get("metrics", {})
-        scorable = bool(case.gold_ids) and not case.unanswerable
+        scorable = case.evidence_scorable
         retrieval_rows.append({**row, "recall": metrics.get("recall", 0.0) if scorable else None,
                                "complete": metrics.get("complete", 0.0) if scorable else None,
                                "evidence_level": case.gold_level})
@@ -78,6 +78,15 @@ def build_report(suite: Suite, retrieval: Path, output: Path, settings: Settings
               "data_invalid_cases": {i: list(cases[i].data_issues) for i in parent["case_ids"] if cases[i].data_issues},
               "settings": settings.model_dump(mode="json"), "retrieval_failures": sum(bool(r["error"]) for r in retrieval_rows),
               "retrieval": {}, "latency_scope": "successful queries, cached vectors; failures reported separately"}
+    result["evidence_metric_eligible_case_count"] = sum(
+        cases[i].evidence_scorable and not cases[i].data_issues for i in parent["case_ids"])
+    result["evidence_scoring_exclusions"] = {
+        i: {"issues": list(cases[i].evidence_label_issues), "gold_ids": list(cases[i].gold_ids),
+            "references": [ref.model_dump(mode="json") for ref in cases[i].evidence_references]}
+        for i in parent["case_ids"] if cases[i].evidence_label_issues}
+    result["evidence_id_normalizations"] = {
+        i: [ref.model_dump(mode="json") for ref in cases[i].evidence_references if ref.resolution == "normalized_numeric"]
+        for i in parent["case_ids"] if any(ref.resolution == "normalized_numeric" for ref in cases[i].evidence_references)}
     # Do not silently average message-label and session-label recall into one score.
     for level in ("message", "session"):
         rows = [r for r in retrieval_rows if r["evidence_level"] == level]
@@ -92,7 +101,7 @@ def build_report(suite: Suite, retrieval: Path, output: Path, settings: Settings
                           set(indexed[(identity, "hybrid")].get("metrics", {}).get("gold_hit_ids", []))),
          "lost": sorted(set(indexed[(identity, "hybrid")].get("metrics", {}).get("gold_hit_ids", [])) -
                         set(indexed[(identity, "full")].get("metrics", {}).get("gold_hit_ids", [])))}
-        for identity in parent["case_ids"] if not cases[identity].data_issues]
+        for identity in parent["case_ids"] if not cases[identity].data_issues and cases[identity].evidence_scorable]
     if answers is not None:
         answer_manifest, answer_rows = checked_answers(suite, answers, settings)
         if answer_manifest["retrieval_sha256"] != file_digest(retrieval / "retrieval.jsonl"):
@@ -135,6 +144,16 @@ def build_report(suite: Suite, retrieval: Path, output: Path, settings: Settings
              "", "Intervals resample whole history clusters after averaging repeats within questions.",
              "Different datasets and evidence levels are reported separately. No best-of-N selection.",
              "All numbers describe this run; no automatic claim of graph causality or non-inferiority.", ""]
+    lines += [f"Evidence-metric eligible questions: {result['evidence_metric_eligible_case_count']}; "
+              f"unresolved annotation exclusions: {len(result['evidence_scoring_exclusions'])}; "
+              f"questions with normalized evidence IDs: {len(result['evidence_id_normalizations'])}.", ""]
+    if result["evidence_scoring_exclusions"]:
+        lines += ["Unresolved annotations exclude the entire question from evidence metrics, not from answer-quality scoring. "
+                  "Original references and the full labelled denominator are retained in paired-summary.json.", ""]
+        for identity, issue in result["evidence_scoring_exclusions"].items():
+            unresolved = [ref["source_id"] for ref in issue["references"] if ref["resolved_id"] is None]
+            lines.append(f"- Evidence metrics excluded: {identity}; unresolved IDs: {', '.join(unresolved)}.")
+        lines.append("")
     sections = {f"Recall ({level})": data["recall"] for level, data in result["retrieval"].items()}
     sections.update({name: result[name] for name in ("semantic_accuracy", "official_locomo_f1") if name in result})
     for title, data in sections.items():

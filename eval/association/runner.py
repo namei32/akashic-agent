@@ -120,6 +120,8 @@ def run_retrieval(suite: Suite, vectors: VectorCache, output: Path, settings: Se
                 row = {"case_id": case.id, "dataset": case.dataset, "category": case.category,
                        "cluster_id": case.cluster_id, "arm": arm, "corpus_sha256": key,
                        "data_issues": list(case.data_issues),
+                       "evidence_label_issues": list(case.evidence_label_issues),
+                       "evidence_references": [ref.model_dump(mode="json") for ref in case.evidence_references],
                        "budget_chars": settings.budget_chars, "error": None, "build_ms": None,
                        "retrieval_ms": None, "render_ms": None}
                 try:

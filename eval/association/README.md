@@ -33,6 +33,16 @@ Either dataset can be supplied alone. LoCoMo splits whole conversations (2 dev, 
 
 LongMemEval retains distinct occurrences of repeated source session IDs and a separate mapping for session labels. Consecutive user inputs and their assistant response form a unit; dangling inputs remain source fragments. Empty messages retain identity but provide no embedding or rendered evidence. LoCoMo maps each speaker-labelled utterance to an observed event, without inventing an assistant response. This explicit observation adapter differs from daily completed-turn ingestion. It uses supplied text only; image URLs, generated captions, observations and summaries are not ingested. Report that modality boundary.
 
+### LoCoMo evidence annotation audit
+
+The adapter preserves original messages, timestamps, questions, answers and evidence references. Exact IDs take precedence. Numeric zero-padding such as D30:05 may resolve to D30:5 only when exactly one real message has that numeric identity in the same conversation. Missing, malformed or ambiguous references are never guessed, dropped or replaced using answer content. Each question records its original source IDs, resolved targets and resolution reasons outside the retrievable corpus.
+
+A question containing any unresolved reference still runs retrieval and answer evaluation against the unchanged reference answer. All evidence metrics for that question are null, including recall, complete coverage, Recall@5/@10 and gained/lost gold evidence; its partly valid label set is not substituted as a smaller denominator. Reports separately count evidence-eligible cases, list exclusions and normalized IDs, while retaining the full question in answer-quality denominators. This differs from time-policy data quarantines, which skip the entire question.
+
+On upstream LoCoMo commit 3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376, the frozen split has two affected development questions: conv-50:q69 normalizes D30:05 to the existing D30:5; conv-47:q38 retains missing D4:36 and excludes evidence metrics only. The latter reference answer's job facts were separately checked against D13:3, D18:1 and D18:7. That content check does not substitute D13:3 as a replacement gold label; neither arm uses annotation labels to build memory or select evidence. The 120 selected holdout questions retain their original selection.
+
+This audit changes serialized suites and evaluator source hashes. Prepare new suites and fresh outputs; keep any already-running experiment on its frozen checkout.
+
 ### Explicit time policy
 
 Default --time-policy strict exposes only history at or before question time. Future gold evidence quarantines the question as gold_after_question_time: it remains in artifacts, receives no model call and is reported separately from algorithm failures. Quality reports give requested and eligible counts.

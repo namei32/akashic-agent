@@ -166,9 +166,9 @@ def render(corpus: Corpus, candidates: list[dict], budget: int):
 
 
 def evidence_metrics(case: Case, corpus: Corpus, presented: list[str], ranked: list[str]):
-    if case.unanswerable or not case.gold_ids:
-        return {"evidence_level": "none", "recall": None, "complete": None, "recall_at_5": None,
-                "recall_at_10": None, "gold_hit_ids": []}
+    if not case.evidence_scorable:
+        return {"evidence_level": case.gold_level, "recall": None, "complete": None, "recall_at_5": None,
+                "recall_at_10": None, "gold_hit_ids": [], "unscorable_reasons": list(case.evidence_label_issues)}
     messages = {m.id: m for u in corpus.units for m in u.messages}
     def project(ids):
         return set(ids) if case.gold_level == "message" else {
