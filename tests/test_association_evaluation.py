@@ -9,6 +9,7 @@ from eval.association.datasets import locomo, longmemeval, prepare
 from eval.association.embeddings import VectorCache, populate
 from eval.association.retrieval import Full, Hybrid, cycle_fingerprint, evidence_metrics, materialize, render
 from eval.association.runner import jsonl, run_answers, run_retrieval
+from eval.association.runner import select_cases
 from eval.association.schema import Case, Corpus, Evidence, Settings, Suite, Unit, digest
 from eval.association.schema import file_digest
 from eval.association.report import build_report, paired_interval
@@ -397,3 +398,62 @@ async def test_runtime_reader_validates_identity_and_never_supplies_tools():
     with pytest.raises(ValueError, match="differs"):
         await RuntimeClient(context, settings()).complete("system", "question", 128)
     assert len(seen) == 1
+
+
+@pytest.mark.asyncio
+async def test_zero_eligible_cases_cannot_be_reported_as_final_quality(tmp_path):
+    suite, config = sample(), settings()
+    suite = suite.model_copy(update={"cases": (suite.cases[0].model_copy(
+        update={"data_issues": ("gold_after_question_time",)}),)})
+    with closing(cache_for(tmp_path, suite)) as cache:
+        run_retrieval(suite, cache, tmp_path / "retrieval", config, split="dev")
+    reader = Reader()
+    await run_answers(suite, tmp_path / "retrieval", tmp_path / "answers", config, reader)
+    await run_judgments(suite, tmp_path / "answers", tmp_path / "judgments", config, reader, OfficialScorers())
+    report = build_report(suite, tmp_path / "retrieval", tmp_path / "report", config,
+                          answers=tmp_path / "answers", judgments=tmp_path / "judgments")
+    assert reader.requests == []
+    assert report["eligible_case_count"] == 0 and not report["quality_final_ready"]
+
+
+@pytest.mark.asyncio
+async def test_embedding_cli_pilot_does_not_call_provider_for_holdout(tmp_path, monkeypatch):
+    from argparse import Namespace
+    from contextlib import asynccontextmanager
+    from eval.association.__main__ import remote
+    suite = sample()
+    hidden_message = suite.corpora[0].units[0].messages[0].model_copy(
+        update={"id": "holdout-message", "text": "HOLDOUT MUST NOT BE EMBEDDED"})
+    hidden_corpus = Corpus(id="holdout-history", adapter="fixture", units=(Unit(id="hidden", messages=(hidden_message,)),))
+    hidden_case = suite.cases[0].model_copy(update={"id": "holdout-question", "corpus_id": hidden_corpus.id,
+                                                  "cluster_id": hidden_corpus.id, "split": "holdout",
+                                                  "question": "HOLDOUT QUESTION", "gold_ids": ("holdout-message",)})
+    suite = Suite(sources=suite.sources, corpora=(*suite.corpora, hidden_corpus), cases=(*suite.cases, hidden_case))
+    requested = []
+    class Embeddings:
+        def embedding_descriptor(self):
+            return {"model": "fixture", "space": "fixture-space", "dimensions": 2}
+        async def embed(self, texts):
+            requested.extend(texts)
+            return {**self.embedding_descriptor(), "vectors": [[1, 0] for _ in texts]}
+    @asynccontextmanager
+    async def isolated(*args):
+        yield Embeddings()
+    monkeypatch.setattr("eval.association.client.runtime_client", isolated)
+    args = Namespace(command="embed", split="dev", limit=1, config=tmp_path / "unused",
+                     model_workspace=tmp_path / "unused-workspace", receipts=tmp_path / "receipts.jsonl",
+                     cache=tmp_path / "vectors.db", batch_size=32)
+    await remote(args, suite, settings())
+    assert requested and all("HOLDOUT" not in text for text in requested)
+    assert sum(text in {case.question for case in suite.cases} for text in requested) == 1
+
+
+def test_pilot_balances_datasets_before_question_categories():
+    suite = sample()
+    cases = tuple(suite.cases[0].model_copy(update={
+        "id": f"{dataset}:{i}", "dataset": dataset, "cluster_id": f"{dataset}:{i}",
+        "category": str(i % categories),
+    }) for dataset, categories in (("longmemeval", 6), ("locomo", 4)) for i in range(30))
+    selected = select_cases(suite.model_copy(update={"cases": cases}), "dev", 24)
+    assert sum(case.dataset == "longmemeval" for case in selected) == 12
+    assert sum(case.dataset == "locomo" for case in selected) == 12

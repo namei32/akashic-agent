@@ -9,8 +9,8 @@ from pathlib import Path
 from .datasets import prepare
 from .embeddings import VectorCache, populate
 from .report import build_report
-from .runner import append, run_answers, run_retrieval
-from .schema import Settings, read_suite, write_json
+from .runner import append, run_answers, run_retrieval, select_cases
+from .schema import Settings, digest, read_suite, write_json
 from .scoring import OfficialScorers, run_judgments
 
 
@@ -42,7 +42,7 @@ def parser():
             cmd.add_argument("--retrieval", type=Path, required=True)
         if command in {"judge", "report"}:
             cmd.add_argument("--answers", type=Path, required=command == "judge")
-        if command == "retrieve":
+        if command in {"retrieve", "embed"}:
             cmd.add_argument("--split", choices=("dev", "holdout"), required=True)
             cmd.add_argument("--limit", type=int, help="Development-only stratified pilot limit")
         if command == "judge":
@@ -60,6 +60,7 @@ def parser():
 
 async def remote(args, suite, settings):
     from .client import runtime_client
+    selected = select_cases(suite, args.split, args.limit) if args.command == "embed" else None
     official = None
     if args.command == "judge":
         official = OfficialScorers(lme=args.lme_rubric, lme_sha256=args.lme_sha256,
@@ -69,11 +70,14 @@ async def remote(args, suite, settings):
             descriptor = client.embedding_descriptor()
             args.receipts.parent.mkdir(parents=True, exist_ok=True)
             with args.receipts.open("x", encoding="utf-8") as stream:
-                append(stream, {"kind": "embedding_identity", **descriptor})
+                assert selected is not None
+                scoped_suite = suite.model_copy(update={"cases": tuple(selected)})
+                append(stream, {"kind": "embedding_identity", "suite_sha256": digest(suite),
+                                "case_ids": [case.id for case in selected], **descriptor})
                 with closing(VectorCache(args.cache, model=settings.embedding_model, dimensions=settings.dimensions,
                                          space=descriptor["space"], writable=True)) as cache:
                     try:
-                        receipts = await populate(suite, cache, client, batch_size=args.batch_size,
+                        receipts = await populate(scoped_suite, cache, client, batch_size=args.batch_size,
                                                   on_receipt=lambda row: append(stream, row))
                         append(stream, {"kind": "completed", "batches": len(receipts), "cache_sha256": cache.fingerprint()})
                     except BaseException as error:

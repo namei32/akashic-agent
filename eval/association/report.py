@@ -122,7 +122,7 @@ def build_report(suite: Suite, retrieval: Path, output: Path, settings: Settings
         scored = [r for r in scored if not cases[r["case_id"]].data_issues]
         pending = sum(r["status"] == "pending" for r in scored)
         result["pending_judgments"] = pending
-        result["quality_final_ready"] = pending == 0
+        result["quality_final_ready"] = pending == 0 and bool(scored)
         # Missing judgments contribute a conservative zero; final claims remain blocked.
         semantic = [{**r, "semantic_correct": 0.0 if r["semantic_correct"] is None else float(r["semantic_correct"])} for r in scored]
         result["semantic_accuracy"] = grouped_report(semantic, "semantic_correct", settings.seed)
@@ -152,6 +152,8 @@ def build_report(suite: Suite, retrieval: Path, output: Path, settings: Settings
         lines.append("Judgments are pending: this is not a final quality report.")
     if result["data_invalid_cases"]:
         lines.append("Data-invalid questions are listed separately and excluded from algorithm quality; this is a filtered subset.")
+    if not result["eligible_case_count"]:
+        lines.append("No eligible questions: this run cannot support a quality claim.")
     if judgments is None:
         lines.append("Answer quality has NOT RUN in this report.")
     lines += ["", "Latency and token coverage (including unknown usage) are in paired-summary.json.",

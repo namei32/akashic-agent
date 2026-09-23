@@ -55,13 +55,14 @@ The real provider adapter uses the existing isolated evaluation template. Set AK
 
 ```sh
 python -m eval.association embed --suite /absolute/path/suite.json \
+  --split dev --limit 24 \
   --settings /absolute/path/settings.json --cache /absolute/path/vectors.sqlite3 \
   --config /absolute/path/evaluation-config.toml \
   --model-workspace /absolute/path/new-model-workspace \
   --receipts /absolute/path/new-embedding-receipts.jsonl
 ```
 
-This command uses the configured embedding service. Cache entries bind exact content hashes to model/space/dimension, with finite and normalized-vector checks. Unknown usage stays null. Partial preparation can reuse verified vectors with a new receipt file; changed vectors cannot overwrite prior entries. Unrelated SQLite databases are refused. Retrieval never falls back to a live embedding request.
+This command uses the configured embedding service. It requires an explicit split and embeds only the selected cases and their visible history; a pilot does not pay to prepare all holdout data. Later prepare holdout with --split holdout and a new receipt file. Cache entries bind exact content hashes to model/space/dimension, with finite and normalized-vector checks. Unknown usage stays null. Partial preparation can reuse verified vectors with a new receipt file; changed vectors cannot overwrite prior entries. Unrelated SQLite databases are refused. Retrieval never falls back to a live embedding request.
 
 ## Retrieval and fixed reader
 
@@ -76,6 +77,8 @@ python -m eval.association answer --suite /absolute/path/suite.json \
 ```
 
 Holdout uses --split holdout without --limit. Every planned pair/repeat retains its success or failure record. Tool schemas are empty; tool_choice is none; proposed tools are refused and never executed. The bound model identity and effort must match settings. There is no generate-until-correct retry.
+
+Development limits balance datasets first, then rotate categories within each dataset. With enough data, a 24-question two-dataset pilot takes 12 questions from each. The reader requests a short answer without citation IDs so evidence identifiers do not distort official lexical F1; evidence provenance is retained in retrieval artifacts, not asserted to be the model's internal reasoning.
 
 Each stage requires a new output directory and writes an input manifest plus completion receipt. Interrupted runs are incomplete. Source, settings, cache and evidence changes invalidate reuse. Build timings are present only when the index was constructed, not zero for reused indexes.
 
