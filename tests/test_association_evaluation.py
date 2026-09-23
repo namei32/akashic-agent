@@ -388,15 +388,15 @@ async def test_runtime_reader_validates_identity_and_never_supplies_tools():
     class Models:
         @asynccontextmanager
         async def independent_execution(self, **kwargs):
-            assert kwargs == {"reasoning_effort": "max"}
+            assert kwargs == {"model_id": "registered-fixture", "reasoning_effort": "max"}
             yield SimpleNamespace(chat=lambda role: Bound())
     context = SimpleNamespace(require=lambda key: Models() if key == CHAT_MODELS else None)
-    result = await RuntimeClient(context, settings()).complete("system", "question", 128)
+    result = await RuntimeClient(context, settings(), model_id="registered-fixture").complete("system", "question", 128)
     assert result["text"] == "response" and result["usage"] is None
     assert seen[0].tools == () and seen[0].tool_choice == "none"
     Bound.descriptor = SimpleNamespace(model="other", reasoning_effort="max")
     with pytest.raises(ValueError, match="differs"):
-        await RuntimeClient(context, settings()).complete("system", "question", 128)
+        await RuntimeClient(context, settings(), model_id="registered-fixture").complete("system", "question", 128)
     assert len(seen) == 1
 
 

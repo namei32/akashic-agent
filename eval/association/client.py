@@ -13,8 +13,8 @@ from .schema import Settings
 
 
 class RuntimeClient:
-    def __init__(self, context, settings: Settings):
-        self.context, self.settings = context, settings
+    def __init__(self, context, settings: Settings, *, model_id: str):
+        self.context, self.settings, self.model_id = context, settings, model_id
 
     def embedding_descriptor(self):
         descriptor = self.context.require(EMBEDDINGS).describe()
@@ -36,7 +36,9 @@ class RuntimeClient:
 
     async def complete(self, system: str, user: str, output_tokens: int):
         models = self.context.require(CHAT_MODELS)
-        async with models.independent_execution(reasoning_effort=self.settings.effort) as execution:
+        async with models.independent_execution(
+            model_id=self.model_id, reasoning_effort=self.settings.effort
+        ) as execution:
             model = execution.chat("agent")
             descriptor = model.descriptor
             if (descriptor.model, descriptor.reasoning_effort) != (self.settings.model, self.settings.effort):
@@ -61,6 +63,6 @@ async def runtime_client(config: Path, workspace: Path, settings: Settings):
         async with lease_runtime_snapshot(runtime.core.plugin_manager.snapshot_store) as snapshot:
             if snapshot.composition_root is None:
                 raise RuntimeError("Model provider composition unavailable")
-            yield RuntimeClient(snapshot.composition_root.context, settings)
+            yield RuntimeClient(snapshot.composition_root.context, settings, model_id=runtime.agent_model.model_id)
     finally:
         await close_runtime(runtime)
