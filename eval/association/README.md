@@ -125,3 +125,25 @@ The root configuration excludes eval. Check this package explicitly:
 ```sh
 pyright --project eval/association/pyrightconfig.json --pythonpath /absolute/path/project-python
 ```
+
+### Personal-memory confirmation (2026-09-25)
+
+`persona.prepare_persona` imports frozen PersonaMem-v2 text CSV selections and
+32k histories. It drops system persona dossiers, indexes only original dialogue,
+and records a synthetic order clock (no real-time forgetting claim). All four
+options are deterministically shuffled with the reviewed upstream method. The
+reader follows the official MCQ instruction; `--persona-scorer/--persona-sha256`
+loads only the reviewed extraction and exact-choice scoring methods. No judge
+model call is made for MCQ scores. This dialogue-only retrieval evaluation is not
+the official full-context leaderboard protocol.
+
+The adapter keeps hidden snippets and preferences out of corpus/query text.
+Snippet evidence is scored only when every label maps uniquely. `persona_pilot`
+round-robins personas before selecting additional questions. Reports include
+persona-cluster paired intervals and overlapping metadata strata.
+
+`diagnostics.diagnose` observes the native retrieval ticket without modifying
+production code and requires candidate scores/order and rendered context to match
+the archived run exactly. Seed absence alone does not establish failure because
+independent/direct routes can still recall an item. Native readout exclusions do
+not identify one specific internal threshold.

@@ -10,6 +10,7 @@ import re
 
 from .runner import append, begin, jsonl
 from .schema import Case, Settings, Suite, digest, file_digest, write_json
+from .persona import OfficialMCQ
 
 SEMANTIC_RULE = (
     "Judge the answer, not its writing style. Respond with exactly yes or no. "
@@ -27,9 +28,14 @@ def verify_script(path: Path, expected: str):
 
 class OfficialScorers:
     def __init__(self, *, lme: Path | None = None, lme_sha256: str | None = None,
-                 locomo: Path | None = None, locomo_sha256: str | None = None):
+                 locomo: Path | None = None, locomo_sha256: str | None = None,
+                 persona: Path | None = None, persona_sha256: str | None = None):
         self.lme_prompt, self.locomo_eval = None, None
+        self.persona_mcq = None
         self.hashes = {}
+        if persona is not None:
+            self.persona_mcq = OfficialMCQ(persona, persona_sha256 or "")
+            self.hashes["personamem-v2"] = persona_sha256
         if lme is not None:
             verify_script(lme, lme_sha256 or "")
             tree = ast.parse(lme.read_text(encoding="utf-8"))
@@ -49,6 +55,8 @@ class OfficialScorers:
             self.hashes["locomo"] = locomo_sha256
 
     def require(self, cases: list[Case]):
+        if any(c.dataset == "personamem-v2" for c in cases) and self.persona_mcq is None:
+            raise ValueError("PersonaMem-v2 requires a pinned official MCQ scorer")
         if any(c.dataset == "longmemeval" for c in cases) and self.lme_prompt is None:
             raise ValueError("LongMemEval requires a pinned official rubric")
         if any(c.dataset == "locomo" and not c.unanswerable for c in cases) and self.locomo_eval is None:
@@ -132,6 +140,11 @@ async def run_judgments(suite: Suite, answers: Path, output: Path, settings: Set
             elif answer["error"]:
                 row.update(status="execution_failure", semantic_correct=False,
                            official_f1=0.0 if case.dataset == "locomo" and not case.unanswerable else None)
+            elif case.dataset == "personamem-v2":
+                assert official.persona_mcq is not None
+                correct, letter = official.persona_mcq.score(case, answer["answer"])
+                row.update(status="judged", semantic_correct=correct, official_mcq_correct=correct,
+                           predicted_letter=letter, scorer="official_mcq", judge_model_calls=0)
             else:
                 try:
                     row["official_f1"] = official.f1(case, answer["answer"])

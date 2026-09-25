@@ -134,7 +134,13 @@ def build_report(suite: Suite, retrieval: Path, output: Path, settings: Settings
         result["quality_final_ready"] = pending == 0 and bool(scored)
         # Missing judgments contribute a conservative zero; final claims remain blocked.
         semantic = [{**r, "semantic_correct": 0.0 if r["semantic_correct"] is None else float(r["semantic_correct"])} for r in scored]
-        result["semantic_accuracy"] = grouped_report(semantic, "semantic_correct", settings.seed)
+        result["semantic_accuracy"] = grouped_report([r for r in semantic if r["dataset"] != "personamem-v2"], "semantic_correct", settings.seed)
+        persona_rows = [r for r in semantic if r["dataset"] == "personamem-v2"]
+        result["official_personamem_mcq_accuracy"] = grouped_report(persona_rows, "semantic_correct", settings.seed)
+        result["personamem_overlapping_strata"] = {
+            label: grouped_report([r for r in persona_rows if label in cases[r["case_id"]].strata],
+                                  "semantic_correct", settings.seed).get("personamem-v2/all")
+            for label in sorted({s for r in persona_rows for s in cases[r["case_id"]].strata})}
         result["official_locomo_f1"] = grouped_report([r for r in scored if r["dataset"] == "locomo"], "official_f1", settings.seed)
     output.mkdir(parents=True, exist_ok=False)
     write_json(output / "paired-summary.json", result)
@@ -155,7 +161,7 @@ def build_report(suite: Suite, retrieval: Path, output: Path, settings: Settings
             lines.append(f"- Evidence metrics excluded: {identity}; unresolved IDs: {', '.join(unresolved)}.")
         lines.append("")
     sections = {f"Recall ({level})": data["recall"] for level, data in result["retrieval"].items()}
-    sections.update({name: result[name] for name in ("semantic_accuracy", "official_locomo_f1") if name in result})
+    sections.update({name: result[name] for name in ("semantic_accuracy", "official_locomo_f1", "official_personamem_mcq_accuracy") if name in result})
     for title, data in sections.items():
         lines += [f"## {title}", "", "| Dataset/category | Hybrid | Full | Difference | 95% interval | Cases/clusters |",
                   "|---|---:|---:|---:|---|---|"]

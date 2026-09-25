@@ -556,3 +556,94 @@ def test_pilot_balances_datasets_before_question_categories():
     selected = select_cases(suite.model_copy(update={"cases": cases}), "dev", 24)
     assert sum(case.dataset == "longmemeval" for case in selected) == 12
     assert sum(case.dataset == "locomo" for case in selected) == 12
+
+
+def test_persona_adapter_excludes_dossier_and_labels_and_does_not_guess_evidence(tmp_path):
+    from eval.association.persona import prepare_persona, OfficialMCQ
+    class Options(OfficialMCQ):
+        def __init__(self):
+            pass
+        def options(self, correct, incorrect, seed):
+            return tuple([*incorrect, correct])
+    history = {'chat_history': [
+        {'role': 'system', 'content': 'SECRET-DOSSIER'},
+        {'role': 'user', 'content': 'I like quiet hotels.'},
+        {'role': 'assistant', 'content': 'Noted.'},
+        {'role': 'user', 'content': 'Actually I now prefer lively hotels.'},
+        {'role': 'assistant', 'content': 'Understood.'}]}
+    (tmp_path / 'history.json').write_text(json.dumps(history))
+    row = dict(persona_id='1', chat_history_32k_link='history.json', user_query=str({'role': 'user', 'content': 'Suggest a hotel.'}),
+               correct_answer='REFERENCE-ANSWER', incorrect_answers=json.dumps(['a', 'b', 'c']), pref_type='ask_to_forget',
+               who='self', updated='True', sensitive_info='False', preference='HIDDEN-LABEL', prev_pref='OLD-HIDDEN',
+               related_conversation_snippet=json.dumps([{'role': 'user', 'content': 'Missing exact snippet'}]))
+    p = tmp_path / 'selection.json'
+    p.write_text(json.dumps({'val': [{'row': row, 'row_index': 0}]}))
+    suite, audit = prepare_persona(p, tmp_path, Options())
+    corpus, case = suite.corpora[0], suite.cases[0]
+    assert all(s not in corpus.model_dump_json() for s in ['SECRET-DOSSIER', 'REFERENCE-ANSWER', 'HIDDEN-LABEL', 'OLD-HIDDEN'])
+    assert len(corpus.units) == 2 and case.question == 'Suggest a hotel.'
+    assert case.evidence_label_issues == ('missing_evidence_id',) and not case.evidence_scorable
+    assert len(case.options) == 4 and case.answer in case.options
+    assert audit['histories'][0]['discarded_system_message_indices'] == [0]
+
+
+def test_persona_pilot_spans_personas_before_repeat_questions():
+    from eval.association.persona import persona_pilot
+    base = sample()
+    cases = tuple(base.cases[0].model_copy(update={'id': f'p{p}q{q}', 'cluster_id': f'p{p}',
+                                                'strata': (f'type:{q}',)}) for p in range(10) for q in range(4))
+    suite = base.model_copy(update={'cases': cases})
+    pilot = persona_pilot(suite)
+    assert len(pilot.cases) == 12 and len({c.cluster_id for c in pilot.cases}) == 10
+    assert pilot == persona_pilot(suite)
+
+
+def test_diagnostic_observer_preserves_native_candidates_and_state(tmp_path):
+    from eval.association.diagnostics import full_trace, loss_rows
+    suite = sample()
+    with closing(cache_for(tmp_path, suite)) as cache:
+        turns, state = materialize(suite.corpora[0], cache)
+        index = Full(turns, state, settings())
+        before = cycle_fingerprint(index.cycle)
+        native, _ = index.query(suite.cases[0], cache.get('red library'))
+        observed, _, trace = full_trace(index, suite.cases[0], cache.get('red library'))
+        assert native == observed and before == cycle_fingerprint(index.cycle)
+        assert trace['persistent_state_unchanged']
+        material = render(suite.corpora[0], observed, 1000)
+        losses = loss_rows(suite.cases[0], suite.corpora[0], turns, observed, material, trace, 'full')
+        assert losses[0]['reason'] == 'presented'
+
+
+@pytest.mark.asyncio
+async def test_mcq_pipeline_uses_same_unlabelled_options_and_scores_without_model_judge(tmp_path):
+    suite = sample()
+    case = suite.cases[0].model_copy(update={'dataset': 'personamem-v2', 'options': ('one', 'two', 'three', 'four'),
+                                           'answer': 'two', 'strata': ('who:self',)})
+    suite = suite.model_copy(update={'cases': (case,)})
+    config = settings()
+    with closing(cache_for(tmp_path, suite)) as cache:
+        run_retrieval(suite, cache, tmp_path / 'r', config, split='dev')
+    prompts = []
+    class Reader:
+        async def complete(self, system, user, tokens):
+            prompts.append(user)
+            assert 'A. one\nB. two\nC. three\nD. four' in user
+            assert 'correct_answer' not in user and 'who:self' not in user
+            return {'text': 'Final Answer: B', 'model': config.model, 'effort': config.effort}
+    from eval.association.persona import OfficialMCQ
+    class MCQ(OfficialMCQ):
+        def __init__(self):
+            pass
+        def score(self, case, text):
+            return text == 'Final Answer: B', 'B'
+    official = OfficialScorers()
+    official.persona_mcq = MCQ()
+    official.hashes['personamem-v2'] = 'fixture'
+    await run_answers(suite, tmp_path / 'r', tmp_path / 'a', config, Reader())
+    await run_judgments(suite, tmp_path / 'a', tmp_path / 'j', config, None, official)
+    rows = jsonl(tmp_path / 'j/judgments.jsonl')
+    assert len(rows) == 4 and all(r['semantic_correct'] and r['judge_model_calls'] == 0 for r in rows)
+    result = build_report(suite, tmp_path / 'r', tmp_path / 'report', config,
+                          answers=tmp_path / 'a', judgments=tmp_path / 'j')
+    assert result['official_personamem_mcq_accuracy']['personamem-v2/all']['full']['mean'] == 1
+    assert not result['semantic_accuracy']

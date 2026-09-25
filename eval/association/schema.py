@@ -82,7 +82,7 @@ class EvidenceReference(Record):
 
 class Case(Record):
     id: str
-    dataset: Literal["longmemeval", "locomo"]
+    dataset: Literal["longmemeval", "locomo", "personamem-v2"]
     corpus_id: str
     cluster_id: str
     split: Literal["dev", "holdout"]
@@ -97,6 +97,17 @@ class Case(Record):
     official_category: int | None = None
     data_issues: tuple[str, ...] = ()
     evidence_references: tuple[EvidenceReference, ...] = ()
+    options: tuple[str, ...] = ()
+    strata: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def check_options(self):
+        if self.dataset == "personamem-v2":
+            if len(self.options) != 4 or len(set(self.options)) != 4 or self.answer not in self.options:
+                raise ValueError("PersonaMem-v2 requires four unique choices including the reference")
+        elif self.options:
+            raise ValueError("Choices are only defined for PersonaMem-v2")
+        return self
 
     @property
     def evidence_label_issues(self) -> tuple[str, ...]:

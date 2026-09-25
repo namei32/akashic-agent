@@ -50,6 +50,8 @@ def parser():
             cmd.add_argument("--lme-sha256")
             cmd.add_argument("--locomo-scorer", type=Path)
             cmd.add_argument("--locomo-sha256")
+            cmd.add_argument("--persona-scorer", type=Path)
+            cmd.add_argument("--persona-sha256")
             cmd.add_argument("--retry-from", type=Path, help="Rejudge only pending rows from a matching completed run")
         if command == "report":
             cmd.add_argument("--judgments", type=Path)
@@ -64,7 +66,11 @@ async def remote(args, suite, settings):
     official = None
     if args.command == "judge":
         official = OfficialScorers(lme=args.lme_rubric, lme_sha256=args.lme_sha256,
-                                  locomo=args.locomo_scorer, locomo_sha256=args.locomo_sha256)
+                                  locomo=args.locomo_scorer, locomo_sha256=args.locomo_sha256,
+                                  persona=args.persona_scorer, persona_sha256=args.persona_sha256)
+        if all(case.dataset == "personamem-v2" for case in suite.cases):
+            await run_judgments(suite, args.answers, args.out, settings, None, official, retry_from=args.retry_from)
+            return
     async with runtime_client(args.config, args.model_workspace, settings) as client:
         if args.command == "embed":
             descriptor = client.embedding_descriptor()
