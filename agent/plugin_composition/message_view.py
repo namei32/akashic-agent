@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Callable, Mapping
-from contextlib import aclosing
+from contextlib import AsyncExitStack, aclosing
 from dataclasses import asdict, dataclass, field
-from typing import Protocol, cast
 from types import MappingProxyType
+from typing import cast
 
+from agent.plugin_composition.context import CompositionRoot
+from agent.plugin_composition.model import ServiceKey
+from agent.plugin_contracts.tools import TOOL_DISPLAY_NAME
+from agent.plugin_contracts.ui import (
+    MessageDisplayReader as MessageDisplayReader,
+)
 from session.log import MessagePage, MessageReader, SessionEntry
 from session.message import ContentPart, Control, Input, Message, Output, ToolCall
 from session.message_codec import json_value
-
 
 PartDisplayProvider = Callable[[ContentPart], Mapping[str, object]]
 
@@ -25,10 +30,64 @@ class MessageDisplayProviders:
         object.__setattr__(self, "part_display", MappingProxyType(dict(self.part_display)))
 
 
-class MessageDisplayReader(Protocol):
-    """在自己的资源作用域内投影一页，不让客户端持有插件回调。"""
 
-    async def __call__(self, page: MessagePage, *, display_only: bool) -> list[dict[str, object]]: ...
+
+async def project_message_rows(
+    root: CompositionRoot,
+    page: MessagePage,
+    *,
+    display_only: bool,
+) -> list[dict[str, object]]:
+    """Project one page through only the live providers used by that page."""
+    if not isinstance(page, MessagePage):
+        raise TypeError("消息展示需要 MessagePage")
+
+    kinds: list[str] = []
+    has_tool_call = False
+    for message in page.messages:
+        if isinstance(message.body, Control):
+            continue
+        for part in message.body.parts:
+            if isinstance(part, ContentPart):
+                if part.kind not in kinds:
+                    kinds.append(part.kind)
+            elif isinstance(part, ToolCall):
+                has_tool_call = True
+
+    providers: dict[str, PartDisplayProvider] = {}
+    tool_name: Callable[[str], str] | None = None
+    entered_contexts: set[int] = set()
+
+    async with AsyncExitStack() as scopes:
+        for kind in kinds:
+            key = ServiceKey[PartDisplayProvider](f"message.display:{kind}")
+            value = root.service_value(key)
+            if value is None or not callable(value):
+                continue
+            context, provider = root._service_provider(key)
+            if id(context) not in entered_contexts:
+                await scopes.enter_async_context(context.runtime_scope())
+                entered_contexts.add(id(context))
+            providers[kind] = cast(PartDisplayProvider, provider)
+
+        if has_tool_call:
+            key = TOOL_DISPLAY_NAME
+            value = root.service_value(key)
+            if value is not None and callable(value):
+                context, provider = root._service_provider(key)
+                if id(context) not in entered_contexts:
+                    await scopes.enter_async_context(context.runtime_scope())
+                    entered_contexts.add(id(context))
+                tool_name = cast(Callable[[str], str], provider)
+
+        return message_rows(
+            page,
+            display_only=display_only,
+            providers=MessageDisplayProviders(
+                tool_name=tool_name,
+                part_display=providers,
+            ),
+        )
 
 
 async def read_message_rows(
@@ -55,6 +114,7 @@ def session_row(entry: SessionEntry) -> dict[str, object]:
         "message_count": entry.message_count,
         "head_seq": entry.head_seq,
         "first_message_content": text,
+        "scope": dict(entry.attributes.scope),
     }
 
 

@@ -23,7 +23,7 @@ from session.artifacts import (
 
 from agent.plugin_composition.context import Context
 from agent.plugin_composition.requests import RequestContext
-from agent.plugin_composition.model import ServiceKey
+from agent.plugin_composition.model import CompositionError, ServiceKey
 
 
 _NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
@@ -153,9 +153,10 @@ class ChannelInboundMessage:
 
 
 # 来源插件接纳已验证的传输输入；不获得 Channel lease 或发送权。
-CHANNEL_INPUT = ServiceKey[
+
+CHANNEL_INPUT_V2 = ServiceKey[
     Callable[[str, str, ChannelInboundMessage], Awaitable[Message]]
-]("channel.input.v1")
+]("channel.input.v2")
 
 
 class InboundOwner(StrEnum):
@@ -175,9 +176,6 @@ class InboundState(StrEnum):
 
 
 class ChannelBindingLease(Protocol):
-    @property
-    def snapshot_lease(self) -> object: ...
-
     @property
     def snapshot_id(self) -> str: ...
 
@@ -1029,6 +1027,7 @@ class ChannelDefinition:
     inbound_identity: InboundIdentity | None
     config: Mapping[str, object] = field(default_factory=dict)
     interrupt: Callable[[RawInbound], Awaitable[bool]] | None = None
+    optional_services: frozenset[ServiceKey[Any]] = frozenset()
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or _NAME.fullmatch(self.name) is None:
@@ -1039,6 +1038,10 @@ class ChannelDefinition:
             raise ValueError("channel capabilities 必须只包含 ChannelCapability")
         if not callable(self.factory):
             raise TypeError("channel factory 必须可调用")
+        if not isinstance(self.optional_services, frozenset) or any(
+            not isinstance(key, ServiceKey) for key in self.optional_services
+        ):
+            raise TypeError("optional_services 必须是 ServiceKey frozenset")
         object.__setattr__(self, "config", _freeze_channel_config(self.config))
         if ChannelCapability.CONTROL in self.capabilities and not callable(self.interrupt):
             raise TypeError("CONTROL channel 必须提供自己的 interrupt 回调")
@@ -1061,7 +1064,7 @@ class Channels(Protocol):
 
     async def register(self, ctx: Context, definition: ChannelDefinition) -> None: ...
 
-    def acquire_binding(self, snapshot_lease: Any, channel_name: str) -> ChannelBindingLease: ...
+    def acquire_binding(self, channel_name: str) -> ChannelBindingLease: ...
 
     async def dispatch_outbound(
         self, envelope: OutboundEnvelope, binding: ChannelBindingLease,
@@ -1124,7 +1127,6 @@ def _validate_binding_lease(lease: object) -> None:
     """Check the narrow exact-binding fields before an envelope retains a lease."""
 
     for field_name in (
-        "snapshot_lease",
         "snapshot_id",
         "generation_id",
         "channel_name",

@@ -6,6 +6,13 @@ const MIN_PANEL_WIDTH = 360;
 const MIN_CHAT_WIDTH = 420;
 
 function syncFrameTheme(frame) {
+  // iframe 隐藏后再返回时核对能力，不重建 iframe 或清空编辑器。
+  const observer = new IntersectionObserver((entries) => {
+    if (entries.some((entry) => entry.isIntersecting)) frame.contentWindow?.postMessage(
+      { type: "akashic.models.changed" }, window.location.origin,
+    );
+  });
+  observer.observe(frame);
   const send = () => frame.contentWindow?.postMessage(
     { type: "akashic.theme", themeId: currentTheme().id },
     window.location.origin,
@@ -13,6 +20,7 @@ function syncFrameTheme(frame) {
   frame.addEventListener("load", send);
   const unsubscribe = subscribeTheme(send);
   return () => {
+    observer.disconnect();
     unsubscribe();
     frame.removeEventListener("load", send);
   };
@@ -58,6 +66,20 @@ function toolIcon() {
   return icon;
 }
 
+// 通知入口的 ?session= 只消费一次，避免刷新后反复跳回同一会话。
+function takeRequestedSession() {
+  const url = new URL(window.location.href);
+  const sessionId = url.searchParams.get("session");
+  if (!sessionId) return "";
+  url.searchParams.delete("session");
+  window.history.replaceState(window.history.state, "", url);
+  return sessionId;
+}
+
+function frameSource(sessionId) {
+  return sessionId ? `/chat?embedded=1&session=${encodeURIComponent(sessionId)}` : "/chat?embedded=1";
+}
+
 function renderConversation(host, view) {
   const tools = view.child("conversation.tools.v1");
   const entries = checkTabs(tools.entries);
@@ -66,7 +88,7 @@ function renderConversation(host, view) {
   const frame = document.createElement("iframe");
   frame.className = "conversation-page-frame";
   frame.title = "Akashic 对话";
-  frame.src = "/chat?embedded=1";
+  frame.src = frameSource(takeRequestedSession());
   root.appendChild(frame);
 
   if (entries.length === 0) {

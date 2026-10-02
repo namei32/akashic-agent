@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Literal
 
+from core.common.file_io import run_file_io
+
 from .api import ContentWakeServices, DriftWakeServices
 from ._boundary import SemanticInterest
 from .content import (_content_text, _datetime, _integer, _mapping, _pool_detail,
@@ -45,30 +47,39 @@ class Duties:
         self.content, self.drift, self.state, self.interest = content, drift, state, interest
         self._maintenance = asyncio.Lock()
 
-    def deadline(self, now: datetime) -> datetime | None:
-        content = self.content.snapshot(now)
+    async def deadline(self, now: datetime) -> datetime | None:
+        content = await self.content.snapshot(now)
         items = _sequence(content.get("items"), "Content items")
-        values = [self.state.unseen_deadline(items), self.content.alert_deadline(now)]
-        drift = self.drift.snapshot(now).get("next_due")
+        unseen = await run_file_io(lambda: self.state.unseen_deadline(items))
+        values = [unseen, await self.content.alert_deadline(now)]
+        drift = (await self.drift.snapshot(now)).get("next_due")
         if drift is not None:
             values.append(_datetime(drift))
         return min((value for value in values if value is not None), default=None)
 
     async def check(self, now: datetime) -> Admission:
-        """先维护池，再按 Alert、通过阈值的 Content、到期 Drift 依次选择。"""
+        """Admit due Alerts before unrelated Content scoring or maintenance."""
+        alert = await self.content.alert_deadline(now)
+        if alert is not None and alert <= now:
+            snapshot = await self.content.snapshot(now)
+            items = tuple(_sequence(snapshot.get("items"), "Content items"))
+            pool = Pool(_integer(snapshot.get("snapshot_seq"), "snapshot_seq"), items,
+                        sum(item.get("status") in {"pending", "deferred"} for item in items),
+                        sum(item.get("due") is True for item in items), 0, 0)
+            return Admission("alert", pool.detail + "；Alert 已到期；Content 评分延后", pool)
         pool = await self.maintain(now)
-        count = self.state.unseen_due_count(pool.items, now)
-        audit = self.state.audit_pool(pool.items, now=now)
+        count = await run_file_io(lambda: self.state.unseen_due_count(pool.items, now))
+        audit = await run_file_io(lambda: self.state.audit_pool(pool.items, now=now))
         detail = _pool_detail(pool.detail, count, audit)
-        alert = self.content.alert_deadline(now)
+        alert = await self.content.alert_deadline(now)
         if alert is not None and alert <= now:
             return Admission("alert", detail + "；Alert 已到期", pool)
-        if self.state.has_unseen_due(pool.items, now):
-            result = self.state.evaluate(pool.items, snapshot_seq=pool.snapshot_seq, now=now)
+        if await run_file_io(lambda: self.state.has_unseen_due(pool.items, now)):
+            result = await run_file_io(lambda: self.state.evaluate(pool.items, snapshot_seq=pool.snapshot_seq, now=now))
             detail = _pool_detail(pool.detail, count, result)
             if result.should_wake:
                 return Admission("content", detail, pool)
-        proposals = _sequence(self.drift.snapshot(now).get("proposals"), "Drift proposals")
+        proposals = _sequence((await self.drift.snapshot(now)).get("proposals"), "Drift proposals")
         if any(item.get("due") is True for item in proposals):
             return Admission("drift", detail + "；Drift 已到期", pool, tuple(proposals))
         return Admission(None, detail + "；没有到期职责或新 Content 不足", pool)
@@ -76,18 +87,19 @@ class Duties:
     async def maintain(self, now: datetime) -> Pool:
         """沿原规则只评分一次，低质量 Content 满最短停留期后由 EventMail 过期。"""
         async with self._maintenance:
-            snapshot = self.content.snapshot(now)
+            snapshot = await self.content.snapshot(now)
             items = _sequence(snapshot.get("items"), "Content items")
-            scored = len(self.state.unscored_due_items(items))
+            scored = len(await run_file_io(lambda: self.state.unscored_due_items(items)))
             items = await self._score(items, now)
-            refs = self.state.expired_content_refs(items, now=now, minimum_residence=timedelta(hours=24))
+            refs = await run_file_io(lambda: self.state.expired_content_refs(
+                items, now=now, minimum_residence=timedelta(hours=24)))
             expired = 0
             if refs:
-                result = self.content.expire(refs, now)
+                result = await self.content.expire(refs, now)
                 expired = len(_sequence(result.get("expired"), "expired Content"))
-                snapshot = self.content.snapshot(now)
+                snapshot = await self.content.snapshot(now)
                 items = _sequence(snapshot.get("items"), "Content items")
-                scored += len(self.state.unscored_due_items(items))
+                scored += len(await run_file_io(lambda: self.state.unscored_due_items(items)))
                 items = await self._score(items, now)
             return Pool(_integer(snapshot.get("snapshot_seq"), "snapshot_seq"), items,
                         sum(item.get("status") in {"pending", "deferred"} for item in items),
@@ -95,9 +107,9 @@ class Duties:
 
     async def _score(self, items: Sequence[Mapping[str, object]], now: datetime) -> tuple[Mapping[str, object], ...]:
         """原 preprocess 和语义兴趣合成后保存不可变初分，不以缺依赖冒充零分。"""
-        unscored = self.state.unscored_due_items(items)
+        unscored = await run_file_io(lambda: self.state.unscored_due_items(items))
         if not unscored:
-            return self.state.scored_items(items)
+            return await run_file_io(lambda: self.state.scored_items(items))
         scores = await self.interest.score([_content_text(item) for item in unscored], cutoff=now.isoformat())
         if len(scores) != len(unscored):
             raise ValueError("兴趣分数数量与 Content 候选不一致")
@@ -115,5 +127,5 @@ class Duties:
                                                  wake_eligible=payload.get("wake_eligible") is not False),
                 semantic_interest=semantic, scored_at=now,
             ))
-        self.state.record_content_scores(records)
-        return self.state.scored_items(items)
+        await run_file_io(lambda: self.state.record_content_scores(records))
+        return await run_file_io(lambda: self.state.scored_items(items))

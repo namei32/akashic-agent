@@ -1,25 +1,23 @@
-from plugins.context.api import check_summary as _model_summary_check
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 import shutil
-from collections.abc import Mapping
-from typing import cast
-
 import pytest
-
 from tests.fixtures.plugin_workspace import initialize_plugin_workspace
-
 from agent.plugin_composition.config_input import save_config
-
-from agent.plugin_composition.channels import CHANNEL_INPUT, ChannelInboundMessage
+from agent.plugin_composition.channels import CHANNEL_INPUT_V2 as CHANNEL_INPUT, ChannelInboundMessage
 from agent.plugins.manager import PluginManager
-from agent.plugins.snapshot import lease_runtime_snapshot
 from bus.event_bus import EventBus
 from session.log import MessageLog
-from session.message import Control, Input, Output, ToolResult
+from session.message import Input, Output, ToolResult
 
+@asynccontextmanager
+async def live_root(host: PluginManager):
+    """Read the one formal Root used by the installed reply consumer."""
+    root = host.live_root
+    assert root is not None
+    yield root
 
 @asynccontextmanager
 async def application(tmp_path, *, replying, start=True, missing_tool=False, discovery=False, compaction=False,
@@ -46,15 +44,16 @@ async def application(tmp_path, *, replying, start=True, missing_tool=False, dis
             ignore=shutil.ignore_patterns("__pycache__"),
         )
     if updates:
-        from tests.test_delivery_bindings import sources as delivery_sources
+        from tests.support.delivery_sources import sources as delivery_sources
         delivery_sources(sources)
         shutil.copytree(
             Path(__file__).parents[1] / "plugins/delivery_policy",
             sources / "delivery_policy",
             ignore=shutil.ignore_patterns("__pycache__"),
         )
-        shutil.copytree(Path(__file__).parents[1] / "plugins/plugin_update", sources / "plugin_update",
-                        ignore=shutil.ignore_patterns("__pycache__"))
+        for name in ("assets", "plugin_update"):
+            shutil.copytree(Path(__file__).parents[1] / "plugins" / name, sources / name,
+                            ignore=shutil.ignore_patterns("__pycache__"))
     if compaction:
         shutil.copytree(Path(__file__).parents[1] / "plugins/compaction", sources / "compaction",
                         ignore=shutil.ignore_patterns("__pycache__"))
@@ -73,9 +72,10 @@ async def application(tmp_path, *, replying, start=True, missing_tool=False, dis
     provider.mkdir()
     (provider / "plugin.py").write_text('''
 from contextlib import asynccontextmanager
+from functools import partial
 from types import SimpleNamespace
 from pathlib import Path
-from agent.plugin_composition import CHAT_MODELS, SNAPSHOT_SEALING, ServiceKey
+from agent.plugin_composition import CHAT_MODELS, ServiceKey
 from agent.plugin_composition.models import BoundModelDescriptor, CapabilitySources, LLMResponse, ModelCapabilities, ToolCall
 from plugins.models.projection import MODEL_CALLS, MODEL_PROJECTION, ProjectionOwner, MODEL_MESSAGE_CHECKS, MessageChecksOwner
 from plugins.models.content import MODEL_CONTENT, ContentOwner
@@ -84,20 +84,21 @@ from plugins.models.state import _BoundChat, ModelsState
 from plugins.models.settings import MODEL_SETTINGS
 from plugins.models.store import ModelsStore
 from plugins.tools.api import Result
-from plugins.standard_tools.shell import shell_cleanup
+from plugins.standard_tools.shell import ShellOwners, shell_cleanup
+from agent.plugin_composition.tasks import TASKS
+from agent.plugin_composition.bindings import BINDINGS
 from plugins.tools.plugin import TOOLS
 from session.message import ContentPart
 api_version = 3
 name = "test_provider"
 version = "1.0.0"
-inject = (TOOLS,)
+inject = (TOOLS, TASKS, BINDINGS)
 async def apply(ctx):
     calls = []
     store = ModelsStore(ctx.data_root / "models.db", ctx.data_root / "backups")
     store.initialize()
-    settings = ModelsState(store, root_instance_token=ctx.root_instance_token, context=ctx)
+    settings = ModelsState(store, context=ctx)
     await ctx.provide(MODEL_SETTINGS, settings.settings)
-    await ctx.on(SNAPSHOT_SEALING, settings.seal)
     class Driver:
         max_tool_schemas = None
         def estimate_context_tokens(self, messages, tools):
@@ -135,7 +136,9 @@ async def apply(ctx):
     await ctx.require(TOOLS).declare_group(ctx, always_on=True)
     await ctx.require(TOOLS).register(ctx, name="write_evidence", description="record local test evidence",
         parameters={"type":"object"}, open=open)
-    await ctx.provide(ServiceKey("tools.cleanup.v1"), shell_cleanup)
+    await ctx.provide(ServiceKey("tools.cleanup.v1"), partial(
+        shell_cleanup, ctx, ShellOwners(ctx), ctx.require(TASKS).open(ctx),
+    ))
     await ctx.provide(CHAT_MODELS, Models())
     await ctx.provide(MODEL_CALLS, store.read_call)
     await ctx.provide(MODEL_PROJECTION, ProjectionOwner())
@@ -156,7 +159,7 @@ async def apply(ctx):
         module = provider / "plugin.py"
         module.write_text(module.read_text().replace(
             'if len(calls) == 1:',
-            'if len(calls) == 1:\n                return LLMResponse(None, [ToolCall("search-call", "tool_search", {"query": "write_evidence"})])\n            if len(calls) == 2:').replace('declare_group(ctx, always_on=True)', 'declare_group(ctx, description="Write local evidence")').replace(
+            'if len(calls) == 1:\n                return LLMResponse(None, [ToolCall("load-call", "load_tools", {"plugin": "test_provider"})])\n            if len(calls) == 2:').replace('declare_group(ctx, always_on=True)', 'declare_group(ctx, description="Write local evidence")').replace(
             'ToolCall("provider-call", "write_evidence", {})',
             'ToolCall("provider-call", "tool_call", {"name": "write_evidence", "arguments": {}})'))
     if compaction:
@@ -177,9 +180,10 @@ async def apply(ctx):
     artifacts = ChannelAttachmentArtifactStore(
         workspace=workspace, metadata_store=artifact_store
     )
+    event_bus = EventBus()
     host = PluginManager(
         [sources],
-        event_bus=EventBus(),
+        event_bus=event_bus,
         workspace=workspace,
         installed_cache_root=tmp_path / "home/cache",
         message_log=log,
@@ -191,10 +195,30 @@ async def apply(ctx):
             await host.start_runtime()
         yield log, host
     finally:
-        await host.terminate_all()
-        log.close()
-        artifact_store.close()
-
+        termination_error = None
+        try:
+            await host.terminate_all()
+        except BaseException as error:
+            termination_error = error
+        cleanup_errors = []
+        for cleanup in (log.close, artifact_store.close):
+            try:
+                cleanup()
+            except BaseException as error:
+                cleanup_errors.append(error)
+        try:
+            await event_bus.aclose()
+        except BaseException as error:
+            cleanup_errors.append(error)
+        if termination_error is not None:
+            if cleanup_errors:
+                raise BaseExceptionGroup(
+                    "Manager termination and fixture cleanup failed",
+                    [termination_error, *cleanup_errors],
+                ) from termination_error
+            raise termination_error
+        if cleanup_errors:
+            raise BaseExceptionGroup("fixture cleanup failed", cleanup_errors)
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("replying", [False, True])
@@ -203,8 +227,8 @@ async def test_installed_default_reply_is_an_independent_log_consumer(tmp_path, 
     async with application(tmp_path, replying=replying) as (log, host):
         message = ChannelInboundMessage("test", "user", "room", "do the work",
                                         datetime(2026, 9, 5, tzinfo=UTC), {})
-        async with lease_runtime_snapshot(host.snapshot_store) as snapshot:
-            accept = snapshot.composition_root.context.require(CHANNEL_INPUT)
+        async with live_root(host) as root:
+            accept = root.context.require(CHANNEL_INPUT)
             accepted = await accept("test:room", "u1", message)
         assert isinstance(accepted.body, Input)
         if replying:
@@ -218,8 +242,8 @@ async def test_installed_default_reply_is_an_independent_log_consumer(tmp_path, 
             assert [type(row.body) for row in rows] == [Input, Output, ToolResult, Output]
             assert (tmp_path / "effect.txt").read_text() == "once\n"
         else:
-            async with lease_runtime_snapshot(host.snapshot_store) as snapshot:
-                calls = snapshot.composition_root.context.require(ServiceKey("fixture.calls"))
+            async with live_root(host) as root:
+                calls = root.context.require(ServiceKey("fixture.calls"))
                 assert calls == []
                 assert all("[Source messages]" in str(call.messages) for call in calls)
             assert log.reader("test:room").snapshot() == (accepted,)
@@ -227,276 +251,135 @@ async def test_installed_default_reply_is_an_independent_log_consumer(tmp_path, 
 
 
 @pytest.mark.asyncio
-async def test_bad_reply_tool_configuration_fails_before_consuming_any_input(tmp_path):
-    with pytest.raises(RuntimeError, match="插件组合拓扑未就绪"):
-        async with application(tmp_path, replying=True, start=False, missing_tool=True):
-            pytest.fail("坏配置不得启动完整组合")
-    log = MessageLog(tmp_path / "sessions.db")
-    try:
-        assert log.catalog().snapshot_heads() == {}
-    finally:
-        log.close()
-
-
-@pytest.mark.asyncio
-async def test_reply_commits_plugin_metadata_and_history_reads_it_without_the_plugin(tmp_path):
-    """实际插件注册、模型与工具循环、writer 授权和重启读取共用一份附加信息。"""
-    from contextlib import closing
-    from infra.channels.message_view import message_rows
-    from session.message_codec import json_value
-
-    def extra(sources):
-        plugin = sources / "citation"
-        plugin.mkdir()
-        (plugin / "plugin.py").write_text('''
-from plugins.content.plugin import CONTENT
-api_version = 3
-name = "citation"
-version = "1.0.0"
-inject = (CONTENT,)
-async def apply(ctx):
-    async def decode(source, references):
-        return (), {"version": 1, "references": [{"ref": "remembered", "declared": True}]} if source.text else {}
-    await ctx.require(CONTENT).register(ctx, {
-        "name": "citation", "prompt": "", "content": {}, "decode": decode})
-''')
-
-    async with application(tmp_path, replying=True, extra_sources=extra) as (log, host):
-        async with lease_runtime_snapshot(host.snapshot_store) as snapshot:
-            await snapshot.composition_root.context.require(CHANNEL_INPUT)(
-                "s", "u", ChannelInboundMessage("test", "user", "s", "record evidence",
-                                                 datetime(2026, 9, 5, tzinfo=UTC), {}))
-        async def completed():
-            async for _ in log.catalog().follow():
-                for row in log.reader("s").snapshot():
-                    if isinstance(row.body, Output) and row.body.finish == "complete":
-                        return row
-        output = await asyncio.wait_for(completed(), 5)
-        assert json_value(output.metadata) == {"citation": {"version": 1, "references": [{"ref": "remembered", "declared": True}]}}
-        assert all(part.kind != "citation" for part in output.body.parts)
-    shutil.rmtree(tmp_path / "plugins/citation")
-    with closing(MessageLog(tmp_path / "sessions.db")) as restarted:
-        assert restarted.reader("s").get(output.message_id) == output
-        rows = message_rows(restarted.reader("s").read_page())
-        assert rows[-1]["metadata"] == {"citation": {"version": 1, "references": [{"ref": "remembered", "declared": True}]}}
-
-
-@pytest.mark.asyncio
-async def test_default_reply_discovers_then_calls_tool_without_react_search_branch(tmp_path):
+async def test_default_reply_loads_one_complete_granted_plugin_group(tmp_path):
+    """PLG-018: 一个准确插件 ID 只加载该次获授 view 中的一整组 schema。"""
+    import json
     from agent.plugin_composition import ServiceKey
+
     async with application(tmp_path, replying=True, discovery=True) as (log, host):
-        async with lease_runtime_snapshot(host.snapshot_store) as snapshot:
-            await snapshot.composition_root.context.require(CHANNEL_INPUT)(
-                "s", "u", ChannelInboundMessage("test", "user", "s", "record evidence",
-                                                 datetime(2026, 9, 5, tzinfo=UTC), {}))
+        async with live_root(host) as root:
+            accepted = await root.context.require(CHANNEL_INPUT)(
+                "test:room", "u1", ChannelInboundMessage(
+                    "test", "user", "room", "do the work", datetime(2026, 9, 5, tzinfo=UTC), {},
+                ),
+            )
+        assert isinstance(accepted.body, Input)
+
         async def completed():
             async for _ in log.catalog().follow():
-                rows = log.reader("s").snapshot()
-                if isinstance(rows[-1].body, Output) and rows[-1].body.finish == "complete":
+                rows = log.reader("test:room").snapshot()
+                if any(isinstance(row.body, Output) and row.body.finish == "complete" for row in rows):
                     return rows
+
         rows = await asyncio.wait_for(completed(), 5)
         assert rows is not None
         assert [type(row.body) for row in rows] == [
-            Input,
-            Output,
-            ToolResult,
-            Output,
-            ToolResult,
-            Output,
+            Input, Output, ToolResult, Output, ToolResult, Output,
         ]
-        assert rows[2].body.parts[-1].kind == "text"
+        value = rows[2].body.parts[0].value
+        assert isinstance(value, str)
+        loaded = json.loads(value)
+        assert loaded["plugin"] == "test_provider"
+        assert [tool["function"]["name"] for tool in loaded["tools"]] == ["write_evidence"]
         assert (tmp_path / "effect.txt").read_text() == "once\n"
-        async with lease_runtime_snapshot(host.snapshot_store) as snapshot:
-            calls = snapshot.composition_root.context.require(
-                ServiceKey("fixture.calls")
-            )
-            expected = {"tool_search", "tool_call"}
-            assert {tool["function"]["name"] for tool in calls[0].tools} == expected
-            assert {tool["function"]["name"] for tool in calls[1].tools} == expected
-            import json
-            from agent.plugin_composition import CHAT_MODELS
-            from agent.plugin_composition.bindings import BINDINGS
-            from plugins.models.content import render_content
-            from plugins.models.projection import MODEL_CALLS, MessageProjection
-            from plugins.tools.plugin import TOOLS
-            payload = json.loads(cast(str, rows[2].body.parts[0].value))
-            assert payload["matched_groups"][0]["tools"][0]["function"]["name"] == "write_evidence"
-            assert "matched_groups" in str(calls[1].messages)
-            ctx = snapshot.composition_root.context
-            # 新投影从持久日志重建；摘要覆盖搜索结果时，只有请求视图失去 schema。
-            async with ctx.require(CHAT_MODELS).execution() as execution:
-                model = execution.chat("agent")
-                bindings = ctx.require(BINDINGS)
-                def tool_name(binding):
-                    return cast(str, cast(Mapping[str, object], bindings.describe(binding, TOOLS)["tool"])["name"])
-                projection = MessageProjection(model, check_summary=_model_summary_check, source="conversation", render_content=lambda part: render_content(part, artifacts={}),
-                                               tool_name=tool_name, read_call=ctx.require(MODEL_CALLS))
-                before = log.reader("s").snapshot()
-                retained = projection.render(before, after_seq=-1)
-                compacted = projection.render(before, after_seq=rows[2].seq)
-                assert "matched_groups" in str(retained.messages)
-                assert "matched_groups" not in str(compacted.messages)
-                assert log.reader("s").snapshot() == before
 
-
-@pytest.mark.asyncio
-async def test_default_reply_applies_provider_tool_capacity_before_first_request(tmp_path):
-    def constrain_provider(sources):
-        module = sources / "test_provider/plugin.py"
-        source = module.read_text()
-        assert source.count("max_tool_schemas = None") == 1
-        assert source.count('parameters={"type":"object"}, open=open)') == 1
-        module.write_text(
-            source.replace("max_tool_schemas = None", "max_tool_schemas = 1")
+        async with live_root(host) as root:
+            requests = root.context.require(ServiceKey("fixture.calls"))
+        prompt = next(
+            row["content"] for row in requests[0].messages if row["role"] == "system"
         )
-
-    from agent.plugin_composition import ServiceKey
-    async with application(
-        tmp_path, replying=True, discovery=True, extra_sources=constrain_provider
-    ) as (log, host):
-        async with lease_runtime_snapshot(host.snapshot_store) as snapshot:
-            await snapshot.composition_root.context.require(CHANNEL_INPUT)(
-                "s", "u", ChannelInboundMessage("test", "user", "s", "record evidence",
-                                                 datetime(2026, 9, 5, tzinfo=UTC), {}))
-
-        async def failed():
-            async for _ in log.catalog().follow():
-                rows = log.reader("s").snapshot()
-                if isinstance(rows[-1].body, Control) and rows[-1].body.action == "failure":
-                    return rows
-
-        rows = await asyncio.wait_for(failed(), 5)
-        assert rows is not None
-        assert isinstance(rows[-1].body, Control)
-        assert "容量不足" in (rows[-1].body.reason or "")
-        async with lease_runtime_snapshot(host.snapshot_store) as snapshot:
-            calls = snapshot.composition_root.context.require(ServiceKey("fixture.calls"))
-            assert calls == []
+        assert "test_provider · Write local evidence · 1 个工具" in prompt
+        assert "write_evidence" not in prompt
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("has_cut,soft_only,large_summary", [(True, False, False), (False, False, False), (False, True, False), (False, False, True)])
-async def test_actual_reply_compacts_history_before_provider_and_records_each_successful_use(tmp_path, has_cut, soft_only, large_summary):
+@pytest.mark.parametrize("vision", [False, True])
+@pytest.mark.parametrize("attach_image", [False, True])
+async def test_reply_projects_images_by_model_capability(tmp_path, vision, attach_image):
+    """图片与附件身份沿同一回复链路进入模型，文本模型保留明确能力说明。"""
+    import io
+    from PIL import Image
     from agent.plugin_composition import ServiceKey
-    from plugins.compaction.records import SummaryRecords
-    from plugins.content.plugin import check_text
-    from plugins.models.projection import MODEL_CALLS
-    from session.message import ContentPart, Control
+    from agent.plugin_contracts import ContentPart, Control
+    from infra.channels.artifacts import ChannelAttachmentArtifactStore
+    from plugins.content.plugin import check_artifact
+    from session.artifact_store import ArtifactStore
+    from session.artifacts import AttachmentKind
 
-    async with application(tmp_path, replying=True, start=False, compaction=True,
-                           output_tokens=1000 if soft_only or large_summary else 4096,
-                           keep_recent_tokens=6000 if soft_only else 128, summary_padding=2400 if large_summary else 0) as (log, host):
-        writer = log.writer("s", author="test", source="conversation", body_types=(Input, Output),
-                            content={"text": check_text})
-        size = 5000 if has_cut or soft_only or large_summary else 6000
-        for index in range(4 if has_cut or large_summary else 3):
-            writer.append(f"old-u{index}", Input((ContentPart("text", f"old input {index}: " + "x" * size),)))
-            writer.append(f"old-a{index}", Output((ContentPart("text", f"old answer {index}: " + "y" * size),), "complete"))
-        writer.append("current", Input((ContentPart("text", "current request"),)))
-        original = log.reader("s").snapshot()
-        await host.start_runtime()
-        async def completed():
-            async for _ in log.catalog().follow():
-                rows = log.reader("s").snapshot()
-                if any(row.seq > original[-1].seq and (
-                    isinstance(row.body, Output) and row.body.finish == "complete"
-                    or isinstance(row.body, Control) and row.body.action == "failure") for row in rows):
-                    return rows
-        rows = await asyncio.wait_for(completed(), 10)
-        assert rows[:len(original)] == original
-        record = SummaryRecords(log.owner("plugin:compaction")).head("s")
-        if not has_cut:
-            assert record is None
-            assert isinstance(rows[-1].body, Control) and rows[-1].body.action == "failure"
-            reason = rows[-1].body.reason
-            assert reason is not None
-            if large_summary:
-                assert "摘要后的完整请求仍超过" in reason
-            elif soft_only:
-                assert "近期原文保留量内没有合法摘要切点" in reason
-            async with lease_runtime_snapshot(host.snapshot_store) as snapshot:
-                calls = snapshot.composition_root.context.require(ServiceKey("fixture.calls"))
-                assert len(calls) == (1 if large_summary else 0)
-                assert all("[Source messages]" in str(call.messages) for call in calls)
-            assert not (tmp_path / "effect.txt").exists()
-            return
-        assert record is not None and record.tokens_after < record.tokens_before
-        assert record.source_message_ids == tuple(row.message_id for row in original[4:6])
-        outputs = [row for row in rows[len(original):] if isinstance(row.body, Output)]
-        assert [row.body.finish for row in outputs] == ["continue", "complete"]
-        refs = [next(cast(Mapping[str, object], part.value)["reference"] for part in row.body.parts
-                     if isinstance(part, ContentPart) and part.kind == "context.summary") for row in outputs]
-        assert refs[0] == refs[1]
-        async with lease_runtime_snapshot(host.snapshot_store) as snapshot:
-            ctx = snapshot.composition_root.context
-            assert all(ctx.require(MODEL_CALLS)(identity)["state"] == "success" for identity in record.model_call_ids)
-            calls = ctx.require(ServiceKey("fixture.calls"))
-            assert len(calls) == 3
-            assert all(all(f"old {role} {index}:" not in str(request.messages)
-                           for role in ("input", "answer") for index in (0, 1)) for request in calls)
-            assert all("current request" in str(request.messages) for request in calls[1:])
-        assert (tmp_path / "effect.txt").read_text() == "once\n"
+    def vision_provider(sources):
+        module = sources / "test_provider/plugin.py"
+        module.write_text(module.read_text().replace(
+            "ModelCapabilities(context_window=10000)",
+            f'ModelCapabilities(context_window=10000, input_modalities={(("text", "image") if vision else ("text",))!r})',
+        ))
 
+    async with application(tmp_path, replying=True, extra_sources=vision_provider) as (log, host):
+        # 1. Publish five real image artifacts on separate settled history messages.
+        metadata = ArtifactStore(tmp_path / "sessions.db")
+        store = ChannelAttachmentArtifactStore(
+            workspace=tmp_path / "workspace", metadata_store=metadata,
+        )
+        try:
+            writer = log.writer(
+                "test:room", author="scheduler", source="scheduler", body_types=(Output,),
+                content={"artifact_ref": check_artifact},
+            )
+            refs = []
+            for index in range(5):
+                data = io.BytesIO()
+                Image.new("RGB", (2, 2), (index * 40, 0, 0)).save(data, format="PNG")
+                ref = await store.import_bytes(
+                    data.getvalue(), kind=AttachmentKind.IMAGE,
+                    filename=f"history-{index}.png", media_type="image/png",
+                )
+                refs.append(ref)
+                writer.append(f"history-{index}", Output((ContentPart("artifact_ref", ref.artifact_id),), "complete"))
+            writer.expire()
+        finally:
+            metadata.close()
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("bad_call", [
-    'ToolCall("bad-call", "tool_call", {"name": "write_evidence", "arguments": "{}"})',
-    'ToolCall("bad-call", "tool_call", {"name": "uninstalled_tool", "arguments": {}})',
-    'ToolCall("bad-call", "old_direct_tool", {})',
-])
-async def test_reply_recovers_rejected_protocol_without_creating_tool_effect(tmp_path, bad_call):
-    """真实 Reply 反馈格式或过期名称错误，修正后只执行有效调用并可重放。"""
-    from agent.plugin_composition import ServiceKey
-    from session.message import ContentPart, ToolCall
-
-    def extra(sources):
-        provider = sources / "test_provider/plugin.py"
-        code = provider.read_text().replace(
-            'return LLMResponse(None, [ToolCall("provider-call", "write_evidence", {})])',
-            f'return LLMResponse(None, [{bad_call}])\n'
-            '            if len(calls) == 2:\n'
-            '                return LLMResponse(None, [ToolCall("good-call", "tool_call", {"name": "write_evidence", "arguments": {}})])',
-        ).replace('declare_group(ctx, always_on=True)', 'declare_group(ctx, description="Write local evidence")')
-        provider.write_text(code)
-
-    async with application(tmp_path, replying=True, extra_sources=extra) as (log, host):
-        async with lease_runtime_snapshot(host.snapshot_store) as snapshot:
-            ctx = snapshot.composition_root.context
-            accept = ctx.require(CHANNEL_INPUT)
-            calls = ctx.require(ServiceKey("fixture.calls"))
-            await accept("test:room", "bad-input", ChannelInboundMessage(
-                "test", "user", "room", "do the work", datetime.now(UTC), {},
-            ))
-        async def completed(count):
-            async for _ in log.catalog().follow():
-                rows = log.reader("test:room").snapshot()
-                if any(isinstance(row.body, Control) and row.body.action == "failure" for row in rows):
-                    pytest.fail("模型协议错误终止了回复")
-                if sum(isinstance(row.body, Output) and row.body.finish == "complete" for row in rows) == count:
-                    return rows
-        rows = await asyncio.wait_for(completed(1), 5)
-        assert rows is not None
-        assert (tmp_path / "effect.txt").read_text() == "once\n"
-        assert len(calls) == 3
-        assert [type(row.body) for row in rows] == [Input, Output, Output, ToolResult, Output]
-        rejected = rows[1].body
-        assert isinstance(rejected, Output) and rejected.finish == "continue"
-        assert not any(isinstance(part, ToolCall) for part in rejected.parts)
-        assert any(isinstance(part, ContentPart) and part.kind == "model.tool_rejection" for part in rejected.parts)
-        for request in calls[1:]:
-            rejection = [row for row in request.messages if row.get("tool_call_id") == "bad-call"]
-            assert len(rejection) == 1 and "调用未执行" in str(rejection[0]["content"])
-            system = [row for row in request.messages if row["role"] == "system"]
-            assert "test_provider：Write local evidence" in str(system)
-            assert all("可搜索工具目录" not in str(row) for row in request.messages if row["role"] != "system")
-        before = rows
-        async with lease_runtime_snapshot(host.snapshot_store) as snapshot:
-            await snapshot.composition_root.context.require(CHANNEL_INPUT)(
-                "test:room", "follow-up", ChannelInboundMessage(
-                    "test", "user", "room", "continue", datetime.now(UTC), {},
+        # 2. Observe the durable terminal result, including the old failure path.
+        async with live_root(host) as root:
+            accepted = await root.context.require(CHANNEL_INPUT)(
+                "test:room", "u1", ChannelInboundMessage(
+                    "test", "user", "room", "Will it rain tomorrow morning?",
+                    datetime(2026, 9, 29, tzinfo=UTC), {},
+                    attachments=(refs[-1],) if attach_image else (),
                 ),
             )
-        await asyncio.wait_for(completed(2), 5)
-        assert log.reader("test:room").snapshot()[:len(before)] == before
-        assert any(row.get("tool_call_id") == "bad-call" for row in calls[-1].messages)
-        assert (tmp_path / "effect.txt").read_text() == "once\n"
+            requests = root.context.require(ServiceKey("fixture.calls"))
+        assert log.reader("test:room").attachments(accepted.message_id) == ((refs[-1],) if attach_image else ())
+
+        async def completed():
+            async for _ in log.catalog().follow():
+                for row in log.reader("test:room").snapshot():
+                    if row.seq > accepted.seq and (
+                        isinstance(row.body, Control)
+                        or isinstance(row.body, Output) and row.body.finish == "complete"
+                    ):
+                        return row
+
+        terminal = await asyncio.wait_for(completed(), 5)
+        assert terminal is not None
+        assert isinstance(terminal.body, Output), terminal.body
+        assert terminal.body.finish == "complete"
+        assert len(requests) == 2
+        for request in requests:
+            images = [part for row in request.messages if isinstance(row["content"], (list, tuple))
+                      for part in row["content"] if part["type"] == "image_url"]
+            assert len(images) == (5 + int(attach_image) if vision else 0)
+            text = str(request.messages)
+            if vision:
+                import base64
+                colors = set()
+                for part in images:
+                    encoded = part["image_url"]["url"].split(",", 1)[1]
+                    with Image.open(io.BytesIO(base64.b64decode(encoded, validate=True))) as image:
+                        colors.add(image.getpixel((0, 0)))
+                assert colors == {(index * 40, 0, 0) for index in range(5)}
+            else:
+                assert "data:image" not in text
+                assert "当前模型不接收图片" in text
+            for ref in refs:
+                assert ref.artifact_id in text
+                assert ref.filename in text

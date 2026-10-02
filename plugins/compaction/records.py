@@ -3,14 +3,22 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Annotated, Literal, Self, TypeAlias, cast
 from collections.abc import Callable, Mapping
+from typing import Annotated, Literal, Self, TypeAlias, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from agent.plugin_composition import ServiceKey
 
-from agent.plugin_composition.messages import MessageConflict, MessageReader, OwnerStore, OwnerTransaction
+from agent.plugin_composition.messages import (
+    MessageConflict,
+    MessageReader,
+    OwnerStore,
+    OwnerTransaction,
+)
 from agent.plugin_contracts import Message, json_value
+from agent.plugin_contracts.compaction import (
+    COMPACTION_SUMMARIES as COMPACTION_SUMMARIES,
+)
+
 Text = Annotated[str, Field(min_length=1)]
 Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 
@@ -258,9 +266,6 @@ class SummaryLookup:
         return _check_lineage(record, self._read, session_id)
 
 
-COMPACTION_SUMMARIES = ServiceKey[SummaryLookup]("compaction.summaries.v1")
-
-
 class SummaryRecords:
     """compaction 的唯一发布入口；调用者只能创建记录或读取已有内容。"""
 
@@ -305,7 +310,7 @@ class SummaryRecords:
             raise ValueError("摘要 head 没有对应 Session 的已发布记录")
         return record
 
-    def publish(
+    async def publish(
         self, record: SummaryRecord, reader: MessageReader, *, parent: StoredSummary | None,
         summary_range: Callable[[tuple[Message, ...], tuple[str, ...]], range],
     ) -> SummaryRecord:
@@ -344,4 +349,4 @@ class SummaryRecords:
                         expected_version=None if previous is None else previous.version)
             return record
 
-        return self._state.transact(commit)
+        return await self._state.transact_async(commit)

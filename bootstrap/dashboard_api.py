@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from agent.plugins.manager import PluginManager
 
 import uvicorn
 from fastapi import FastAPI
@@ -54,12 +59,19 @@ def create_dashboard_app(
     workspace: Path,
     *,
     plugin_manager: object | None = None,
+    host_bridge_status: Callable[[], dict[str, Any]] | None = None,
 ) -> FastAPI:
     workspace.mkdir(parents=True, exist_ok=True)
     project_root = Path(__file__).resolve().parent.parent
     static_dir = project_root / "static" / "dashboard"
 
     app = FastAPI(title="Akashic Dashboard API")
+    if host_bridge_status is not None:
+
+        @app.get("/api/runtime/host-bridge")
+        async def read_host_bridge_status() -> dict[str, Any]:
+            return host_bridge_status()
+
     # Vite 构建产物被 gitignore，新 clone 或 CI 环境可能没有该目录。
     # 预先创建目录并在挂载时关闭目录检查，避免 app 创建依赖构建是否执行；
     # dashboard_index() 会在入口文件缺失时报告错误。
@@ -85,23 +97,13 @@ def create_dashboard_app(
 
     if plugin_manager is not None:
         from agent.plugins.dashboard_host import (
-            PluginDashboardHost,
-            SnapshotDashboardMiddleware,
+            LiveDashboardMiddleware,
         )
 
-        dashboard_host = PluginDashboardHost(
-            core_routes=tuple(app.routes),
-        )
-        snapshot = plugin_manager.current_snapshot
-        if snapshot is not None:
-            dashboard_host.prepare_initial_snapshot(snapshot)
-        plugin_manager.bind_dashboard_preparer(
-            dashboard_host.prepare_snapshot,
-            validation_releaser=dashboard_host.release_validation,
-        )
+        plugin_manager.configure_dashboard_routes(tuple(app.routes))
         app.add_middleware(
-            SnapshotDashboardMiddleware,
-            snapshot_store=plugin_manager.snapshot_store,
+            LiveDashboardMiddleware,
+            plugin_manager=cast("PluginManager", plugin_manager),
         )
 
     return app
@@ -131,11 +133,13 @@ def _build_dashboard_uvicorn_config(
     port: int | None,
     uds: str | None = None,
     plugin_manager: object | None = None,
+    host_bridge_status: Callable[[], dict[str, Any]] | None = None,
 ) -> uvicorn.Config:
     config = uvicorn.Config(
         create_dashboard_app(
             workspace,
             plugin_manager=plugin_manager,
+            host_bridge_status=host_bridge_status,
         ),
         host=host or "127.0.0.1",
         port=port or 2236,
@@ -153,6 +157,7 @@ def build_dashboard_server(
     port: int | None = None,
     uds: str | None = None,
     plugin_manager: object | None = None,
+    host_bridge_status: Callable[[], dict[str, Any]] | None = None,
 ) -> uvicorn.Server:
     config = _build_dashboard_uvicorn_config(
         workspace=workspace,
@@ -160,5 +165,6 @@ def build_dashboard_server(
         port=port,
         uds=uds,
         plugin_manager=plugin_manager,
+        host_bridge_status=host_bridge_status,
     )
     return uvicorn.Server(config)

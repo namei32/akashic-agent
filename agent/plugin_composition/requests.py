@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import cast
+from typing import TYPE_CHECKING, Any, cast
 
 from agent.plugin_composition.model import CompositionError, ServiceKey
+
+if TYPE_CHECKING:
+    from agent.plugin_composition.context import Context
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,13 +34,29 @@ class RequestContext:
         repr=False,
     )
 
-    _resolve: Callable[[ServiceKey[object]], object] | None = field(default=None, repr=False)
+    _resolve: Callable[[ServiceKey[Any]], object] | None = field(default=None, repr=False)
+    _borrow: Callable[[ServiceKey[Any]], AbstractContextManager[object | None]] | None = field(default=None, repr=False)
+    _context: Context | None = field(default=None, repr=False, compare=False)
+
+    def _require_context(self, key: ServiceKey[Any], service: object) -> Context:
+        """Core 在当前请求许可内取得原 owner，不向插件开放完整 Context API。"""
+        if self.require(key) is not service:
+            raise CompositionError("SERVICE_SCOPE_MISMATCH", "授权服务不属于当前请求")
+        if self._context is None:
+            raise CompositionError("REQUEST_SCOPE_MISSING", "插件没有请求 owner")
+        return self._context
 
     def require[T](self, key: ServiceKey[T]) -> T:
         """在 async 路由的当前请求租约内取得声明能力，不暴露宿主 Root。"""
         if self._resolve is None:
             raise CompositionError("REQUEST_SCOPE_MISSING", "插件没有请求能力入口")
-        return cast(T, self._resolve(cast(ServiceKey[object], key)))
+        return cast(T, self._resolve(cast(ServiceKey[Any], key)))
+
+    def borrow[T](self, key: ServiceKey[T]) -> AbstractContextManager[T | None]:
+        """在当前请求内借用可选能力；缺席返回 None，借用期间保护 provider。"""
+        if self._borrow is None:
+            raise CompositionError("REQUEST_SCOPE_MISSING", "插件没有请求借用入口")
+        return cast(AbstractContextManager[T | None], self._borrow(key))
 
     def workspace_root(self, name: str) -> Path:
         """返回与当前插件 generation 相同的声明式 workspace root。"""

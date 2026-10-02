@@ -3,19 +3,20 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 from uuid import uuid4
 
 from agent.plugin_composition.archive import (
     PluginArchive,
-    encode_tree,
-    tree_entries,
     sync_directory,
 )
 from agent.plugins.static_manifest import StaticPluginManifest, StaticPythonRuntime
@@ -23,8 +24,121 @@ from agent.plugins.static_manifest import StaticPluginManifest, StaticPythonRunt
 ENVIRONMENT_FILE = ".akashic-python-environment"
 
 
+@dataclass(frozen=True)
+class OfflineWheels:
+    """A wheel directory and the digest expected by its caller."""
+
+    directory: Path
+    tree_sha256: str
+
+
+def wheel_tree_sha256(directory: Path) -> str:
+    """Hash sorted wheel names and bytes without following links."""
+
+    # 1. Check every path segment, then lock each file to the inode being hashed.
+    if not isinstance(directory, Path) or not directory.is_absolute():
+        raise ValueError("离线 wheel 目录必须是绝对路径")
+    current = Path(directory.anchor)
+    for part in directory.parts[1:]:
+        current /= part
+        info = current.lstat()
+        if not stat.S_ISDIR(info.st_mode):
+            raise ValueError(f"离线 wheel 路径不是普通目录: {current}")
+    entries = sorted(directory.iterdir(), key=lambda item: item.name.encode("utf-8"))
+    if not entries:
+        raise ValueError("离线 wheel 目录不能为空")
+    # 2. The exact serialization is UTF-8 filename, NUL, lowercase hex SHA-256, LF.
+    digest = hashlib.sha256()
+    from pip._vendor.packaging.utils import InvalidWheelFilename, parse_wheel_filename
+
+    for path in entries:
+        before = path.lstat()
+        if not stat.S_ISREG(before.st_mode) or path.suffix != ".whl":
+            raise ValueError(f"离线输入只能包含普通 .whl 文件: {path}")
+        try:
+            _ = parse_wheel_filename(path.name)
+        except InvalidWheelFilename as error:
+            raise ValueError(f"离线 wheel 文件名无效: {path.name}") from error
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            opened = os.fstat(fd)
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                raise RuntimeError(f"离线 wheel 在读取前变化: {path}")
+            with os.fdopen(fd, "rb", closefd=False) as stream:
+                file_hash = hashlib.file_digest(stream, "sha256").hexdigest()
+            after = os.fstat(fd)
+            if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != (
+                before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns
+            ):
+                raise RuntimeError(f"离线 wheel 在读取中变化: {path}")
+        finally:
+            os.close(fd)
+        digest.update(path.name.encode("utf-8") + b"\0" + file_hash.encode("ascii") + b"\n")
+    return digest.hexdigest()
+
+
+def _verify_offline_wheels(wheels: OfflineWheels) -> str:
+    if not isinstance(wheels, OfflineWheels) or not isinstance(wheels.tree_sha256, str):
+        raise ValueError("离线 wheel 输入无效")
+    expected = wheels.tree_sha256
+    if len(expected) != 64 or any(char not in "0123456789abcdef" for char in expected):
+        raise ValueError("离线 wheel 摘要必须是小写 SHA-256")
+    actual = wheel_tree_sha256(wheels.directory)
+    if actual != expected:
+        raise ValueError("离线 wheel 目录摘要不匹配")
+    return actual
+
+
+def _check_offline_requirements(path: Path) -> None:
+    """Accept only named PEP 508 packages, leaving the source file unchanged."""
+
+    from pip._vendor.packaging.requirements import InvalidRequirement, Requirement
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    found = False
+    for number, raw in enumerate(lines, 1):
+        line = raw.split(" #", 1)[0].strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\\" in line:
+            raise ValueError(f"离线 requirements 第 {number} 行不支持续行或路径")
+        if re.search(r"\.(?:tar(?:\.(?:gz|bz2|xz|zst))?|tgz|zip|whl)(?:\s|$)", line, re.IGNORECASE):
+            raise ValueError(f"离线 requirements 第 {number} 行不支持本地包或源码包")
+        if (path.parent / line).exists():
+            raise ValueError(f"离线 requirements 第 {number} 行不支持本地路径")
+        try:
+            requirement = Requirement(line)
+        except InvalidRequirement as error:
+            raise ValueError(f"离线 requirements 第 {number} 行不是普通包要求: {line}") from error
+        if requirement.url is not None:
+            raise ValueError(f"离线 requirements 第 {number} 行不支持 URL/VCS: {line}")
+        found = True
+    if not found:
+        raise ValueError("离线 wheel 输入只用于非空普通 requirements")
+
+
+def preflight_offline_runtime(
+    code: Path, runtime: StaticPythonRuntime, wheels: OfflineWheels, destination: Path,
+) -> None:
+    """Check the target interpreter's wheel closure before state migration."""
+
+    requirements = code / runtime.requirements
+    _check_offline_requirements(requirements)
+    _ = _verify_offline_wheels(wheels)
+    if not destination.is_dir() or destination.is_symlink():
+        raise ValueError("离线依赖检查目标必须是已有普通目录")
+    _ = subprocess.run(
+        [sys.executable, "-I", "-m", "pip", "--isolated", "download", "--no-index",
+         f"--find-links={wheels.directory}", "--only-binary=:all:",
+         "--no-cache-dir", "--no-input", "--dest", str(destination),
+         "-r", str(requirements)],
+        check=True, capture_output=True, text=True,
+    )
+    _ = _verify_offline_wheels(wheels)
+
+
 class PythonEnvironments:
-    """在最终路径创建固定 Python 环境；恢复只验证，不安装或修复依赖。"""
+    """安装时准备最终路径，运行时直接读取已选环境。"""
 
     def __init__(self, workspace: Path) -> None:
         self.path = workspace / "runtime" / "plugin-python-environments"
@@ -36,28 +150,43 @@ class PythonEnvironments:
     def archive(self) -> PluginArchive:
         if not self._archive_path.is_dir():
             raise FileNotFoundError("Python 环境归档缺失")
-        return PluginArchive(self._archive_path)
+        return PluginArchive(self._archive_path, create=False)
 
-    def prepare(self, code: Path, runtime: StaticPythonRuntime) -> str:
+    def prepared(self, code_id: str, runtime: StaticPythonRuntime, *, wheel_digest: str = "") -> str:
+        """Read an already prepared distribution environment; never install at load."""
+        value = _environment_input(code_id, runtime, wheel_digest)
+        pointer = self.path / (hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest() + ".ref")
+        if pointer.is_symlink():
+            raise ValueError("Python 环境引用不能是符号链接")
+        ref = pointer.read_text()
+        self.open(ref)
+        return ref
+
+    def prepare(
+        self, code: Path, runtime: StaticPythonRuntime, *,
+        offline_wheels: OfflineWheels | None = None,
+    ) -> str:
         """安装 owner 首次解析依赖；环境始终留在创建时的最终目录。"""
+        wheel_digest = None
+        if offline_wheels is not None:
+            _check_offline_requirements(code / runtime.requirements)
+            wheel_digest = _verify_offline_wheels(offline_wheels)
         self.path.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._archive_path.mkdir(mode=0o700, parents=True, exist_ok=True)
-        # 1. pip 可引用同包内文件，因此固定整个安装输入，不能只 hash 顶层 requirements。
+        # 1. 固定完整代码输入；其中已包含 requirements 与本地构建文件。
         code_id = self.archive.save(
             code, exclude=frozenset({".venv", "node_modules", ENVIRONMENT_FILE})
         )
         source = self.archive.open(code_id)
-        base = _base_profile(
+        executable = (
             Path(sys.base_prefix)
             / "bin"
             / f"python{sys.version_info.major}.{sys.version_info.minor}"
-        )
-        requirements = _requirements(source, runtime)
-        input_value: dict[str, object] = {
-            "code": code_id,
-            "base": base,
-            "requirements": requirements,
-        }
+        ).resolve(strict=True)
+        if offline_wheels is not None:
+            _check_offline_requirements(source / runtime.requirements)
+            _ = _verify_offline_wheels(offline_wheels)
+        input_value = _environment_input(code_id, runtime, wheel_digest or "")
         input_id = hashlib.sha256(
             json.dumps(input_value, sort_keys=True).encode()
         ).hexdigest()
@@ -66,7 +195,7 @@ class PythonEnvironments:
             if pointer.is_symlink():
                 raise ValueError("Python 环境引用不能是符号链接")
             ref = pointer.read_text()
-            _ = self.open(ref, source, runtime)
+            _ = self.open(ref)
             return ref
 
         # 2. 不 rename venv；脚本 shebang 与 .pth 中的绝对路径从创建起就有效。
@@ -81,7 +210,7 @@ class PythonEnvironments:
             options = [] if has_requirements else ["--without-pip"]
             _run(
                 [
-                    cast(str, base["executable"]),
+                    str(executable),
                     "-I",
                     "-m",
                     "venv",
@@ -96,38 +225,39 @@ class PythonEnvironments:
                 build_source = root / "source"
                 _ = shutil.copytree(source, build_source, symlinks=True)
                 requirements_path = build_source / runtime.requirements
-                _run(
-                    [
-                        str(venv / "bin/python"),
-                        "-E",
-                        "-s",
-                        "-m",
-                        "pip",
-                        "--disable-pip-version-check",
-                        "install",
-                        "-r",
-                        str(requirements_path),
-                    ],
-                    build_source,
-                )
-            if _base_profile(Path(cast(str, base["executable"]))) != base:
-                raise RuntimeError("创建环境期间 base Python 发生变化")
-            entries = tree_entries(root)
-            for relative, kind, _ in entries:
-                path = root / relative
-                if kind == "file":
+                if offline_wheels is None:
+                    command = [
+                        str(venv / "bin/python"), "-E", "-s", "-m", "pip",
+                        "--disable-pip-version-check", "install", "-r", str(requirements_path),
+                    ]
+                else:
+                    _ = _verify_offline_wheels(offline_wheels)
+                    command = [
+                        str(venv / "bin/python"), "-I", "-m", "pip", "--isolated",
+                        "--disable-pip-version-check", "install", "--no-index",
+                        f"--find-links={offline_wheels.directory}", "--only-binary=:all:",
+                        "--no-cache-dir", "--no-input", "-r", str(requirements_path),
+                    ]
+                _run(command, build_source)
+                if offline_wheels is not None:
+                    _ = _verify_offline_wheels(offline_wheels)
+            for current, _, files in os.walk(root, topdown=False):
+                for name in files:
+                    path = Path(current) / name
+                    if path.is_symlink():
+                        continue
                     path.chmod(0o555 if path.stat().st_mode & 0o111 else 0o444)
                     with path.open("rb") as stream:
                         os.fsync(stream.fileno())
-            for current, _, _ in os.walk(root, topdown=False):
                 sync_directory(Path(current))
             sync_directory(self.path)
+            if offline_wheels is not None:
+                _ = _verify_offline_wheels(offline_wheels)
             ref = self.archive.save_descriptor(
                 {
                     "version": 1,
                     "location": location,
                     "input": input_value,
-                    "tree": hashlib.sha256(encode_tree(entries)).hexdigest(),
                 }
             )
             published = True
@@ -148,14 +278,14 @@ class PythonEnvironments:
                 sync_directory(self.path)
             finally:
                 pending.unlink()
-            _ = self.open(ref, source, runtime)
+            _ = self.open(ref)
             return ref
         finally:
             if not published:
                 shutil.rmtree(root)
 
-    def open(self, ref: str, code: Path, runtime: StaticPythonRuntime) -> Path:
-        """验证完整恢复材料；缺失、损坏或解释器变化都不能借用当前环境。"""
+    def open(self, ref: str) -> Path:
+        """按安装引用读取环境目录，不扫描内容或探测解释器。"""
         if self.path.is_symlink() or not self.path.is_dir():
             raise FileNotFoundError("Python 环境根缺失或是符号链接")
         record = self.archive.read_descriptor(ref)
@@ -167,53 +297,20 @@ class PythonEnvironments:
         ):
             raise ValueError("Python 环境路径身份无效")
         root = self.path / location
-        input_value = cast(Mapping[str, object], record["input"])
-        expected_code = self.archive.open(cast(str, input_value["code"]))
-        if tree_entries(code) != tree_entries(expected_code):
-            raise RuntimeError("Python 环境与固定安装输入不一致")
-        if input_value["requirements"] != _requirements(code, runtime):
-            raise RuntimeError("Python 环境 requirements 不一致")
-        base = cast(Mapping[str, object], input_value["base"])
-        if _base_profile(Path(cast(str, base["executable"]))) != base:
-            raise RuntimeError("Python 环境 base interpreter 已变化")
-        if (
-            hashlib.sha256(encode_tree(tree_entries(root))).hexdigest()
-            != record["tree"]
-        ):
-            raise RuntimeError("Python 环境内容缺失或损坏")
+        if root.is_symlink() or not root.is_dir():
+            raise FileNotFoundError(f"Python 环境目录缺失或是符号链接: {root}")
         return root
 
 
-def _base_profile(executable: Path) -> dict[str, object]:
-    """固定机器上的 base Python；不声称环境可跨机器或系统升级搬运。"""
-    path = executable.resolve(strict=True)
-    with path.open("rb") as stream:
-        digest = hashlib.file_digest(stream, "sha256").hexdigest()
-    result = subprocess.run(
-        [
-            str(path),
-            "-I",
-            "-S",
-            "-c",
-            "import json,sys; print(json.dumps([sys.version,sys.implementation.cache_tag,sys.base_prefix]))",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return {
-        "executable": str(path),
-        "sha256": digest,
-        "profile": tuple(json.loads(result.stdout)),
+def _environment_input(code_id: str, runtime: StaticPythonRuntime, wheel_digest: str) -> dict[str, object]:
+    value: dict[str, object] = {
+        "code": code_id,
+        "base": {"executable": str((Path(sys.base_prefix) / "bin" / f"python{sys.version_info.major}.{sys.version_info.minor}").resolve(strict=True))},
+        "runtime_root": runtime.runtime_root,
     }
-
-
-def _requirements(code: Path, runtime: StaticPythonRuntime) -> dict[str, str]:
-    return {
-        runtime.requirements: hashlib.sha256(
-            (code / runtime.requirements).read_bytes()
-        ).hexdigest()
-    }
+    if wheel_digest:
+        value["wheel_tree_sha256"] = wheel_digest
+    return value
 
 
 def read_environment_refs(code: Path, manifest: StaticPluginManifest) -> dict[str, str]:

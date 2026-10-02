@@ -38,7 +38,9 @@
   Root 关闭也重试同一 Effect，而非创建新的会话。
 
 三个 provider 的注册限于 `apply`。MCP 的 `open` 是运行期操作，取得 exact Root scope。
-其工具目录没有常驻会话时明确报告不可用，不把定义当成已发现的工具。
+Runtime catalog 只列已注册的 MCP 目标并标记 `declared`，不把定义当成已发现的工具。
+客户端显式请求目标详情时，当前请求许可经 Core 窄服务验证，再用原贡献 Context
+按调用打开会话；工具来自本次握手，会话关闭失败或取消如实传播，不建立常驻目录。
 每次实际连接检查必需工具和候选只读范围，不承诺两次远端连接返回相同目录。
 无调用者的 `expected_catalog_digest` 参数、摘要副本及比较链已删除；可调用工具仍来自
 本次握手，并保持 schema 冻结、route 失效和只读执行边界。
@@ -49,6 +51,8 @@ Snapshot 不再存储三份 registry 或 identity；编译器不校验资源定�
 
 `host.execution.v1` 绑定实际 Context 的固定代码 owner 与 Root 权限。
 命令解析继续使用归档中的 Python 环境，cwd 必须位于所属固定代码制品。
+安装准备与运行时读取按 PLG-002 分开；[0077](../decisions/0077-trust-installed-runtime-inputs.md)
+记录删除摘要复验的理由和恢复边界。
 插件 API 不接受 formal/candidate 参数、正式 workspace 路径或自报的代码 owner。
 
 环境只继承明确列出的 PATH、语言/时区项与 Supervisor 身份。候选只采用显式

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Protocol, TypeAlias
 
@@ -57,6 +56,33 @@ class AddModel:
     capability_sources: CapabilitySources
     default_reasoning_effort: str | None = None
     driver_config: Mapping[str, Any] = field(default_factory=dict)
+    make_default_embedding: bool = False
+    discovery_owned: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class VerifyModel:
+    expected_revision: int
+    model_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class UpdateModel:
+    """写入一个对话模型的用户声明能力参数（上下文窗口/最大输出/图像输入）。"""
+
+    expected_revision: int
+    model_id: str
+    context_window: int | None
+    max_output_tokens: int | None
+    image_input: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RemoveModel:
+    """移除模型选择，后续聊天引用跟随默认模型；历史事实不变。"""
+
+    expected_revision: int
+    model_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +90,7 @@ class SetDefaultModel:
     expected_revision: int
     role: str | None
     model_id: str
+    verify_embedding: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +130,9 @@ ModelChange: TypeAlias = (
     | UpdateConnection
     | DisableConnection
     | AddModel
+    | VerifyModel
+    | UpdateModel
+    | RemoveModel
     | SetDefaultModel
     | SyncModels
     | StartConnectionAuth
@@ -128,18 +158,10 @@ class SettingsReceipt:
             )
 
 
-@dataclass(frozen=True, slots=True)
-class ModelSettingsSource:
-    """模型 owner 的现有设置位置；不携带旧 Root、driver 或数据库连接。"""
-
-    path: Path
-    backup_dir: Path
-
-
 class ModelSettings(Protocol):
-    def read_source(self) -> ModelSettingsSource: ...
+    async def probe_embedding(self, model: str, expected_revision: int, *, connection: AddConnection | None = None, connection_id: str | None = None) -> DiscoveredModel: ...
 
-    def use_source(self, source: ModelSettingsSource) -> None: ...
+    async def discover_saved(self, connection_id: str, expected_revision: int) -> tuple[DiscoveredModel, ...]: ...
 
     async def discover(self, connection: AddConnection) -> tuple[DiscoveredModel, ...]: ...
 
@@ -152,6 +174,7 @@ MODEL_SETTINGS = ServiceKey[ModelSettings]("models.settings.v1")
 __all__ = [
     "AddConnection",
     "AddModel",
+    "VerifyModel",
     "CancelConnectionAuth",
     "CreateConnectionWithModel",
     "DisableConnection",
@@ -159,10 +182,11 @@ __all__ = [
     "MODEL_SETTINGS",
     "ModelChange",
     "ModelSettings",
-    "ModelSettingsSource",
     "SetDefaultModel",
+    "RemoveModel",
     "SettingsReceipt",
     "StartConnectionAuth",
     "SyncModels",
     "UpdateConnection",
+    "UpdateModel",
 ]

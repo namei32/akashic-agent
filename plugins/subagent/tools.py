@@ -99,7 +99,7 @@ class Spawn:
     async def invoke(self, key: str, arguments: Mapping[str, object]) -> Result:
         prepared = Prepared.model_validate(json_value(arguments))
         try:
-            self.jobs.accept(key, prepared.request, prepared.task)
+            await self.jobs.accept(key, prepared.request, prepared.task)
         except SubagentBusy as error:
             return Result("error", (ContentPart("text", str(error)),))
         if not prepared.request.background:
@@ -108,7 +108,11 @@ class Spawn:
                 try:
                     _ = await task.join()
                 except asyncio.CancelledError:
-                    _ = await self.jobs.cancel(prepared.request.job_id)
+                    caller = asyncio.current_task()
+                    assert caller is not None
+                    # 子 Task 已撤权时不能再把 join 的取消记成用户 pause。
+                    if caller.cancelling() and task.active:
+                        _ = await self.jobs.cancel(prepared.request.job_id)
                     raise
         result = await self.query(key)
         if result is None:
@@ -124,7 +128,7 @@ class Spawn:
             return Result("success", (ContentPart("text", f"已创建后台任务「{request.label}」（job_id={request.job_id}）。完成后会回传当前会话。"),))
         if not record.value["settled"]:
             return None
-        outcome = self.jobs.outcome(reader)
+        outcome = await self.jobs.outcome(reader)
         if outcome is None:
             raise ValueError("子任务结算记录缺少消息终态")
         return Result("success" if outcome[0] == "completed" else "error",

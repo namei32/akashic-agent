@@ -5,6 +5,14 @@
 - 决策：[0006](../decisions/0006-akasha-v2-is-the-canonical-explicit-memory-engine.md)
 - 需求：MEM-009、SES-003、GOV-005、TST-002、TST-005
 
+> **2026-09-18 勘误（收口第 8 层的旧兼容层）**：本文以下关于 `akasha-v2-index.db` 稀疏索引、
+> `Consumption.legacy_prefix`、`frozen_history` 导出物、`scripts/build_akasha_db.py` 与
+> `--sessions-db` 离线 CLI 的段落只保留历史证据；这些对象已随单一重建实现一起退役
+> （见 [0006 勘误](../decisions/0006-akasha-v2-is-the-canonical-explicit-memory-engine.md)
+> 与 [MEM-009](../projectneed.md)）。现行行为：`akasha.db` 是唯一派生 sidecar；重建 =
+> 空图 + 无切换上界重放同一个 `MessageConsumer`，由插件自有的一次性 Yoyo 迁移登记并在启动时
+> 兑现；缺少固定向量的单个 turn 明确跳过并记入 `consumption.skipped`。
+
 ## 1. 目标与边界
 
 本迁移把独立 `akasha-v2-engine` 接入 Akasic Agent，保留宿主的 MemoryPlugin、
@@ -17,7 +25,7 @@
 - 重建、Docker 和报告都使用独立 workspace，不读写正式派生库。
 
 这次不部署正式 workspace，不迁移旧 Akasha Graph，也不保留旧 fast/slow、reinforce
-或可写检查器兼容层。桌面端和移动端重新提供面向 V2 schema 的只读 Inspector；旧配置
+或可写检查器兼容层。Web Chat 的插件 UI 提供面向 V2 schema 的只读 Inspector；旧配置
 和旧 sidecar 的正式切换必须作为独立数据迁移执行。
 
 ## 2. 状态所有权
@@ -49,7 +57,7 @@
 │                                                    ▼         │
 │                       plugins/akasha/MemoryPlugin adapter     │
 │                                                             │
-│  Dashboard / Mobile ── read-only ──► Akasha Inspector       │
+│  Dashboard / Plugin UI ── read-only ──► Akasha Inspector    │
 └────────────────────────────────┬────────────────────────────┘
                                  │ byte-identical mirror
                                  ▼
@@ -155,7 +163,9 @@ BLAS 线程数，不同 `PYTHONHASHSEED` 不得改变 canonical logical state。
 
 ## 6. 重建合同
 
-`scripts/build_akasha_db.py` 只负责把宿主入口转发给 upstream CLI。完整重建分四段：
+`scripts/build_akasha_db.py` 与旧稀疏索引一起退役。完整重建由插件自己的唯一实现执行
+（空图 + 无切换上界重放同一个 `MessageConsumer`），由一次性 Yoyo 迁移登记并在启动时兑现；离线核对使用
+`docker/debug/akasha_replay_dry_run.py`。历史四段式流程保留为背景：
 
 ```text
 只读打开 sessions.db
@@ -353,7 +363,9 @@ fresh workspace 没有历史 `Consumption` 时可以没有 sidecar，不能因�
 本分支只交付代码、隔离证据和迁移设计，不修改正式 workspace，也不把 PR 合入运行中
 分支。
 
-## 12. 验收命令
+## 12. 当时的验收命令（历史）
+
+下列命令记录原迁移时的证据输入，其中部分脚本已退役，不能作为当前 PR 的可执行 Gate；当前插件 UI 以 Web 构建、活动资源解析和浏览器场景验证。
 
 ```bash
 # upstream
@@ -368,7 +380,6 @@ python scripts/check_akasic_behavior.py
 npm run typecheck
 npm run lint
 npm run build:dashboard
-node --test tests/test_akasha_mobile_ui.mjs
 
 # strict isolated replay
 PYTHONHASHSEED=1 .venv/bin/python scripts/build_akasha_db.py \

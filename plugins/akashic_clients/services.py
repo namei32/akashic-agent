@@ -6,17 +6,33 @@ Protocol；客户端插件不导入 bootstrap、Core runtime 或其他插件实�
 
 from __future__ import annotations
 
-import logging
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from agent.plugin_composition.channels import AttachmentRef
-from agent.plugin_composition.messages import InvalidPage, MessageConflict
-from agent.plugin_composition.models import ChatModelSelection, ModelCatalogSnapshot, ModelCallStats
 from agent.plugin_composition.message_view import MessageDisplayReader
+from agent.plugin_composition.messages import InvalidPage, MessageConflict, SessionAttributes
 from agent.plugin_composition.model_settings_http import ModelControlUnavailable
+from agent.plugin_composition.models import (
+    ChatModelSelection,
+    ModelCatalogSnapshot,
+)
+from agent.plugin_composition.ui import (
+    WebUiProvider as WebUiProvider,
+)
+from agent.plugin_composition.ui_slots import (
+    PluginUiPluginUnavailable,  # noqa: F401 - 显式再导出给本插件消费者。
+    PluginUiQueryOverloaded,  # noqa: F401 - 显式再导出给本插件消费者。
+    PluginUiQueryTimeout,  # noqa: F401 - 显式再导出给本插件消费者。
+    PluginUiRpcExecutionError,  # noqa: F401 - 显式再导出给本插件消费者。
+    PluginUiRpcInvalidRequest,  # noqa: F401 - 显式再导出给本插件消费者。
+    PluginUiStaleRevision,  # noqa: F401 - 显式再导出给本插件消费者。
+)
 from agent.plugin_contracts.message import Message
+from agent.plugin_contracts.ui import (
+    PluginUiProvider as PluginUiProvider,
+)
 
 
 class MessagePagePort(Protocol):
@@ -48,62 +64,8 @@ class SessionPagePort(Protocol):
     next_cursor: tuple[str, str] | None
 
 
-class TurnStartedEvent(Protocol):
-    session_key: str
-    channel: str
-    chat_id: str
-    content: str
-    timestamp: object
-    turn_id: str
-    control_turn_id: str
-    client_message_id: str
-
-
-class StreamDeltaReadyEvent(Protocol):
-    session_key: str
-    channel: str
-    chat_id: str
-    turn_id: str
-    content_delta: str
-    thinking_delta: str
-
-
-class TurnOutputCompletedEvent(Protocol):
-    session_key: str
-    channel: str
-    chat_id: str
-    turn_id: str
-    client_message_id: str
-
-
-class ToolCallStartedEvent(Protocol):
-    session_key: str
-    channel: str
-    chat_id: str
-    iteration: int
-    call_id: str
-    tool_name: str
-    arguments: dict[str, object]
-    turn_id: str
-
-
-class ToolCallCompletedEvent(Protocol):
-    session_key: str
-    channel: str
-    chat_id: str
-    iteration: int
-    call_id: str
-    tool_name: str
-    arguments: dict[str, object]
-    final_arguments: dict[str, object]
-    status: str
-    result_preview: str
-    runtime_provenance: dict[str, str]
-    turn_id: str
-
-
 class AttachmentStorePort(Protocol):
-    """客户端临时上传与 Mobile 分片共享的文件 owner。"""
+    """客户端临时上传与 旧上传分片共享的文件 owner。"""
 
     root: Path
     def create_path(self, prefix: str, suffix: str) -> Path: ...
@@ -131,6 +93,8 @@ class ArtifactStorePort(Protocol):
 
 class MessageReaderPort(Protocol):
     @property
+    def attributes(self) -> SessionAttributes: ...
+    @property
     def session_id(self) -> str: ...
     def head(self) -> int: ...
     def follow(self, *, after_seq: int = -1) -> AsyncGenerator[Message, None]: ...
@@ -148,21 +112,10 @@ class MessageCatalogPort(Protocol):
 ReplyStatusPort = Callable[[str], AsyncGenerator[dict[str, object], None]]
 ModelCatalogReader = Callable[[], Awaitable[ModelCatalogSnapshot]]
 ModelSelectionReader = Callable[[Mapping[str, object]], Awaitable[ChatModelSelection]]
-ModelStatsReader = Callable[[str], Awaitable[ModelCallStats]]
 
 
-class MobileUiProvider(Protocol):
-    def catalog(self) -> dict[str, object]: ...
-    def asset(self, plugin_id: str, plugin_revision: str, kind: str, sha256: str) -> dict[str, object]: ...
-    async def query(self, plugin_id: str, plugin_revision: str, method: str, payload: dict[str, object], *, session_id: str | None, turn_id: str | None) -> dict[str, object]: ...
 
 
-class MobileUiPluginUnavailable(RuntimeError): ...
-class MobileUiQueryOverloaded(RuntimeError): ...
-class MobileUiQueryTimeout(RuntimeError): ...
-class MobileUiRpcExecutionError(RuntimeError): ...
-class MobileUiRpcInvalidRequest(ValueError): ...
-class MobileUiStaleRevision(RuntimeError): ...
 class ModelCatalogUnavailable(RuntimeError): ...
 
 
@@ -181,33 +134,28 @@ class RuntimeInspectionService(Protocol):
     async def get_mcp(self, owner_id: str, server_name: str) -> dict[str, object]: ...
 
 
-class WebUiProvider(Protocol):
-    async def bootstrap(self) -> bytes: ...
-    async def state(self) -> dict[str, str]: ...
-
-
-class ModelRpcInvoker(Protocol):
-    async def invoke_rpc(self, method: str, params: Mapping[str, object]) -> object: ...
-
-
-class MobilePairingAdminPort(Protocol):
-    def create_offer(self) -> dict[str, object]: ...
-    def pending_claim(self, pairing_id: str) -> dict[str, object] | None: ...
-    def approve(self, pairing_id: str, confirmation_code: str) -> dict[str, object]: ...
-
-
-def turn_milestone(logger: logging.Logger, event: str, **fields: object) -> None:
-    """记录不含正文的客户端时序观察；权威状态仍由宿主 owner 保存。"""
-    logger.info(event, extra={"event": event, **fields})
-
-
 def default_chat_model_id(snapshot: ModelCatalogSnapshot) -> str:
     """读取已声明的 default 绑定，不为客户端编造模型。"""
     return str(snapshot.role_bindings.get("default", ""))
 
 
+def project_unavailable_chat_runtimes(snapshot: ModelCatalogSnapshot) -> list[dict[str, str]]:
+    """只读展示连接停用或驱动缺席，不把本地可用误称远端认证成功。"""
+    connections = {item.connection_id: item for item in snapshot.connections}
+    return [
+        {
+            "id": model.model_id,
+            "model": model.model,
+            "sourceName": connections[model.connection_id].name,
+            "availability": model.availability.value,
+        }
+        for model in snapshot.models
+        if model.kind.value == "chat" and model.availability.value != "available"
+    ]
+
+
 def project_chat_runtimes(snapshot: ModelCatalogSnapshot) -> list[dict[str, object]]:
-    """把公共模型目录投影为既有 Web/Mobile DTO。"""
+    """把公共模型目录投影为既有 Web DTO。"""
     roles_by_model: dict[str, list[str]] = {}
     for role, model_id in snapshot.role_bindings.items():
         roles_by_model.setdefault(model_id, []).append(role)
@@ -246,9 +194,7 @@ __all__ = [
     "ArtifactReadLeasePort", "ArtifactStorePort", "AttachmentStorePort",
     "InvalidPage", "MessageCatalogPort", "MessageConflict", "MessageDisplayReader",
     "MessagePagePort", "MessageReaderPort", "SessionEntryPort", "SessionPagePort", "Message",
-    "StreamDeltaReadyEvent", "ToolCallCompletedEvent", "ToolCallStartedEvent", "TurnOutputCompletedEvent",
-    "TurnStartedEvent",
-    "ModelCatalogReader", "ModelCatalogSnapshot", "ModelCallStats", "ModelControlUnavailable",
-    "ModelSelectionReader", "ModelStatsReader", "MobilePairingAdminPort", "RuntimeInspectionError", "RuntimeInspectionService",
-    "default_chat_model_id", "project_chat_runtimes", "turn_milestone",
+    "ModelCatalogReader", "ModelCatalogSnapshot", "ModelControlUnavailable",
+    "ModelSelectionReader", "RuntimeInspectionError", "RuntimeInspectionService",
+    "default_chat_model_id", "project_chat_runtimes",
 ]

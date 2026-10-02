@@ -5,14 +5,13 @@ from agent.plugin_composition.context import (
     Fiber,
     FiberHandle,
     HealthHandle,
+    OwnerCall,
     RuntimeScope,
 )
-from agent.control.turn_scope import ToolGrant, TurnExecutionScope
 from agent.control.models import TurnItem, TurnItemKind, TurnStatus
 from agent.control.scoped_turn import TurnAcceptedReceipt
 from agent.control.timer import TimerHandle, TimerStatus
-from agent.tool_context import ToolExecutionContext
-from agent.plugin_contracts.turn_effects import PostCommitEffect, TurnStorage
+from agent.plugin_contracts.turn_effects import PostCommitEffect
 from agent.plugin_composition.dashboard import DashboardContext
 from agent.plugin_composition.requests import RequestContext
 from agent.plugin_composition.commands import (
@@ -71,11 +70,9 @@ from agent.plugin_composition.runtime_lifecycle import (
     RUNTIME_STARTING,
     RUNTIME_STARTED,
     RUNTIME_STOPPING,
-    SNAPSHOT_SEALING,
     RuntimeStarting,
     RuntimeStarted,
     RuntimeStopping,
-    SnapshotSealing,
 )
 from agent.plugin_composition.models import (
     AuthenticationError,
@@ -201,15 +198,19 @@ from agent.plugin_composition.channels import (
 from agent.plugin_composition.claims import EMBEDDING_MEMORY_PLUGIN
 from agent.plugin_composition.ui_slots import (
     UI_SLOTS,
-    MobileUiBinding,
-    MobileUiDefinition,
-    MobileUiDescriptor,
-    MobileUiNavigation,
-    MobileUiQueryHandler,
-    MobileUiRegistry,
-    MobileUiRpcInvalidRequest,
+    PluginUiBinding,
+    PluginUiDefinition,
+    PluginUiDescriptor,
+    PluginUiNavigation,
+    PluginUiQueryHandler,
+    PluginUiRpcInvalidRequest,
+    PluginUiPluginUnavailable,
+    PluginUiStaleRevision,
+    PluginUiQueryTimeout,
+    PluginUiQueryOverloaded,
+    PluginUiRpcExecutionError,
     UiSlots,
-    MobileUiAsset,
+    PluginUiAsset,
 )
 
 from agent.plugin_composition.processes import PROCESSES, PluginProcesses, ProcessCleanupError
@@ -329,6 +330,7 @@ __all__ = [
     "InboundIdentity",
     "InboundOwner",
     "InboundState",
+    "OwnerCall",
     "INTERACTION_UNDO",
     "InteractionUndoResult",
     "InteractionUndoService",
@@ -348,17 +350,21 @@ __all__ = [
     "WorkloadHealth",
     "WorkloadLimits",
     "WorkloadPort",
-    "MobileUiBinding",
-    "MobileUiDefinition",
-    "MobileUiDescriptor",
-    "MobileUiNavigation",
-    "MobileUiQueryHandler",
-    "MobileUiRegistry",
-    "MobileUiRpcInvalidRequest",
+    "PluginUiBinding",
+    "PluginUiDefinition",
+    "PluginUiDescriptor",
+    "PluginUiNavigation",
+    "PluginUiQueryHandler",
+    "PluginUiRpcInvalidRequest",
+    "PluginUiPluginUnavailable",
+    "PluginUiStaleRevision",
+    "PluginUiQueryTimeout",
+    "PluginUiQueryOverloaded",
+    "PluginUiRpcExecutionError",
     "ObserveEventKey",
     "Commands",
     "UiSlots",
-    "MobileUiAsset",
+    "PluginUiAsset",
     "PluginRuntime",
     "PluginDiagnostics",
     "PluginDiagnosticContext",
@@ -384,25 +390,19 @@ __all__ = [
     "RUNTIME_STARTING",
     "RUNTIME_STARTED",
     "RUNTIME_STOPPING",
-    "SNAPSHOT_SEALING",
     "RuntimeStarting",
     "RuntimeStarted",
     "RuntimeStopping",
     "RuntimeScope",
-    "SnapshotSealing",
     "SerialEventKey",
     "SyncTask",
     "StopReceipt",
     "TopologyFiberView",
     "TopologyView",
-    "ToolGrant",
-    "ToolExecutionContext",
     "TurnAcceptedReceipt",
-    "TurnExecutionScope",
     "TurnItem",
     "TurnItemKind",
     "TurnStatus",
-    "TurnStorage",
     "TransformEventKey",
     "UI_SLOTS",
     "WriteObservation",

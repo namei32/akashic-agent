@@ -41,18 +41,12 @@ from agent.plugin_composition.channels import (
 from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
-from .message_types import ChannelMessage, DeliveryReceipt, DeliveryStatus
 from .services import AttachmentStorePort as AttachmentStore
 from .services import ArtifactStorePort as ChannelAttachmentArtifactStore
 from agent.plugin_composition.message_view import MessageDisplayReader, follow_messages
 from .services import (
     MessageCatalogPort as MessageCatalog,
     MessageConflict,
-    StreamDeltaReadyEvent as StreamDeltaReady,
-    ToolCallCompletedEvent as ToolCallCompleted,
-    ToolCallStartedEvent as ToolCallStarted,
-    TurnOutputCompletedEvent as TurnOutputCompleted,
-    TurnStartedEvent as TurnStarted,
 )
 
 logger = logging.getLogger(__name__)
@@ -258,7 +252,7 @@ class WebChatChannel:
 
     @asynccontextmanager
     async def _open_message_catalog(self) -> AsyncIterator[MessageCatalog]:
-        """Hold one message capability only for the current request or stream."""
+        """Resolve one message capability for a short request or reader acquisition."""
 
         if self._message_scope is not None:
             async with self._message_scope() as messages:
@@ -282,9 +276,6 @@ class WebChatChannel:
     @staticmethod
     def _socket_id(websocket: WebSocket) -> str:
         return f"ws-{id(websocket):x}"
-
-    def _connection_count(self, session_key: str) -> int:
-        return len(self._connections.get(session_key, set()))
 
     async def start(self) -> None:
         """Start Web transport state without subscribing to a global event bus.
@@ -456,10 +447,9 @@ class WebChatChannel:
     def _close_v3_binding(self, adapter: WebNativeChannelAdapter) -> None:
         if self._v3_adapters.get(adapter.binding_token) is not adapter:
             raise RuntimeError("Web v3 binding 未注册")
-        # Host closes admission and then drains binding operations.  A follow
-        # keeps its request scope open while waiting for the next message, so
-        # it must be cancelled at the admission boundary or the host would
-        # wait forever for that scope to release.
+        # Adapter admission is closed before draining captured calls. Followers
+        # own their reader after short acquisition, so cancel those long reads.
+        # The Web transport stays open for a replacement binding.
         self._cancel_followers_for_admission()
 
     def _cancel_followers_for_admission(self) -> None:
@@ -730,55 +720,6 @@ class WebChatChannel:
             "metadata": {"source": "message_push", "kind": "image"},
         })
 
-    async def _deliver_message(self, message: ChannelMessage) -> DeliveryReceipt:
-        """把完整渠道消息映射为一个 Web final frame。"""
-
-        session_key = self._session_key(message.chat_id)
-        media = [attachment.source for attachment in message.attachments]
-        self.remember_media(media)
-        metadata = dict(message.metadata)
-        passive = metadata.pop("_channel_commit_role", None) == "passive"
-        if not passive:
-            metadata.setdefault("source", "message_push")
-        if passive and (
-            not message.execution_attempt_id or not message.control_turn_id
-        ):
-            raise RuntimeError("Web passive final 缺少 Turn/Attempt 身份")
-        frame: dict[str, Any] = {
-            "type": "message.final",
-            "session_id": session_key,
-            "turn_id": message.execution_attempt_id or "",
-            "content": message.content,
-            "thinking": message.thinking or "",
-            "media": media,
-            "metadata": metadata,
-        }
-        if passive:
-            frame["control_turn_id"] = message.control_turn_id
-            frame["execution_attempt_id"] = message.execution_attempt_id
-        duration = metadata.get("turn_duration_ms")
-        if isinstance(duration, (int, float)) and not isinstance(duration, bool):
-            frame["duration_ms"] = duration
-        delivered = await self._broadcast(session_key, frame)
-        if delivered > 0:
-            self._pending_terminal.pop(session_key, None)
-            return DeliveryReceipt(
-                DeliveryStatus.SUCCESS,
-                canonical_media=tuple(media),
-            )
-        if message.control_turn_id:
-            self._pending_terminal[session_key] = frame
-            return DeliveryReceipt(
-                DeliveryStatus.SUCCESS,
-                canonical_media=tuple(media),
-            )
-        if delivered == 0:
-            return DeliveryReceipt(
-                DeliveryStatus.FAILED,
-                detail="Web 会话没有可用连接",
-            )
-        raise RuntimeError("Web legacy delivery 状态无效")
-
     async def deliver_v3(
         self,
         request: ProviderDeliveryRequest,
@@ -985,10 +926,21 @@ class WebChatChannel:
             await self._send_error(websocket, request_id, str(error))
             return ""
         await self._cancel_follow(websocket)
-        _ = await self._add_connection(session_id, websocket)
+        if self._stopping:
+            return ""
+        try:
+            _ = await self._add_connection(session_id, websocket)
+        except RuntimeError:
+            if self._stopping:
+                return ""
+            raise
+        if self._stopping:
+            await self._remove_connection_attempt(session_id, websocket)
+            return ""
         await websocket.send_json({"type": "session.following", "version": 2,
                                    "request_id": request_id, "session_id": session_id, "through_seq": head})
         if self._stopping:
+            await self._remove_connection_attempt(session_id, websocket)
             return ""
         task = tasks.create_task(self._follow(websocket, session_id, after_seq))
         self._followers[websocket] = (session_id, task)
@@ -1002,15 +954,14 @@ class WebChatChannel:
                     await websocket.send_json({"type": kind, **frame})
 
         async def send_messages() -> None:
-            # The message reader and its display projection must enter and
-            # leave the request scope in this follower task.  Passing an
-            # entered scope through TaskGroup task creation leaves a copied
-            # ContextVar pointing at a closed RequestContext on installed
-            # runtimes.
+            # Resolve the reader before the long follow.  The display
+            # projection opens its own short scope for each page in the
+            # follower task; no entered request scope crosses TaskGroup work.
             async with self._open_message_catalog() as messages:
-                await send("messages.appended", follow_messages(
-                    cast(Any, messages.reader(session_id)), after_seq=after_seq,
-                    display_only=True, reader_display=self.message_display))
+                reader = cast(Any, messages.reader(session_id))
+            await send("messages.appended", follow_messages(
+                reader, after_seq=after_seq,
+                display_only=True, reader_display=self.message_display))
 
         async with asyncio.TaskGroup() as tasks:
             _ = tasks.create_task(send_messages())
@@ -1156,6 +1107,15 @@ class WebChatChannel:
                 )
                 return session_key
             metadata["reply_to_message_id"] = reply_to_message_id.strip()
+        if "session_dimensions" in payload:
+            dimensions = payload["session_dimensions"]
+            if not isinstance(dimensions, dict) or not all(
+                isinstance(key, str) and isinstance(value, str)
+                for key, value in cast(dict[object, object], dimensions).items()
+            ):
+                await self._send_error(websocket, request_id, "session_dimensions 必须是字符串对象")
+                return session_key
+            metadata["session_dimensions"] = dict(cast(dict[str, str], dimensions))
         chat_id = self._chat_id(session_key)
         raw = RawInbound(
             message_id=request_id or uuid4().hex,
@@ -1216,76 +1176,6 @@ class WebChatChannel:
         finally:
             adapter._finish_inbound()
         return session_key
-
-    async def _on_turn_started(self, event: TurnStarted) -> None:
-        if event.channel != self.name:
-            return
-        if not event.turn_id:
-            raise RuntimeError("Web TurnStarted 缺少 Server 权威 turn_id")
-        turn_id = event.turn_id
-        await self._broadcast(event.session_key, {
-            "type": "turn.started",
-            "session_id": event.session_key,
-            "turn_id": turn_id,
-            "control_turn_id": event.control_turn_id or turn_id,
-            "client_message_id": event.client_message_id,
-            "content": event.content,
-        })
-
-    async def _on_stream_delta(self, event: StreamDeltaReady) -> None:
-        if event.channel != self.name:
-            return
-        turn_id = self._event_turn_id(event.turn_id)
-        if event.thinking_delta:
-            await self._broadcast(event.session_key, {
-                "type": "react.thinking.delta",
-                "session_id": event.session_key,
-                "turn_id": turn_id,
-                "delta": event.thinking_delta,
-            })
-        if event.content_delta:
-            await self._broadcast(event.session_key, {
-                "type": "answer.delta",
-                "session_id": event.session_key,
-                "turn_id": turn_id,
-                "delta": event.content_delta,
-            })
-
-    async def _on_tool_call_started(self, event: ToolCallStarted) -> None:
-        if event.channel != self.name:
-            return
-        await self._broadcast(event.session_key, {
-            "type": "react.tool.started",
-            "session_id": event.session_key,
-            "turn_id": self._event_turn_id(event.turn_id),
-            "call_id": event.call_id,
-            "tool_name": event.tool_name,
-            "arguments": event.arguments,
-        })
-
-    async def _on_tool_call_completed(self, event: ToolCallCompleted) -> None:
-        if event.channel != self.name:
-            return
-        await self._broadcast(event.session_key, {
-            "type": "react.tool.completed",
-            "session_id": event.session_key,
-            "turn_id": self._event_turn_id(event.turn_id),
-            "call_id": event.call_id,
-            "tool_name": event.tool_name,
-            "status": event.status,
-            "result_preview": event.result_preview,
-        })
-
-    async def _on_output_completed(self, event: TurnOutputCompleted) -> None:
-        if event.channel != self.name:
-            return
-        turn_id = self._event_turn_id(event.turn_id)
-        await self._broadcast(event.session_key, {
-            "type": "turn.output.completed",
-            "session_id": event.session_key,
-            "turn_id": turn_id,
-            "client_message_id": event.client_message_id,
-        })
 
     async def _add_connection(self, session_key: str, websocket: WebSocket) -> bool:
         """把一个 Web socket 投影到唯一的当前 Session。"""
@@ -1417,25 +1307,6 @@ class WebChatChannel:
 
     def _chat_id(self, session_key: str) -> str:
         return session_key[len(self.name) + 1:]
-
-    def _turn_id(self, session_key: str, seed: float) -> str:
-        return f"{session_key}:{seed:.6f}"
-
-    @staticmethod
-    def _event_turn_id(attempt_turn_id: str) -> str:
-        if not attempt_turn_id:
-            raise RuntimeError("Web lifecycle event 缺少 turn_id")
-        return attempt_turn_id
-
-def _reply_source_text(target: dict[str, Any]) -> str:
-    content = str(target["content"])
-    if content.strip():
-        return content
-    media = target.get("media")
-    if isinstance(media, list) and media:
-        return "[附件]"
-    return "[无文字消息]"
-
 
 def _normalize_v3_content(value: str) -> str:
     """把 Web 文本归一化为 Core inbound 允许的无控制字符正文。"""

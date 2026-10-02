@@ -94,6 +94,22 @@ class LLMResponse:
 StreamCallback: TypeAlias = Callable[[dict[str, str]], Awaitable[None]]
 
 
+def read_content_refs(value: object) -> tuple[tuple[str, int], ...]:
+    """在请求与持久记录边界校验同一种消息内容位置编码。"""
+    if not isinstance(value, (tuple, list)):
+        raise ValueError("内容位置必须是数组")
+    refs: list[tuple[str, int]] = []
+    for ref in value:
+        if (not isinstance(ref, (tuple, list)) or len(ref) != 2
+                or not isinstance(ref[0], str) or not ref[0]
+                or type(ref[1]) is not int or ref[1] < 0):
+            raise ValueError("内容位置需要消息 ID 和非负整数索引")
+        refs.append((ref[0], ref[1]))
+    if len(set(refs)) != len(refs):
+        raise ValueError("请求内容位置不能重复")
+    return tuple(refs)
+
+
 @dataclass(frozen=True, slots=True)
 class ModelRequest:
     messages: Sequence[Mapping[str, Any]]
@@ -105,6 +121,10 @@ class ModelRequest:
     on_delta: StreamCallback | None = None
     continuation: ModelContinuation | None = None
     disable_reasoning: bool = False
+    request_key: str | None = None
+    # 本次完整展示、尚无成功展示回执的消息内容位置；不发送给 provider。
+    content_refs: tuple[tuple[str, int], ...] = ()
+    content_transformed: bool = False
 
     def __post_init__(self) -> None:
         """在唯一调用边界冻结请求，adapter 和并行调用不能改写彼此输入。"""
@@ -114,6 +134,9 @@ class ModelRequest:
         object.__setattr__(
             self, "tools", tuple(_freeze_json_mapping(row) for row in self.tools)
         )
+        object.__setattr__(self, "content_refs", read_content_refs(self.content_refs))
+        if type(self.content_transformed) is not bool:
+            raise ValueError("内容投影标记必须是 bool")
         if isinstance(self.tool_choice, Mapping):
             object.__setattr__(
                 self, "tool_choice", _freeze_json_mapping(self.tool_choice)
@@ -224,6 +247,19 @@ class BoundChatModel(Protocol):
 
     @property
     def max_tool_schemas(self) -> int | None: ...
+
+    def key_recovery(self, request_key: str) -> str:
+        """该 request key 最近耐久记录的恢复裁决（Models 独占分类）：
+
+        - "open"：无终结结算（无记录、成功、在途或仍有耐久退避额度）；
+        - "rejected"：provider 明确容量拒绝——本代可续跑有界缩减，
+          真实 resume 也可开新准备；
+        - "answered"：其他可证明失败——真实 resume 后允许新准备如实付费；
+        - "uncertain"：取消/孤儿/传输/超时/未知名目——远端效果不可证，
+          resume 不得据此重付，仅新 Input 作为真正新工作可运行。
+
+        非 "open" 即终结：终结 key 不因重启/重调获得新预算。"""
+        ...
 
 
 class BoundEmbeddingModel(Protocol):
@@ -349,9 +385,9 @@ class ModelDescriptor:
 
 @dataclass(frozen=True, slots=True)
 class DiscoveredModel:
-    """Provider evidence that the models plugin may persist under its own ID."""
+    """服务返回的模型候选；None 表示尚无用途证据，不能直接持久化。"""
 
-    kind: ModelKind
+    kind: ModelKind | None
     model: str
     capabilities: ModelCapabilities
     capability_sources: CapabilitySources
@@ -493,6 +529,7 @@ class ModelDriverDefinition:
     open: DriverOpen
     discover: DriverDiscover | None = None
     probe: DriverProbe | None = None
+    probe_embedding: Callable[[DriverConnectionDescriptor, CredentialHandle, str], Awaitable[DiscoveredModel]] | None = None
     start_auth: DriverAuthHandler | None = None
     finish_auth: DriverAuthHandler | None = None
     cancel_auth: DriverAuthHandler | None = None
@@ -514,6 +551,12 @@ MODEL_DRIVERS = ServiceKey[ModelDrivers]("models.drivers.v1")
 
 class ModelError(RuntimeError):
     retryable = False
+    # 发送边界证据，driver 在产生错误处显式置位：
+    # "rejected" = provider 以 HTTP 错误应答明确拒绝了请求（未进入流处理）；
+    # "unsent"   = 连接建立失败或发送前本地校验失败，可证明请求未发出；
+    # None       = 无任何可证明事实（HTTP 200 流内失败、读/写错误、超时、
+    #              取消等），一律按远端效果不确定处理，不得自动重试。
+    send_evidence: str | None = None
 
 
 class AuthenticationError(ModelError): ...

@@ -1,40 +1,65 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from typing import Any, cast
+from contextlib import AbstractAsyncContextManager
 
+from core.common.file_io import run_file_io
 from agent.plugin_composition import Context
-from agent.plugin_composition.artifacts import ARTIFACT_READ
-from agent.plugin_composition.messages import MESSAGE_WRITERS, MessageReader
+from agent.plugin_composition.artifacts import ArtifactRead
+from agent.plugin_composition.messages import MessageReader, MessageWriters, OwnerState, OwnerTransaction
 from agent.plugin_composition.models import BoundChatModel, ChatModels, ModelRequest
 from agent.plugin_composition.tasks import Task
+from agent.plugin_contracts.context import MaterialView
+from agent.plugin_contracts.models import PrepareContent
 from agent.plugin_contracts import ContentPart, Input, Message, Output
 
+from agent.plugin_contracts.sources import SourceGuard
+
 from .inputs import (
-    Authorize, CallReader, Content, ContentRenderer, ContextBuilder, ContextMaterials,
-    ContextModel, Materials, MODEL_CHECKS, MODEL_CONTENT, MODEL_PROJECTION, MODEL_SELECTION,
-    SOURCE_CHECK, Preview, Reminder, Summary, ToolCatalog, ToolCleanup, TOOL_PROGRAM, ToolPresentation,
-    ToolView, TurnProjection,
+    Authorize,
+    CallReader,
+    Content,
+    ContentRenderer,
+    ContextBuilder,
+    ContextModel,
+    Materials,
+    ModelChecks,
+    ModelContent,
+    ModelProjections,
+    ModelSelection,
+    Preview,
+    Reminder,
+    Summary,
+    ToolCatalog,
+    ToolCleanup,
+    ToolPresentation,
+    ToolProgram,
+    ToolView,
+    TurnProjection,
 )
-
-
 
 
 async def run_reply(
     ctx: Context, task: Task, reader: MessageReader, source: str, *,
     models: ChatModels, content: Content, context: ContextBuilder, tools: ToolCatalog,
     cleanup: ToolCleanup,
+    check_admission: SourceGuard,
+    selection: ModelSelection, tool_program: ToolProgram,
+    model_checks: ModelChecks, model_content: ModelContent, model_projection: ModelProjections,
+    writers: MessageWriters, owner_state: OwnerState, artifact_reader: ArtifactRead,
     react: Callable[..., Awaitable[Message]],
-    materials: ContextMaterials,
+    materials: AbstractAsyncContextManager[MaterialView],
     turn_projection: TurnProjection,
     render_content: ContentRenderer | None = None,
+    prepare_content: PrepareContent | None = None,
     read_call: CallReader,
     authorize: Authorize,
     max_output_tokens: int,
     max_steps: int,
+    max_parallel_calls: int = 4,
     tool_view: ToolView | None = None,
     tool_names: Sequence[str] | None = None,
-    exclude_materials: frozenset[str] = frozenset(),
     prompt_hints: Sequence[str] = (),
     fixed_bindings: Mapping[str, str] | None = None,
     preview: Preview | None = None,
@@ -51,32 +76,46 @@ async def run_reply(
         ):
             raise ValueError("旧工具名称与原固定 binding 不一致")
     # 1. 内容检查器与模型绑定覆盖整个程序，取消时先排空已开始的工具。
-    check_source = ctx.require(SOURCE_CHECK)
     prompt_hints = tuple(prompt_hints)
     reader = reader.incremental()
-    source_head = reader.head(source=source)
-    snapshot = reader.snapshot()
-    turns = turn_projection.project(snapshot, source)
-    open_ids: set[str] = set(turns[-1].message_ids) if turns and turns[-1].status == "open" else set()
-    chosen = ctx.require(MODEL_SELECTION).read(tuple(message for message in snapshot if message.message_id in open_ids))
+    with reader.read_snapshot():
+        check_admission()
+        source_head = reader.head(source=source)
+        through_seq = reader.head()
+        saved_selection = reader.metadata()
+    def check(transaction: OwnerTransaction | None = None) -> None:
+        check_admission(transaction=transaction)
+
+    def read_open(messages: Iterable[Message]) -> tuple[Message, ...]:
+        """同一短快照内只取未闭合 Turn 正文，历史分段只保留引用。"""
+        turns = turn_projection.project(messages, source, include_closed=False)
+        if not turns or turns[-1].status != "open":
+            return ()
+        members: list[Message] = []
+        for identity in turns[-1].message_ids:
+            message = reader.get(identity)
+            if message is None:
+                raise RuntimeError("同一快照中的 Turn 消息缺失")
+            members.append(message)
+        return tuple(members)
+
+    opened = await run_file_io(lambda: reader.scan(read_open, through_seq=through_seq, source=source))
+    chosen = selection.read(opened)
     if chosen is None:
-        chosen = ctx.require(MODEL_SELECTION).read_saved(reader.metadata() or {})
-    from_seq = min((message.seq for message in snapshot if message.message_id in open_ids), default=source_head + 1)
+        chosen = selection.read_saved(saved_selection or {})
+    from_seq = min((message.seq for message in opened), default=source_head + 1)
+    keep_input_ids = tuple(item.message_id for item in opened if isinstance(item.body, Input))
+    del opened
     async with (
-        cleanup(ctx, reader, source, from_seq, task=task, drain=tools.drain_calls),
+        cleanup(reader, source, from_seq, task=task, drain=tools.drain_calls),
         content.bind() as view,
         models.execution(model_id=chosen.model_id, reasoning_effort=chosen.reasoning_effort) as execution,
-        materials.bind(exclude=exclude_materials) as material_view,
+        materials as material_view,
     ):
         model = execution.chat("agent")
-        writers = ctx.require(MESSAGE_WRITERS)
-        keep_input_ids = tuple(
-            item.message_id for item in snapshot
-            if item.message_id in open_ids and isinstance(item.body, Input)
-        )
-        menu = ctx.require(TOOL_PROGRAM).create_menu(
+        menu = await tool_program.create_menu(
             reader, source, content=view.checks,
-            check_start=lambda: check_source(task, reader, source, source_head),
+            check_start=check,
             authorize=authorize, view=tool_view, limit=model.max_tool_schemas,
             fixed_bindings=fixed_bindings, presentation=presentation,
             child_permit=task.child_permit if task.has_external_permit else None,
@@ -86,15 +125,16 @@ async def run_reply(
         output = writers.bind(
             ctx, author="assistant", source=source, body_types=(Output,),
             check_metadata=view.check_metadata,
-            content={**view.checks, "model.facts": ctx.require(MODEL_CHECKS).check_facts, "model.tool_rejection": ctx.require(MODEL_CHECKS).check_tool_rejection, "context.summary": context.check_summary}, check_call=menu.check_call,
+            content={**view.checks, "model.facts": model_checks.check_facts, "model.tool_rejection": model_checks.check_tool_rejection, "context.summary": context.check_summary}, check_call=menu.check_call,
         )(reader.session_id)
         task.on_close(output.expire)
         artifacts: Mapping[str, tuple[Mapping[str, Any], ...]] = {}
         def render(part: ContentPart):
-            return ctx.require(MODEL_CONTENT).render(part, artifacts=artifacts, read_message=reader.get)
-        projection = ctx.require(MODEL_PROJECTION).create(
+            return model_content.render(part, artifacts=artifacts, read_message=reader.get)
+        projection = model_projection.create(
             model, source=source, render_content=render if render_content is None else render_content,
             tool_name=menu.name, read_call=read_call, check_summary=context.check_summary, keep_input_ids=keep_input_ids,
+            **({"prepare_content": prepare_content, "tool_names": menu.names} if prepare_content is not None else {}),
         )
 
         # 2. 内容协议提示与解码来自同一 view；Context 仍只接收已取得的材料。
@@ -111,11 +151,14 @@ async def run_reply(
                     if index >= start or message.message_id in keep_input_ids
                 ))
                 if refs:
-                    artifacts = await ctx.require(MODEL_CONTENT).load_artifacts(
-                        ctx.require(ARTIFACT_READ), refs,
+                    artifacts = await model_content.load_artifacts(
+                        artifact_reader, refs,
                         accepts_images="image" in model.descriptor.capabilities.input_modalities,
+                        current_artifact_ids=frozenset(
+                            ref.artifact_id for ref in reader.attachments_for(keep_input_ids)
+                        ),
                     )
-            check_source(task, reader, source, source_head)
+            check()
             return {**result, "system_prompt": "\n\n".join(
                 part for part in (cast(str, result["system_prompt"]), *view.prompts, *prompt_hints, menu.system_prompt) if part
             )}
@@ -126,7 +169,7 @@ async def run_reply(
         ) -> Summary | None:
             result = await material_view.reduce(snapshot, prepared, request, model, projection,
                                                 source=source, force=force)
-            check_source(task, reader, source, source_head)
+            check()
             return result
 
         try:
@@ -135,6 +178,9 @@ async def run_reply(
                 materials=build_materials, content=view, tools=menu,
                 max_output_tokens=max_output_tokens, max_steps=max_steps,
                 reduce=reduce, preview=preview, terminal_tools=terminal_tools,
+                max_parallel_calls=max_parallel_calls,
+                state=owner_state.open_scoped(ctx, "generation"),
+                check_start=check,
             )
         finally:
             output.expire()

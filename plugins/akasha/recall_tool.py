@@ -23,7 +23,6 @@ from .application.snapshot import read_memory
 from .domain.model import MemoryConfig
 from .learning import AKASHA_LEARNING, Learning, LearningConfig
 from .recalls import ProgramSource, Recall, RecallRecords, ToolSource, query_memory, render_materials
-from .infrastructure.frozen_history import FrozenHistory
 
 
 class RecallArguments(BaseModel):
@@ -103,16 +102,15 @@ class RecallTool:
     idempotent = True
 
     def __init__(
-        self, *, memory: Path, legacy_index: Path | None, config: MemoryConfig,
+        self, *, memory: Callable[[str | None], Path], config: MemoryConfig,
         catalog: MessageCatalog, embeddings: MessageEmbeddings, bindings: Bindings,
         select_learning: Callable[[], tuple[str, str]], records: RecallRecords,
         open_embedding: Callable[[str], AbstractAsyncContextManager[BoundEmbeddingModel]],
-        max_chars: int = 12000, frozen_history: FrozenHistory | None = None,
+        max_chars: int = 12000,
     ):
         if max_chars <= 0:
             raise ValueError("召回文本预算必须为正")
         self._memory = memory
-        self._legacy_index = legacy_index
         self._config = config
         self._catalog = catalog
         self._embeddings = embeddings
@@ -121,7 +119,6 @@ class RecallTool:
         self._records = records
         self._open_embedding = open_embedding
         self._max_chars = max_chars
-        self._frozen_history = frozen_history
 
     async def prepare(
         self, arguments: Mapping[str, object], source: CallSource | None = None,
@@ -151,10 +148,10 @@ class RecallTool:
         # 1. 打开工具实际固定的学习规则；读副本也校验图的 embedding 空间。
         async with self._bindings.open(request.learning_binding, AKASHA_LEARNING) as (learning, metadata):
             rule = LearningConfig.model_validate(dict(metadata))
+            # 调用所在 Session 决定读取哪张图；显式程序没有 Session 时读 default 图。
             async with read_memory(
-                self._memory, legacy_index=self._legacy_index, catalog=self._catalog,
+                self._memory(None if request.source is None else request.source.session_id), catalog=self._catalog,
                 embeddings=self._embeddings, bindings=self._bindings, config=self._config,
-                frozen_history=self._frozen_history,
                 embedding_space=(rule.embedding_model, rule.dimension),
             ) as (cycle, state):
                 async with self._open_embedding(request.embedding_binding) as model:
@@ -176,31 +173,26 @@ class RecallTool:
                     dense=dense, stamp=stamp, source=source, limit=request.limit,
                 ))
             # 2. 材料和呈现出处固定后一次发布；失败不能暴露成功 Result。
-            material = render_materials(identity, recall, learning, self._catalog, max_chars=request.max_chars)
+            material = await run_memory_job(lambda: render_materials(
+                identity, recall, learning, self._catalog, max_chars=request.max_chars,
+            ))
             recall = recall.model_copy(update={
                 "max_chars": request.max_chars,
                 "presented_message_ids": tuple(dict.fromkeys(ref["ref"] for ref in cast(tuple[Mapping[str, str], ...], material["references"]))),
             })
-            _ = self._records.save(identity, recall)
+            _ = await run_memory_job(lambda: self._records.save(identity, recall))
             return self._result(identity, recall, tuple(ContentPart("text", part["text"]) for part in cast(tuple[Mapping[str, str], ...], material["reminders"])))
 
     async def query(self, key: str) -> Result | None:
         """工具外部结果恢复只读实际查询记录；不读当前图或重跑模型。"""
         identity = "tool:" + key
-        recall = self._records.read(identity)
+        recall = await run_memory_job(lambda: self._records.read(identity))
         if recall is None:
             return None
-        if self._frozen_history is not None:
-            if self._frozen_history.has_recall(identity, recall):
-                material = self._frozen_history.material_for(identity, recall, self._catalog)
-            elif self._frozen_history.requires_frozen_binding(recall.learning_binding):
-                raise ValueError("历史 Recall 缺少冻结结果，禁止用当前 binding 重渲染")
-            else:
-                async with self._bindings.open(recall.learning_binding, AKASHA_LEARNING) as (learning, _metadata):
-                    material = render_materials(identity, recall, learning, self._catalog, max_chars=recall.max_chars)
-        else:
-            async with self._bindings.open(recall.learning_binding, AKASHA_LEARNING) as (learning, _metadata):
-                material = render_materials(identity, recall, learning, self._catalog, max_chars=recall.max_chars)
+        async with self._bindings.open(recall.learning_binding, AKASHA_LEARNING) as (learning, _metadata):
+            material = await run_memory_job(lambda: render_materials(
+                identity, recall, learning, self._catalog, max_chars=recall.max_chars,
+            ))
         if tuple(dict.fromkeys(ref["ref"] for ref in cast(tuple[Mapping[str, str], ...], material["references"]))) != recall.presented_message_ids:
             raise ValueError("原查询呈现的材料发生变化，不能用当前结果冒充恢复")
         return self._result(identity, recall, tuple(ContentPart("text", part["text"]) for part in cast(tuple[Mapping[str, str], ...], material["reminders"])))

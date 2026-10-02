@@ -11,7 +11,7 @@ from typing import Any, cast
 
 import httpx
 
-from core.net.http import HttpClient, finish_response
+from core.net.http import HttpClient, StreamProgress, finish_response
 
 from agent.plugin_composition import (
     AuthenticationError,
@@ -22,6 +22,7 @@ from agent.plugin_composition import (
     InvalidRequestError,
     LLMResponse,
     ModelContinuation,
+    ModelError,
     ModelRequest,
     ModelTimeoutError,
     ModelUsage,
@@ -45,7 +46,9 @@ class CodexResponses:
         credential: CredentialHandle,
         descriptor: BoundModelDescriptor,
         config: Mapping[str, Any],
+        progress_timeout: float = 300.0,
     ) -> None:
+        self._progress_timeout = progress_timeout
         self._http = http
         self._credential = credential
         self._descriptor = descriptor
@@ -63,59 +66,78 @@ class CodexResponses:
         return self._max_tool_schemas
 
     async def complete(self, request: ModelRequest) -> LLMResponse:
-        """Send one stream; refresh once after a rejected access token."""
+        """Send one stream; a rejected access token rotates without re-POSTing."""
 
         payload, previous_items = self._build_payload(request)
-        rejected: str | None = None
-        for attempt in range(2):
-            token, auth_headers = await headers(
-                self._credential,
-                rejected_access_token=rejected,
-            )
-            request_headers = {
-                **auth_headers,
-                "Accept": "text/event-stream",
-                "Content-Type": "application/json",
-                "originator": "codex_cli_rs",
-                "User-Agent": f"codex_cli_rs/{CODEX_CLIENT_VERSION}",
-                "x-codex-installation-id": self._installation_id,
-                "session-id": self._session_id,
-                "thread-id": self._thread_id,
-                "x-codex-window-id": self._window_id,
-            }
-            if self._lite:
-                request_headers["x-openai-internal-codex-responses-lite"] = "true"
-            try:
-                client = self._http.client()
-                # OAuth 头由本次凭据生成，不继承前次响应的 Cookie。
-                client.cookies.clear()
-                async with client.stream(
-                    "POST", "/responses", json=payload, headers=request_headers,
-                ) as response:
-                    if response.status_code >= 400:
-                        _ = await response.aread()
-                    if response.status_code == 401 and attempt == 0:
-                        rejected = token
-                        continue
-                    _raise_status(response, token)
-                    return await _consume_stream(
-                        response, request, self._descriptor.binding_id, previous_items,
-                    )
-            except asyncio.CancelledError:
-                raise
-            except _CallbackError as exc:
-                raise exc.error from exc
-            except (httpx.TimeoutException, TimeoutError) as exc:
-                error = ModelTimeoutError("Codex Responses 请求超时")
-                if getattr(exc, "response_delta_seen", False):
-                    setattr(error, "retryable", False)
-                raise error from exc
-            except httpx.TransportError as exc:
-                error = TransportError("Codex Responses 连接失败")
-                if getattr(exc, "response_delta_seen", False):
-                    setattr(error, "retryable", False)
-                raise error from exc
-        raise AuthenticationError("Codex 请求认证失败，请重新登录")
+        token, auth_headers = await headers(self._credential)
+        request_headers = {
+            **auth_headers,
+            "Accept": "text/event-stream",
+            "Content-Type": "application/json",
+            "originator": "codex_cli_rs",
+            "User-Agent": f"codex_cli_rs/{CODEX_CLIENT_VERSION}",
+            "x-codex-installation-id": self._installation_id,
+            "session-id": self._session_id,
+            "thread-id": self._thread_id,
+            "x-codex-window-id": self._window_id,
+        }
+        if self._lite:
+            request_headers["x-openai-internal-codex-responses-lite"] = "true"
+        try:
+            client = self._http.client()
+            # OAuth 头由本次凭据生成，不继承前次响应的 Cookie。
+            client.cookies.clear()
+            async with client.stream(
+                "POST", "/responses", json=payload, headers=request_headers,
+            ) as response:
+                if response.status_code >= 400:
+                    _ = await response.aread()
+                if response.status_code == 401:
+                    # 401 是 provider 对本请求的明确拒绝。凭据轮换属于
+                    # driver/auth owner，本次调用不再发第二个模型 POST；
+                    # 是否再试由 Models 预算/回执链决定，下一 attempt 读取
+                    # 的是轮换后的凭据。轮换失败只影响可否调度重试。
+                    rotated = await self._rotate_rejected(token)
+                    error = AuthenticationError("Codex 请求认证失败，请重新登录")
+                    error.send_evidence = "rejected"
+                    if rotated:
+                        setattr(error, "retry_safe", True)
+                    raise error
+                _raise_status(response, token)
+                return await _consume_stream(
+                    response, request, self._descriptor.binding_id, previous_items,
+                    progress_timeout=self._progress_timeout,
+                )
+        except asyncio.CancelledError:
+            raise
+        except _CallbackError as exc:
+            raise exc.error from exc
+        except ModelTimeoutError:
+            # parser 已携带进展期限和部分响应事实，不再包装丢失信息。
+            raise
+        except (httpx.TimeoutException, TimeoutError) as exc:
+            error = ModelTimeoutError("Codex Responses 请求超时")
+            if isinstance(exc, httpx.ConnectTimeout):
+                # 连接建立失败可证明请求未发出。
+                error.send_evidence = "unsent"
+            elif getattr(exc, "response_delta_seen", False):
+                setattr(error, "retryable", False)
+            raise error from exc
+        except httpx.TransportError as exc:
+            error = TransportError("Codex Responses 连接失败")
+            if isinstance(exc, httpx.ConnectError):
+                error.send_evidence = "unsent"
+            elif getattr(exc, "response_delta_seen", False):
+                setattr(error, "retryable", False)
+            raise error from exc
+
+    async def _rotate_rejected(self, token: str) -> bool:
+        """凭据轮换由 auth owner 承担；失败不让本次 401 失去明确拒绝分类。"""
+        try:
+            await headers(self._credential, rejected_access_token=token)
+        except ModelError:
+            return False
+        return True
 
     def _build_payload(
         self,
@@ -130,9 +152,9 @@ class CodexResponses:
         tools = _responses_tools(request.tools)
         tool_choice, tools = _normalize_tool_choice(request.tool_choice, tools)
         if self._max_tool_schemas is not None and len(tools) > self._max_tool_schemas:
-            raise InvalidRequestError(
+            raise _unsent(InvalidRequestError(
                 f"Codex model accepts at most {self._max_tool_schemas} tools"
-            )
+            ))
         if self._lite:
             messages = _responses_lite_input(messages, instructions, tools)
             instructions = ""
@@ -201,6 +223,8 @@ async def _consume_stream(
     request: ModelRequest,
     binding_id: str,
     previous_items: tuple[dict[str, Any], ...],
+    *,
+    progress_timeout: float = 300.0,
 ) -> LLMResponse:
     content: list[str] = []
     thinking: list[str] = []
@@ -209,9 +233,10 @@ async def _consume_stream(
     usage: ModelUsage | None = None
     completed = False
     delta_seen = False
+    progress = StreamProgress(progress_timeout)
     try:
         lines = response.aiter_lines()
-        async for line in lines:
+        async for line in progress.read(lines):
             if not line.startswith("data:"):
                 continue
             raw = line[5:].strip()
@@ -226,39 +251,39 @@ async def _consume_stream(
             event_type = str(event.get("type") or "")
             delta = event.get("delta")
             if event_type == "response.output_text.delta" and isinstance(delta, str):
+                if delta:
+                    progress.advance()
                 content.append(delta)
                 delta_seen = True
                 await _emit(request.on_delta, {"content_delta": delta})
             elif event_type == "response.output_text.done":
-                delta_seen = (
-                    await _append_done(
-                        content,
-                        event.get("text"),
-                        request.on_delta,
-                        "content_delta",
-                    )
-                    or delta_seen
+                advanced = await _append_done(
+                    content, event.get("text"), request.on_delta, "content_delta",
                 )
+                if advanced:
+                    progress.advance()
+                delta_seen = advanced or delta_seen
             elif event_type in {
                 "response.reasoning_summary_text.delta",
                 "response.reasoning_text.delta",
             } and isinstance(delta, str):
+                if delta:
+                    progress.advance()
                 thinking.append(delta)
                 delta_seen = True
                 await _emit(request.on_delta, {"thinking_delta": delta})
             elif event_type == "response.reasoning_summary_text.done":
-                delta_seen = (
-                    await _append_done(
-                        thinking,
-                        event.get("text"),
-                        request.on_delta,
-                        "thinking_delta",
-                    )
-                    or delta_seen
+                advanced = await _append_done(
+                    thinking, event.get("text"), request.on_delta, "thinking_delta",
                 )
+                if advanced:
+                    progress.advance()
+                delta_seen = advanced or delta_seen
             elif event_type == "response.function_call_arguments.delta":
                 key = str(event.get("item_id") or event.get("output_index") or "")
                 slot = tool_args.setdefault(key, {"arguments": ""})
+                if delta:
+                    progress.advance()
                 slot["arguments"] += str(delta or "")
                 delta_seen = True
             elif event_type == "response.output_item.done":
@@ -266,14 +291,23 @@ async def _consume_stream(
                 if not isinstance(item, Mapping):
                     raise TransportError("Codex output item 必须是对象")
                 if item.get("type") == "reasoning":
-                    new_items.append(_sanitize_replay_item(item))
+                    replay = _sanitize_replay_item(item)
+                    if replay not in new_items and any(
+                        value for key, value in replay.items() if key != "type"
+                    ):
+                        progress.advance()
+                        delta_seen = True
+                    new_items.append(replay)
                 elif item.get("type") == "function_call":
                     key = str(item.get("id") or item.get("call_id") or "")
-                    tool_args[key] = {
+                    completed_call = {
                         "id": str(item.get("call_id") or key),
                         "name": str(item.get("name") or ""),
                         "arguments": str(item.get("arguments") or "{}"),
                     }
+                    if completed_call != tool_args.get(key):
+                        progress.advance()
+                    tool_args[key] = completed_call
                     delta_seen = True
             elif event_type == "response.completed":
                 response_payload = event.get("response")
@@ -294,10 +328,17 @@ async def _consume_stream(
                     else response_payload
                 )
                 _raise_stream_error(error)
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as error:
+        if delta_seen:
+            setattr(error, "response_delta_seen", True)
         raise
     except _CallbackError:
         raise
+    except TimeoutError as exc:
+        error = ModelTimeoutError(f"Codex 模型流超过 {progress_timeout:g} 秒没有有效进展")
+        if delta_seen:
+            setattr(error, "response_delta_seen", True)
+        raise error from exc
     except Exception as exc:
         if delta_seen:
             setattr(exc, "response_delta_seen", True)
@@ -367,10 +408,10 @@ def _continuation_items(
         return ()
     payload = continuation.payload
     if payload.get("format_version") != 1:
-        raise InvalidRequestError("unsupported Codex continuation format")
+        raise _unsent(InvalidRequestError("unsupported Codex continuation format"))
     raw_items = payload.get("items")
     if not isinstance(raw_items, tuple):
-        raise InvalidRequestError("Codex continuation items must be an array")
+        raise _unsent(InvalidRequestError("Codex continuation items must be an array"))
     return tuple(_sanitize_replay_item(item) for item in raw_items)
 
 
@@ -399,10 +440,10 @@ def _responses_input(
         if role == "assistant" and isinstance(calls, (list, tuple)):
             for call in calls:
                 if not isinstance(call, Mapping):
-                    raise InvalidRequestError("assistant tool call must be an object")
+                    raise _unsent(InvalidRequestError("assistant tool call must be an object"))
                 function = call.get("function")
                 if not isinstance(function, Mapping):
-                    raise InvalidRequestError("assistant tool call misses function")
+                    raise _unsent(InvalidRequestError("assistant tool call misses function"))
                 result.append(
                     {
                         "type": "function_call",
@@ -421,11 +462,11 @@ def _responses_content(role: object, content: object) -> object:
     if isinstance(content, str):
         return content
     if not isinstance(content, (list, tuple)):
-        raise InvalidRequestError("message content must be a string or array")
+        raise _unsent(InvalidRequestError("message content must be a string or array"))
     converted: list[dict[str, Any]] = []
     for raw in content:
         if not isinstance(raw, Mapping):
-            raise InvalidRequestError("message content block must be an object")
+            raise _unsent(InvalidRequestError("message content block must be an object"))
         block_type = raw.get("type")
         if block_type in {"input_text", "output_text", "input_image"}:
             converted.append(dict(raw))
@@ -436,13 +477,13 @@ def _responses_content(role: object, content: object) -> object:
             image = raw.get("image_url")
             url = image.get("url") if isinstance(image, Mapping) else image
             if not isinstance(url, str) or not url:
-                raise InvalidRequestError("image_url block misses URL")
+                raise _unsent(InvalidRequestError("image_url block misses URL"))
             item: dict[str, Any] = {"type": "input_image", "image_url": url}
             if isinstance(image, Mapping) and image.get("detail"):
                 item["detail"] = image["detail"]
             converted.append(item)
         else:
-            raise InvalidRequestError(f"unsupported Responses content block: {block_type}")
+            raise _unsent(InvalidRequestError(f"unsupported Responses content block: {block_type}"))
     return converted
 
 
@@ -451,15 +492,15 @@ def _responses_tools(tools: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]
     for tool in tools:
         function = tool.get("function") if tool.get("type") == "function" else tool
         if not isinstance(function, Mapping) or not function.get("name"):
-            raise InvalidRequestError("tool schema misses function name")
+            raise _unsent(InvalidRequestError("tool schema misses function name"))
         result.append(
             {
                 "type": "function",
                 "name": function["name"],
                 "description": function.get("description", ""),
-                "parameters": function.get(
+                "parameters": _thaw(function.get(
                     "parameters", {"type": "object", "properties": {}}
-                ),
+                )),
                 "strict": bool(function.get("strict", False)),
             }
         )
@@ -472,15 +513,15 @@ def _normalize_tool_choice(
 ) -> tuple[str, list[dict[str, Any]]]:
     if isinstance(choice, str):
         if choice not in {"auto", "none", "required"}:
-            raise InvalidRequestError(f"unsupported tool_choice: {choice}")
+            raise _unsent(InvalidRequestError(f"unsupported tool_choice: {choice}"))
         return choice, tools
     function = choice.get("function")
     name = function.get("name") if isinstance(function, Mapping) else choice.get("name")
     if choice.get("type") != "function" or not isinstance(name, str) or not name:
-        raise InvalidRequestError("named tool_choice is invalid")
+        raise _unsent(InvalidRequestError("named tool_choice is invalid"))
     selected = [tool for tool in tools if tool.get("name") == name]
     if not selected:
-        raise InvalidRequestError(f"named tool_choice references unknown tool: {name}")
+        raise _unsent(InvalidRequestError(f"named tool_choice references unknown tool: {name}"))
     return "required", selected
 
 
@@ -512,7 +553,7 @@ def _responses_lite_input(
 
 def _sanitize_replay_item(item: object) -> dict[str, Any]:
     if not isinstance(item, Mapping) or item.get("type") != "reasoning":
-        raise InvalidRequestError("Codex continuation only accepts reasoning items")
+        raise _unsent(InvalidRequestError("Codex continuation only accepts reasoning items"))
     allowed = {"type", "summary", "content", "encrypted_content"}
     return {key: _thaw(value) for key, value in item.items() if key in allowed}
 
@@ -588,27 +629,48 @@ def _optional_int(value: object) -> int | None:
     return value
 
 
+
+def _unsent(error: ModelError) -> ModelError:
+    """发送前本地校验失败：请求可证明未到达 provider，标记为允许重试的证据。"""
+    error.send_evidence = "unsent"
+    return error
+
 def _raise_status(response: httpx.Response, secret: str) -> None:
-    if response.status_code < 400:
+    error = _status_error(response, secret)
+    if error is None:
         return
+    # 4xx 是对本请求的明确拒绝应答——正面证据。5xx 只说明服务端/网关
+    # 未能给出结论，不能证明后端未接收或未处理：不授证据，fail-closed。
+    if response.status_code < 500:
+        error.send_evidence = "rejected"
+    raise error
+
+
+def _status_error(response: httpx.Response, secret: str) -> ModelError | None:
+    if response.status_code < 400:
+        return None
     text = response.text.replace(secret, "[REDACTED]") if secret else response.text
     lowered = text.lower()
     if response.status_code in {401, 403}:
-        raise AuthenticationError("Codex 请求认证失败，请重新登录")
+        return AuthenticationError("Codex 请求认证失败，请重新登录")
+    if response.status_code >= 500:
+        # status-first：5xx 只说明服务端/网关未给出结论，正文诊断文案
+        # （context_length 等）不得把错误提升为可证明的容量拒绝。
+        return TransportError(f"Codex 服务失败 (HTTP {response.status_code})")
     if "context_length" in lowered or "context window" in lowered:
-        raise ContextLengthError("Codex 请求超过上下文窗口")
+        return ContextLengthError("Codex 请求超过上下文窗口")
     if any(marker in lowered for marker in ("bio_policy", "cyber_policy", "policy_violation")):
-        raise ContentSafetyError("Codex 请求被安全策略拒绝")
+        return ContentSafetyError("Codex 请求被安全策略拒绝")
     if response.status_code == 402 or (
         response.status_code == 429
         and any(marker in lowered for marker in ("quota", "billing", "usage limit"))
     ):
-        raise QuotaError("Codex 账号额度不足")
+        return QuotaError("Codex 账号额度不足")
     if response.status_code == 429:
-        raise RateLimitError("Codex 请求被限流")
+        return RateLimitError("Codex 请求被限流")
     if 400 <= response.status_code < 500:
-        raise InvalidRequestError(f"Codex 请求失败 (HTTP {response.status_code})")
-    raise TransportError(f"Codex 服务失败 (HTTP {response.status_code})")
+        return InvalidRequestError(f"Codex 请求失败 (HTTP {response.status_code})")
+    return TransportError(f"Codex 服务失败 (HTTP {response.status_code})")
 
 
 def _raise_stream_error(error: object) -> None:

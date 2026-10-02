@@ -1,25 +1,30 @@
 from __future__ import annotations
 
 # pyright: reportPrivateUsage=false
-
 import asyncio
+import contextvars
 import hashlib
 import inspect
 import json
 from collections import deque
-from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping
-from contextlib import asynccontextmanager
-from contextlib import nullcontext
+from collections.abc import Awaitable, Callable, Coroutine, Iterable, Iterator, Mapping
+from contextlib import asynccontextmanager, contextmanager, nullcontext
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, AsyncGenerator, TypeVar, cast
+from typing import Any, AsyncGenerator, TypeVar, cast
 
-from agent.plugin_composition.effect import Effect, EffectSetup, _join_cleanup as _await_critical
+from agent.plugin_composition.access import CompositionAudit
 from agent.plugin_composition.diagnostics import (
     CorePluginDiagnostics,
     PluginDiagnostics,
     plugin_entrypoint,
+)
+from agent.plugin_composition.effect import (
+    Effect,
+    EffectSetup,
+    _join_cleanup as _await_critical,
 )
 from agent.plugin_composition.events import (
     Bail,
@@ -33,7 +38,6 @@ from agent.plugin_composition.events import (
     TransformEventKey,
 )
 from agent.plugin_composition.executor import reject_executor_context_access
-from agent.plugin_composition.access import CompositionAudit
 from agent.plugin_composition.model import (
     CompositionError,
     CompositionReceipt,
@@ -46,67 +50,53 @@ from agent.plugin_composition.model import (
     TopologyFiberView,
     TopologyView,
 )
-
-if TYPE_CHECKING:
-    from agent.plugins.snapshot import RuntimeSnapshotLease
-
+from agent.plugin_composition.runtime_lifecycle import (
+    RUNTIME_STARTED,
+    RUNTIME_STARTING,
+    RUNTIME_STOPPING,
+    RuntimeStarted,
+    RuntimeStarting,
+    RuntimeStopping,
+)
 
 T = TypeVar("T")
 R = TypeVar("R")
+F = TypeVar("F", bound=Callable[..., object])
 PluginApply = Callable[["Context"], object]
 
 
-class RuntimeScope:
-    """Carry one exact snapshot from a source callback into one async operation."""
+_lifecycle_binding: contextvars.ContextVar[
+    "tuple[Context, asyncio.Task[object]] | None"
+] = contextvars.ContextVar("plugin_lifecycle_binding", default=None)
 
-    def __init__(self, lease: RuntimeSnapshotLease) -> None:
-        self._lease = lease
-        self._token: object | None = None
-        self._closed = False
 
-    @property
-    def snapshot_id(self) -> str:
-        """Expose only the immutable identity carried by this runtime scope."""
+@contextmanager
+def _lifecycle_bound(context: Context) -> Iterator[None]:
+    """Core-only：把 (Context, 实际执行 Task) 生命周期借用显式绑到当前 Task。
 
-        return self._lease.snapshot.snapshot_id
+    ContextVar 值会随 create_task 继承，但借用要求 binding 里的 Task
+    正是 current_task——原生后台 Task 继承该值也不获权。由实际执行
+    回调的 Task 建立并 finally reset，不做隐式授权传播。
+    """
 
-    async def __aenter__(self) -> None:
-        if self._closed or self._token is not None:
-            raise RuntimeError("runtime scope 只能进入一次")
-        from agent.plugins.snapshot import bind_runtime_snapshot
-
-        try:
-            self._token = bind_runtime_snapshot(self._lease)
-        except BaseException:
-            self._closed = True
-            await self._lease.release()
-            raise
-
-    async def __aexit__(self, *exc_info: object) -> None:
-        await self.close()
-
-    async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        token = self._token
-        try:
-            if token is not None:
-                from agent.plugins.snapshot import reset_runtime_snapshot
-
-                reset_runtime_snapshot(cast(Any, token))
-                self._token = None
-        finally:
-            await self._lease.release()
+    task = asyncio.current_task()
+    if task is None:
+        raise RuntimeError("生命周期借用需要实际 Task")
+    token = _lifecycle_binding.set((context, task))
+    try:
+        yield
+    finally:
+        _lifecycle_binding.reset(token)
 
 
 @dataclass(slots=True)
 class _Provider:
-    key: ServiceKey[object]
+    key: ServiceKey[Any]
     value: object
     owner: Fiber
     revision: int
     binding_contributors: Callable[[], tuple[Context, ...]] | None = None
+    revoking: bool = False
 
 
 @dataclass(slots=True)
@@ -126,9 +116,20 @@ class Context:
         self._fiber = fiber
         self._fiber_handle = FiberHandle(fiber)
 
+    def _require_current(self) -> None:
+        """对象身份拒绝被替换 activation 的旧 Context；不用 token 比较，
+        避免误拒排空期仍需读自己 dependency_store 的已保护工作。"""
+
+        if self._fiber.context is not self:
+            raise CompositionError(
+                "STALE_ACTIVATION",
+                f"{self._fiber.name} 的 Context 属于已被替换的 activation",
+            )
+
     @property
     def fiber(self) -> FiberHandle:
         reject_executor_context_access()
+        self._require_current()
         return self._fiber_handle
 
     @property
@@ -143,71 +144,118 @@ class Context:
         reject_executor_context_access()
         return self._root.instance_token
 
-    def _root_instance_token(self) -> object:
-        """Return the Core-only identity of this Context's Root."""
-
-        reject_executor_context_access()
-        return self._root.instance_token
-
-    def _declared_dependencies(self) -> tuple[ServiceKey[object], ...]:
+    def _declared_dependencies(self) -> tuple[ServiceKey[Any], ...]:
         """供 Core 请求边界冻结声明 Fiber 的能力集合。"""
         reject_executor_context_access()
         return self._fiber.dependencies
 
-    def _plugin_module(self) -> ModuleType | None:
-        """Return the exact module mounted on this Fiber when one exists."""
-
+    def _reserve_scope(self) -> RuntimeScope | None:
+        """在派发时保留准确 owner；生命周期与 Root 由其外层寿命保护。"""
         reject_executor_context_access()
-        return self._fiber.plugin_module
+        self._require_current()
+        binding = _lifecycle_binding.get()
+        if self._fiber._is_root or binding == (self, asyncio.current_task()):
+            return None
+        owned = self._fiber._call_owned_by_current_task()
+        call = (owned._retain() if owned is not None
+                else self._fiber._begin_call(self._fiber._activation_token))
+        return RuntimeScope(call)
+
+    @contextmanager
+    def _call_scope(self) -> Iterator[None]:
+        """统一保护同步和异步入口。"""
+        scope = self._reserve_scope()
+        with scope if scope is not None else nullcontext():
+            yield
 
     @asynccontextmanager
     async def runtime_scope(self) -> AsyncGenerator[None]:
-        """Bind one short background operation to this exact composition Root."""
-
-        reject_executor_context_access()
-        from agent.plugins.snapshot import get_current_runtime_lease
-
-        current = get_current_runtime_lease()
-        lease = (
-            current.fork()
-            if current is not None
-            and self._belongs_to_scope(current.snapshot.composition_root)
-            else await self._root._acquire_runtime_scope()
-        )
-
-        async with RuntimeScope(lease):
+        """为需要显式延长资源寿命的业务边界保留同一次 activation。"""
+        with self._call_scope():
             yield
 
-    def require_runtime_owner(self, key: ServiceKey[object], service: object) -> str:
+    def entrypoint(self, operation: F) -> F:
+        """把同步或异步 callable 绑定到本 provider 的执行入口。"""
+        self._require_current()
+        if not callable(operation) or inspect.isgeneratorfunction(operation) or inspect.isasyncgenfunction(operation):
+            raise TypeError("执行入口必须是同步函数或 async 函数，资源生成器需显式管理寿命")
+        if inspect.iscoroutinefunction(operation):
+            @wraps(operation)
+            async def run_async(*args: Any, **kwargs: Any) -> object:
+                with self._call_scope():
+                    return await operation(*args, **kwargs)
+            return cast(F, run_async)
+
+        @wraps(operation)
+        def run_sync(*args: Any, **kwargs: Any) -> object:
+            with self._call_scope():
+                result = operation(*args, **kwargs)
+                if inspect.isawaitable(result):
+                    if inspect.iscoroutine(result):
+                        result.close()
+                    elif isinstance(result, asyncio.Future):
+                        result.cancel()
+                    raise TypeError("同步入口不能返回 awaitable；请用 async 函数声明入口")
+                return result
+        return cast(F, run_sync)
+
+    @contextmanager
+    def borrow(self, key: ServiceKey[T]) -> Iterator[T | None]:
+        """临时查询可选服务，借用期间保护实际 provider；缺席返回 None。"""
+        reject_executor_context_access()
+        self._require_current()
+        provider = self._root._active_provider(cast(ServiceKey[Any], key))
+        if provider is None:
+            yield None
+            return
+        with provider.owner.context._call_scope():
+            yield cast(T, provider.value)
+
+    def require_runtime_owner(self, key: ServiceKey[Any], service: object) -> str:
         """验证当前 scope 的实际服务与 Context，返回 Core 分配的插件 owner。"""
         reject_executor_context_access()
-        from agent.plugins.snapshot import get_current_runtime_lease
+        self._require_current()
+        task = asyncio.current_task()
+        binding = _lifecycle_binding.get()
+        if not (
+            self._fiber._call_owned_by_current_task() is not None
+            or (
+                binding is not None
+                and binding[0] is self
+                and binding[1] is task
+            )
+        ):
+            raise CompositionError(
+                "OWNER_CALL_CONTEXT",
+                "授权需要当前 Context 的 OwnerCall 或生命周期借用",
+            )
+        if self.require(key) is not service:
+            raise CompositionError(
+                "SERVICE_SCOPE_MISMATCH",
+                "授权服务不属于当前 Context 的 dependency store",
+            )
+        return self.runtime.plugin_id
 
-        lease = get_current_runtime_lease()
-        if lease is None or lease.snapshot.composition_root is None:
-            raise RuntimeError("授权需要实际 runtime scope")
-        root = lease.snapshot.composition_root
-        if root.context.require(key) is not service:
-            raise RuntimeError("授权服务不属于当前 runtime scope")
-        owner = root.context_owner(self)
-        if owner is None:
-            raise PermissionError("Context 不属于当前 runtime scope")
-        return owner
+    def require_declared_runtime_owner(self, key: ServiceKey[Any], service: object) -> str:
+        """先核对 Context 有效性和声明，再核对实际调用许可。"""
+        reject_executor_context_access()
+        self._require_current()
+        if key not in self._fiber.dependencies:
+            raise CompositionError("UNDECLARED_SERVICE", f"当前 Fiber 未声明依赖: {key.name}")
+        return self.require_runtime_owner(key, service)
 
     def capture_runtime_scope(self) -> RuntimeScope:
-        """Fork the exact scope bound to this callback for one detached operation."""
+        """把当前 Task 已接纳的许可延长成一份可移交子 Task 的 scope。"""
 
         reject_executor_context_access()
-        from agent.plugins.snapshot import get_current_runtime_lease
-
-        current = get_current_runtime_lease()
-        if current is None or not self._belongs_to_scope(current.snapshot.composition_root):
-            raise RuntimeError("当前 task 未绑定此插件 Root 的 runtime scope")
-        return RuntimeScope(current.fork())
-
-    def _belongs_to_scope(self, root: CompositionRoot | None) -> bool:
-        """回调只能进入创建它的同一完整 Root。"""
-        return root is self._root
+        self._require_current()
+        owned = self._fiber._call_owned_by_current_task()
+        if owned is None:
+            raise CompositionError(
+                "OWNER_CALL_CONTEXT",
+                "当前 task 未持有本 Fiber 的调用许可，不能 capture scope",
+            )
+        return RuntimeScope(owned._retain())
 
     @property
     def config(self) -> Mapping[str, object]:
@@ -237,7 +285,7 @@ class Context:
         return CorePluginDiagnostics(
             plugin_id=runtime.plugin_id,
             generation_id=runtime.generation_id,
-            fiber=self._fiber.name,
+            fiber=self._fiber.path,
         )
 
     @property
@@ -263,10 +311,11 @@ class Context:
         plugin: PluginApply,
         *,
         name: str | None = None,
-        inject: Iterable[ServiceKey[object]] | None = None,
+        inject: Iterable[ServiceKey[Any]] | None = None,
         required_for_readiness: bool = True,
     ) -> FiberHandle:
         reject_executor_context_access()
+        self._require_current()
         if not callable(plugin) or hasattr(plugin, "apply"):
             raise TypeError("Context.mount 只接受 child callable")
         fiber = await self._root._mount(
@@ -282,12 +331,12 @@ class Context:
 
     async def inject(
         self,
-        dependencies: Iterable[ServiceKey[object]],
+        dependencies: Iterable[ServiceKey[Any]],
         apply: PluginApply,
         *,
         name: str | None = None,
     ) -> FiberHandle:
-        """初始化时挂载可选子插件；Root 冻结后不再补挂或重绑。"""
+        """挂载独立随依赖激活的子 Fiber，不阻塞父 Fiber 就绪。"""
 
         reject_executor_context_access()
         return await self.mount(
@@ -301,30 +350,88 @@ class Context:
                       binding_contributors: Callable[[], tuple[Context, ...]] | None = None) -> Effect:
         """服务 owner 可声明归档时实际需要的动态注册 Context，生命周期随同一 Effect。"""
         reject_executor_context_access()
+        self._require_current()
+        typed_key = cast(ServiceKey[Any], key)
+        if self._fiber.state == FiberState.ACTIVE:
+            # ACTIVE late provide must reject synchronously before ownership changes.
+            self._root._check_provider_registration(typed_key)
+            self._root._guard_service_notify(typed_key, self._fiber)
 
-        async def setup() -> Callable[[], Awaitable[None]]:
-            self._root._register_provider(
-                cast(ServiceKey[object], key),
+        registration: _Provider | None = None
+
+        def close_guard() -> None:
+            if registration is None:
+                raise RuntimeError("Service registration 尚未建立 close guard")
+            self._root._guard_service_close(registration)
+
+        def setup() -> Callable[[], Awaitable[None]]:
+            nonlocal registration
+            registration = self._root._register_provider(
+                typed_key,
                 value,
                 self._fiber,
                 binding_contributors=binding_contributors,
             )
 
             async def cleanup() -> None:
+                if registration is None:
+                    raise RuntimeError("Service registration cleanup 缺少 registration")
                 await self._root._remove_provider(
-                    cast(ServiceKey[object], key),
-                    self._fiber,
+                    registration,
                 )
 
             return cleanup
 
-        return await self.effect(setup, label=f"service:{key.name}")
+        effect = await self._fiber.add_effect(
+            setup,
+            label=f"service:{key.name}",
+            close_guard=close_guard,
+        )
+        if self._fiber.state == FiberState.ACTIVE:
+            if registration is None:
+                raise RuntimeError("ACTIVE Service registration 缺少 registration")
+            notification = self._root._notify_provider_registered(registration)
+            try:
+                try:
+                    notification_task = asyncio.create_task(
+                        notification,
+                        name=f"plugin-service-notify:{key.name}",
+                    )
+                except BaseException:
+                    notification.close()
+                    raise
+                await _await_critical(notification_task)
+            except BaseException as error:
+                try:
+                    await effect.aclose()
+                except BaseException as cleanup_error:
+                    raise BaseExceptionGroup(
+                        f"Service 发布与撤销失败: {key.name}", [error, cleanup_error],
+                    ) from None
+                raise
+        return effect
 
     def get(self, key: ServiceKey[T]) -> T | None:
         reject_executor_context_access()
-        provider = self._fiber.dependency_store.get(cast(ServiceKey[object], key))
+        self._require_current()
+        provider = self._fiber.dependency_store.get(cast(ServiceKey[Any], key))
         if provider is None:
-            provider = self._root._active_provider(cast(ServiceKey[object], key))
+            # LOADING 中 owner 只读自己已登记的 provide；跨 owner 仍要求
+            # provider owner 已 ACTIVE。
+            provider = self._root._providers.get(cast(ServiceKey[Any], key))
+            if provider is not None and provider.owner is self._fiber:
+                if (
+                    provider.revoking
+                    and not self._root._provider_owner_accessible(provider, self)
+                ):
+                    provider = None
+            elif self._fiber._is_root:
+                provider = self._root._active_provider(cast(ServiceKey[Any], key))
+            else:
+                raise CompositionError(
+                    "UNDECLARED_SERVICE",
+                    f"{self._fiber.path} 未声明 Service {key.name}；可选调用请使用 borrow",
+                )
         return cast(T | None, None if provider is None else provider.value)
 
     def require(self, key: ServiceKey[T]) -> T:
@@ -339,6 +446,7 @@ class Context:
 
     async def effect(self, setup: EffectSetup, *, label: str = "effect") -> Effect:
         reject_executor_context_access()
+        self._require_current()
         return await self._fiber.add_effect(setup, label=label)
 
     async def health(
@@ -350,6 +458,7 @@ class Context:
         """注册一个由当前 Fiber Effect 持有的健康项。"""
 
         reject_executor_context_access()
+        self._require_current()
         entry = self._root._new_health_entry(
             self._fiber,
             name=name,
@@ -368,6 +477,7 @@ class Context:
         """记录一条结构化 Incident，但不隐式改变当前 Health。"""
 
         reject_executor_context_access()
+        self._require_current()
         if not kind or kind.strip() != kind:
             raise ValueError("Incident kind 必须是非空且无首尾空白的字符串")
         if not message or message.strip() != message:
@@ -405,6 +515,7 @@ class Context:
 
     def emit(self, key: EmitEventKey[T], payload: T) -> None:
         reject_executor_context_access()
+        self._require_current()
         self._root._events.emit(key, payload)
 
     async def serial(
@@ -413,18 +524,22 @@ class Context:
         payload: T,
     ) -> Bail[R] | None:
         reject_executor_context_access()
+        self._require_current()
         return await self._root._events.serial(key, payload)
 
     async def parallel(self, key: ParallelEventKey[T], payload: T) -> None:
         reject_executor_context_access()
+        self._require_current()
         await self._root._events.parallel(key, payload)
 
     async def transform(self, key: TransformEventKey[T], payload: T) -> T:
         reject_executor_context_access()
+        self._require_current()
         return await self._root._events.transform(key, payload)
 
     async def observe(self, key: ObserveEventKey[T], payload: T) -> None:
         reject_executor_context_access()
+        self._require_current()
         await self._root._events.observe(key, payload)
 
     async def spawn(
@@ -436,26 +551,52 @@ class Context:
         """Start one Fiber-owned task and expose failures to Core readiness."""
 
         reject_executor_context_access()
+        try:
+            self._require_current()
+        except BaseException:
+            # A stale Context rejects the operation before creating an owned
+            # Task; close the caller's coroutine so the rejected request has
+            # no unobserved CORO_CREATED resource left behind.
+            coroutine.close()
+            raise
         if not name or name.strip() != name:
             coroutine.close()
             raise ValueError("任务名称必须是非空且无首尾空白的字符串")
         task: asyncio.Task[T] | None = None
+        # 就绪闸捕获当次 activation：换代后旧 coroutine 不会等到新
+        # activation 的 ready。user_state 是 wrapper 与 cleanup 共享的唯一
+        # 结算事实：not_started 由 cleanup 关闭，awaiting 已交给 Task 执行，
+        # closed 已由用户 coroutine 的 finally 完成，避免双关/漏关。
+        ready = self._fiber._activation_ready
+        user_state = "not_started"
 
         def setup() -> Callable[[], Awaitable[None]]:
             nonlocal task
             runtime = self._fiber.runtime
 
+            async def run_user() -> T:
+                nonlocal user_state
+                # 这里没有可被其他 Task 插入的 await；一旦进入该函数，
+                # 下一条 await 就会把用户 coroutine 交给同一个 Task。
+                user_state = "awaiting"
+                try:
+                    return await coroutine
+                finally:
+                    user_state = "closed"
+
             async def run_owned_task() -> T:
-                if runtime is None:
-                    return await coroutine
-                with plugin_entrypoint(
-                    plugin_id=runtime.plugin_id,
-                    generation_id=runtime.generation_id,
-                    fiber=self._fiber.name,
-                    operation="task.run",
-                    entrypoint=name,
-                ):
-                    return await coroutine
+                await ready.wait()
+                with self._call_scope():
+                    if runtime is None:
+                        return await run_user()
+                    with plugin_entrypoint(
+                        plugin_id=runtime.plugin_id,
+                        generation_id=runtime.generation_id,
+                        fiber=self._fiber.path,
+                        operation="task.run",
+                        entrypoint=name,
+                    ):
+                        return await run_user()
 
             owned_coroutine = run_owned_task()
             try:
@@ -465,7 +606,10 @@ class Context:
                 )
             except BaseException:
                 owned_coroutine.close()
+                coroutine.close()
                 raise
+            self._fiber._tasks.add(task)
+            task.add_done_callback(self._fiber._tasks.discard)
             task.add_done_callback(
                 lambda completed: self._root._record_task_result(
                     self._fiber,
@@ -475,10 +619,16 @@ class Context:
             )
 
             async def cleanup() -> None:
+                nonlocal user_state
                 assert task is not None
                 if not task.done():
                     _ = task.cancel()
                 _ = await asyncio.gather(task, return_exceptions=True)
+                # 原生 Task 首指令前取消不执行 wrapper finally；未开始的
+                # 用户 coroutine 由 cleanup 侧关闭。
+                if user_state == "not_started":
+                    coroutine.close()
+                    user_state = "closed"
 
             return cleanup
 
@@ -501,6 +651,12 @@ class FiberHandle:
         self._fiber = fiber
 
     @property
+    def fiber_id(self) -> int:
+        """供只读图消费者关联实际功能分支。"""
+        reject_executor_context_access()
+        return self._fiber.fiber_id
+
+    @property
     def name(self) -> str:
         reject_executor_context_access()
         return self._fiber.name
@@ -517,9 +673,215 @@ class FiberHandle:
         reject_executor_context_access()
         return self._fiber._activation_token
 
+    def acquire_call(self, expected_activation: object) -> OwnerCall:
+        """Atomically admit one call bound to the caller's expected activation.
+
+        旧绑定在 owner 换代后必须显式失败，不默认替调用方改绑最新实例。
+        """
+
+        reject_executor_context_access()
+        return self._fiber._begin_call(expected_activation)
+
     async def dispose(self) -> None:
         reject_executor_context_access()
         await self._fiber.dispose()
+
+
+class OwnerCall:
+    """One admitted, not-yet-released local call permit.
+
+    只能由 FiberHandle.acquire_call 或 Core-only 的 `_retain` 返回；
+    排空期间许可仍保护其 owner 的资源直到 release。它不代表新调用
+    资格，也不报告 owner 当前状态；不提供自行构造或跨 Task 转移的
+    保障。
+    """
+
+    __slots__ = ("_fiber", "_activation", "_admission_closed", "_released")
+
+    def __init__(
+        self,
+        fiber: Fiber,
+        activation: object,
+        admission_closed: asyncio.Event,
+    ) -> None:
+        self._fiber = fiber
+        self._activation = activation
+        self._admission_closed = admission_closed
+        self._released = False
+
+    @property
+    def activation(self) -> object:
+        """返回接纳本次调用的 activation 身份，不跟随后续换代。"""
+
+        return self._activation
+
+    async def __aenter__(self) -> OwnerCall:
+        if self._released:
+            raise CompositionError(
+                "OWNER_CALL_RELEASED", "调用句柄不能重复进入"
+            )
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        self.release()
+
+    def _retain(self) -> OwnerCall:
+        """Core-only：从本许可派生同 activation 的独立许可。
+
+        延长已被接纳调用的保护，不是新调用接纳：不判断 ACTIVE，不比
+        较 Fiber 当前 token——UNLOADING 期间源许可仍受保护，故仍可
+        保留。仅持有源许可的 Task 可调用；源/派生许可各自独立
+        release，最后一份释放才允许资源清理。当前不承诺跨 Task
+        转移。
+        """
+
+        if self._released:
+            raise CompositionError(
+                "OWNER_CALL_RELEASED", "已释放的调用句柄不能再保留"
+            )
+        return self._fiber._retain_call(self)
+
+    def release(self) -> None:
+        """结束本次调用并释放 owner 的排空等待。"""
+
+        if self._released:
+            raise CompositionError(
+                "OWNER_CALL_RELEASED", "调用句柄不能重复释放"
+            )
+        self._released = True
+        self._fiber._end_call(self)
+
+
+_runtime_scope_binding: contextvars.ContextVar["RuntimeScope | None"] = (
+    contextvars.ContextVar("plugin_runtime_scope_binding", default=None)
+)
+
+
+def _current_runtime_scope() -> "RuntimeScope | None":
+    """Return the scope actually entered by the current task, if any.
+
+    ContextVar 隐式继承到子 Task 不算授权：只有 entered_task 即当前
+    Task 且未关闭的绑定才算数。
+    """
+
+    scope = _runtime_scope_binding.get()
+    if (
+        scope is None
+        or scope._closed
+        or scope._entered_task is not asyncio.current_task()
+    ):
+        return None
+    return scope
+
+
+class RuntimeScope:
+    """一份独占 OwnerCall 的绑定/交接/结算 scope。
+
+    构造消费一份当前 Task 独占、未释放的 call——调用方随后不得再
+    释放或再次移交这同一份 call；这是 Core 调用代码遵守的合同，
+    不为违约加反向指针/票据/所有权表。资源计数唯一由
+    Fiber._in_flight_calls 持有；本类只保存许可、ContextVar reset
+    token、进入 Task 与关闭事实，不持 lease/版本选择器/注册表。
+    ContextVar 绑定不授权生命周期借用、跨 owner 借用或后台许可。
+    """
+
+    __slots__ = ("_call", "_entered_task", "_binding_token", "_closed")
+
+    def __init__(self, call: OwnerCall) -> None:
+        # 调用方把这份许可的结算责任移交本 scope；构造时要求当前 Task
+        # 仍持有它（可来自 acquire_call 或 _retain）。
+        current = asyncio.current_task()
+        if call._released:
+            raise CompositionError(
+                "OWNER_CALL_RELEASED", "已释放的调用句柄不能绑定 scope"
+            )
+        if current is None or (
+            call._fiber._in_flight_calls.get(call) is not current
+        ):
+            raise CompositionError(
+                "OWNER_CALL_CONTEXT", "call scope 需要持有该许可的 Task"
+            )
+        self._call = call
+        self._entered_task: asyncio.Task[object] | None = None
+        self._binding_token: contextvars.Token[RuntimeScope | None] | None = None
+        self._closed = False
+
+    def capture(self) -> "RuntimeScope":
+        """同步 retain 当前 scope 的许可，返回独立未 enter 的 scope。
+
+        保护在返回前即存在，没有 capture→enter 空窗；源 scope 与
+        captured scope 各自独立结算，不互相代替。
+        """
+
+        if (
+            self._closed
+            or self._entered_task is None
+            or self._entered_task is not asyncio.current_task()
+        ):
+            raise CompositionError(
+                "OWNER_CALL_CONTEXT",
+                "只有已 enter 且未关闭的 scope 能由进入它的 Task capture",
+            )
+        return RuntimeScope(self._call._retain())
+
+    async def wait_admission_closed(self) -> None:
+        """等待本 activation 停止新接纳；不代表已接纳调用已结束。"""
+
+        await self._call._admission_closed.wait()
+
+    def __enter__(self) -> "RuntimeScope":
+        if self._closed or self._entered_task is not None:
+            raise RuntimeError("call scope 只能进入一次")
+        task = asyncio.current_task()
+        if task is None:
+            raise CompositionError(
+                "OWNER_CALL_CONTEXT", "call scope 需要实际 Task 上下文"
+            )
+        # 同步完成：许可仍在途且未释放 → Fiber 记账改归属当前 Task →
+        # 绑定 ContextVar。不判断 ACTIVE、不比较 Fiber 最新 token——
+        # 排空期间已持许可仍有效。
+        self._call._fiber._adopt_call(self._call)
+        self._binding_token = _runtime_scope_binding.set(self)
+        self._entered_task = task
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self._close()
+
+    async def __aenter__(self) -> "RuntimeScope":
+        return self.__enter__()
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        self._close()
+
+    def _close(self) -> None:
+        """Synchronously settle this scope without duplicating release logic.
+
+        错误 Task 在任何 closed 标记/释放/reset 之前被拒绝，合法
+        Task 之后仍可完成清理。未 enter 的 scope 允许持有对象者关闭，
+        只释放其独立许可，无 ContextVar 要 reset。
+        """
+
+        if self._closed:
+            return
+        entered = self._entered_task
+        if entered is not None and asyncio.current_task() is not entered:
+            raise CompositionError(
+                "OWNER_CALL_CONTEXT",
+                "已 enter 的 call scope 只能由进入它的 Task 关闭",
+            )
+        self._closed = True
+        if entered is not None:
+            token = self._binding_token
+            if token is not None:
+                _runtime_scope_binding.reset(token)
+                self._binding_token = None
+        self._call.release()
+
+    async def close(self) -> None:
+        """幂等；已 enter 的 scope 只能由 entered_task 关闭。"""
+
+        self._close()
 
 
 class HealthHandle:
@@ -560,7 +922,7 @@ class Fiber:
         fiber_id: int,
         name: str,
         apply: PluginApply,
-        dependencies: tuple[ServiceKey[object], ...],
+        dependencies: tuple[ServiceKey[Any], ...],
         parent: Fiber | None,
         required_for_readiness: bool,
         runtime: PluginRuntime | None,
@@ -578,18 +940,40 @@ class Fiber:
         self.plugin_module = plugin_module
         self.state = FiberState.ACTIVE if is_root else FiberState.PENDING
         self.context = Context(root, self)
-        self.dependency_store: dict[ServiceKey[object], _Provider] = {}
+        self.dependency_store: dict[ServiceKey[Any], _Provider] = {}
         self.effects: list[Effect] = []
         self.children: list[Fiber] = []
         self.error: BaseException | None = None
         self._task_failures: dict[str, str] = {}
+        self._tasks: set[asyncio.Task[Any]] = set()
         self._epoch: tuple[tuple[str, int], ...] | None = () if is_root else None
         self._activation_token: object | None = object() if is_root else None
+        self._admission_closed = asyncio.Event()
         self._transition = asyncio.Lock()
         self._transition_owner: asyncio.Task[object] | None = None
         self._dispose_requested = False
         self._dispose_task: asyncio.Task[None] | None = None
         self._is_root = is_root
+        # 本次 activation 已接纳的在途调用；只对受影响 owner 等待。
+        # 接纳条件即 state==ACTIVE 且 activation token 匹配，不另设独立事实。
+        # 许可对象本身即键——嵌套 scope 可据此取回当前 Task 的真实许可。
+        self._in_flight_calls: dict[OwnerCall, asyncio.Task[object]] = {}
+        self._calls_idle = asyncio.Event()
+        self._calls_idle.set()
+        # activation-local 事实：就绪闸与 STOPPING 完成标志随每次 _load 重建。
+        self._activation_ready = asyncio.Event()
+        if is_root:
+            self._activation_ready.set()
+        self._stopping_completed = False
+        self._lifecycle_started = False
+
+    @property
+    def path(self) -> str:
+        """诊断与拓扑使用父路径；局部名字只由当前父 Fiber 管理。"""
+        segment = self.name.replace("~", "~0").replace("/", "~1")
+        if self.parent is None or self.parent._is_root:
+            return segment
+        return f"{self.parent.path}/{segment}"
 
     @property
     def missing_services(self) -> tuple[str, ...]:
@@ -599,7 +983,13 @@ class Fiber:
             if self.root._active_provider(key) is None
         )
 
-    async def add_effect(self, setup: EffectSetup, *, label: str) -> Effect:
+    async def add_effect(
+        self,
+        setup: EffectSetup,
+        *,
+        label: str,
+        close_guard: Callable[[], object] | None = None,
+    ) -> Effect:
         """Register ownership before setup and expose only live Fiber states."""
 
         if self.state in {FiberState.UNLOADING, FiberState.DISPOSED}:
@@ -608,26 +998,136 @@ class Fiber:
                 f"{self.name} 在 {self.state.value} 状态不能注册 Effect",
             )
         runtime = self.runtime
+        context = self.context
         effect = Effect(
             label=label,
             remove_from_owner=self._remove_effect,
             plugin_id="" if runtime is None else runtime.plugin_id,
             generation_id="" if runtime is None else runtime.generation_id,
             fiber=self.name,
+            lifecycle_binder=lambda: _lifecycle_bound(context),
+            close_guard=close_guard,
         )
         self.effects.append(effect)
         return await effect.start(setup)
+
+    def _begin_call(self, expected_activation: object) -> OwnerCall:
+        """Atomically admit one call bound to the expected activation."""
+
+        if self._is_root:
+            raise CompositionError(
+                "ROOT_CALL_ADMISSION",
+                "Root Fiber 不提供调用接纳",
+            )
+        current = asyncio.current_task()
+        if current is None:
+            raise CompositionError(
+                "OWNER_CALL_CONTEXT",
+                f"{self.name} 的调用接纳需要实际 Task 上下文",
+            )
+        if self.state != FiberState.ACTIVE or self._activation_token is None:
+            raise CompositionError(
+                "OWNER_UNAVAILABLE",
+                f"{self.name} 当前 activation 不接纳新调用",
+            )
+        if expected_activation is not self._activation_token:
+            raise CompositionError(
+                "STALE_ACTIVATION",
+                f"{self.name} 的调用仍绑定旧 activation，不得静默重绑",
+            )
+        call = OwnerCall(self, self._activation_token, self._admission_closed)
+        self._in_flight_calls[call] = current
+        self._calls_idle.clear()
+        return call
+
+    def _call_owned_by_current_task(self) -> OwnerCall | None:
+        """返回当前 Task 实际持有的本 Fiber 在途许可，无则 None。"""
+
+        current = asyncio.current_task()
+        if current is None:
+            return None
+        for call, task in self._in_flight_calls.items():
+            if task is current:
+                return call
+        return None
+
+    def _retain_call(self, source: OwnerCall) -> OwnerCall:
+        """Register one extra permit derived from a still-held call.
+
+        只信任调用方仍持有源许可：源许可的在途 entry 必须归属当前
+        Task。检查先于任何新增，不做跨 Task 转交或死锁探测。
+        """
+
+        current = asyncio.current_task()
+        if current is None or (
+            self._in_flight_calls.get(source) is not current
+        ):
+            raise CompositionError(
+                "OWNER_CALL_CONTEXT",
+                f"{self.name} 的调用保留需要持有源许可的 Task 上下文",
+            )
+        call = OwnerCall(
+            self,
+            source._activation,
+            source._admission_closed,
+        )
+        self._in_flight_calls[call] = current
+        self._calls_idle.clear()
+        return call
+
+    def _adopt_call(self, call: OwnerCall) -> None:
+        """Core-only：把一份在途许可的执行归属转交当前 Task。
+
+        仅供 RuntimeScope.__aenter__ 对自有许可使用；不是通用任意
+        Task 转交 API。许可已释放或已不在在途记账时 fail-loud。
+        """
+
+        current = asyncio.current_task()
+        if current is None:
+            raise CompositionError(
+                "OWNER_CALL_CONTEXT", f"{self.name} 的许可接管需要实际 Task 上下文"
+            )
+        if call._released or self._in_flight_calls.get(call) is None:
+            raise CompositionError(
+                "OWNER_CALL_RELEASED", "许可已释放，不能接管"
+            )
+        self._in_flight_calls[call] = current
+
+    def _end_call(self, call: OwnerCall) -> None:
+        if self._in_flight_calls.pop(call, None) is None:
+            raise CompositionError(
+                "OWNER_CALL_RELEASED", f"{self.name} 的调用句柄不能重复释放"
+            )
+        if not self._in_flight_calls:
+            self._calls_idle.set()
+
+    def _reject_self_call_wait(self) -> None:
+        """持有本 activation 在途调用的任务不能等待它自己的卸载。"""
+
+        current = asyncio.current_task()
+        if current is not None and any(
+            task is current for task in self._in_flight_calls.values()
+        ):
+            raise CompositionError(
+                "REENTRANT_CALL_WAIT",
+                f"{self.name} 的卸载不能等待该任务自己仍持有的在途调用",
+            )
 
     async def reconcile(self) -> None:
         """Move to the state implied by the newest dependency epoch."""
 
         self._reject_direct_reentrant_wait("reconcile")
+        # 仅当 transition 已被另一操作持有、本任务又持有本 owner 的
+        # 在途调用时，等待会构成同 owner 自等待；无锁/无在途的
+        # reconcile（包括同 epoch no-op）不受影响。
+        if self._transition.locked() and self._in_flight_calls:
+            self._reject_self_call_wait()
         async with self._locked_transition():
             await self._reconcile()
 
     async def _reconcile(self) -> None:
         """在调用方持有转换锁时完成依赖装配。"""
-        if self._dispose_requested or self._is_root or self.root.frozen:
+        if self._dispose_requested or self._is_root:
             return
         providers = self.root._dependency_snapshot(self.dependencies)
         target_epoch = self.root._provider_epoch(providers)
@@ -645,9 +1145,9 @@ class Fiber:
     async def dispose(self) -> None:
         """Permanently unload this Fiber and join all child/effect cleanup."""
 
-        if self.state != FiberState.DISPOSED:
-            self.root._require_tree_removal("dispose Fiber")
         self._reject_direct_reentrant_wait("dispose")
+        if self._in_flight_calls:
+            self._reject_self_call_wait()
         if self._dispose_task is None or self._dispose_task.done():
             self._dispose_task = asyncio.create_task(
                 self._dispose(),
@@ -667,12 +1167,22 @@ class Fiber:
 
     async def _load(
         self,
-        providers: dict[ServiceKey[object], _Provider],
+        providers: dict[ServiceKey[Any], _Provider],
         epoch: tuple[tuple[str, int], ...],
     ) -> None:
         # 1. Freeze the dependency values for this activation.
         self.state = FiberState.LOADING
         self._activation_token = object()
+        self._admission_closed = asyncio.Event()
+        # 就绪闸与停止事实属本次 activation；旧 coroutine 不会等到
+        # 下一次 activation 的 ready。
+        self._activation_ready = asyncio.Event()
+        self._stopping_completed = False
+        self._lifecycle_started = False
+        # 每次 activation 换 Context：旧 Context/旧 bound method 不随
+        # Fiber 重载获得新能力；Root Context 保持稳定身份。
+        if not self._is_root:
+            self.context = Context(self.root, self)
         self.dependency_store = providers
         self.error = None
         await asyncio.sleep(0)
@@ -684,7 +1194,8 @@ class Fiber:
             await self._unload(next_state=FiberState.PENDING)
             return
 
-        # 2. Apply the plugin and publish its services only after success.
+        # 2. Apply + 本 owner 生命周期 STARTING/STARTED + required health；
+        #    任一失败都先清理已获资源（清理成功 FAILED，失败保留句柄）。
         try:
             runtime = self.runtime
             boundary = (
@@ -697,10 +1208,36 @@ class Fiber:
                     operation="lifecycle.apply",
                 )
             )
-            with boundary:
-                result = self.apply(self.context)
-                if inspect.isawaitable(result):
-                    await result
+            with _lifecycle_bound(self.context):
+                with boundary:
+                    result = self.apply(self.context)
+                    if inspect.isawaitable(result):
+                        await result
+                # apply 已成功；从第一个 STARTING listener 开始，activation
+                # 已取得需要由 STOPPING/Effect 释放的资源责任。
+                self._lifecycle_started = True
+                # 生命周期事件按准确 owner 派发（LOADING 中不经普通过滤）；
+                # 不接受 Bail，同一 activation 只发一次。
+                starting = await self.root._events.serial_for_owner(
+                    self, RUNTIME_STARTING, RuntimeStarting(),
+                )
+                if starting is not None:
+                    raise CompositionError(
+                        "RUNTIME_LIFECYCLE_BAIL_NOT_ALLOWED",
+                        f"{RUNTIME_STARTING.name} 不接受 Bail",
+                    )
+                started = await self.root._events.serial_for_owner(
+                    self, RUNTIME_STARTED, RuntimeStarted(),
+                )
+                if started is not None:
+                    raise CompositionError(
+                        "RUNTIME_LIFECYCLE_BAIL_NOT_ALLOWED",
+                        f"{RUNTIME_STARTED.name} 不接受 Bail",
+                    )
+                self.root._check_required_health(self)
+                task = asyncio.current_task()
+                if task is not None and task.cancelling():
+                    raise asyncio.CancelledError
         except asyncio.CancelledError as error:
             cleanup_task = asyncio.create_task(
                 self._unload(next_state=FiberState.PENDING),
@@ -740,15 +1277,33 @@ class Fiber:
             return
         self._epoch = epoch
         self.state = FiberState.ACTIVE
+        self._activation_ready.set()
         await self.root._owner_became_active(self)
 
     async def _unload(self, *, next_state: FiberState) -> None:
-        # 1. Make owned services unavailable before dependents clean up.
+        # 1. 持本 activation 在途调用的任务不得驱动本次卸载；在撤销
+        #    任何状态之前拒绝，避免失败后残留半卸载状态。
+        self._reject_self_call_wait()
+        # 2. 撤销本 activation 身份使新调用接纳关闭，再让消费者观察到不可用。
         self._activation_token = None
         self.state = FiberState.UNLOADING
+        self._admission_closed.set()
         await self.root._owner_became_inactive(self)
+        # 后台循环由 Fiber 停止；先取消并等待，避免排空等待它自己长期持有的许可。
+        tasks = tuple(self._tasks)
+        for task in tasks:
+            _ = task.cancel()
+        if tasks:
+            async def join_tasks() -> None:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            await _await_critical(asyncio.create_task(join_tasks()))
 
-        # 2. 子作用域失败时保留父资源；无关子分支仍尝试关闭。
+        # 3. 依赖方先退出；本 owner 已接纳的实际调用结束后再释放资源。
+        #    取消等待不等于资源已退出；超时与拒绝策略由调用方负责。
+        if self._in_flight_calls:
+            await _await_critical(asyncio.ensure_future(self._calls_idle.wait()))
+
+        # 4. 子作用域失败时保留父资源；无关子分支仍尝试关闭。
         errors: list[BaseException] = []
         for child in reversed(tuple(self.children)):
             try:
@@ -757,7 +1312,21 @@ class Fiber:
                 errors.append(error)
         if errors:
             raise BaseExceptionGroup(f"Fiber 子作用域关闭失败: {self.name}", errors)
-        # 3. 后取得的资源仍未关闭时，不提前释放它可能依赖的旧资源。
+        # 5. 本 owner 生命周期停止只在实际进入 STARTING 的 activation 上派发；
+        #    STOPPING 成功且非 Bail 才记完成——失败在 Effect 释放前传播，
+        #    保留 owner/资源/固定依赖，显式 retry 只重试失败的阶段。
+        if self._lifecycle_started and not self._stopping_completed:
+            with _lifecycle_bound(self.context):
+                result = await self.root._events.serial_for_owner(
+                    self, RUNTIME_STOPPING, RuntimeStopping()
+                )
+            if result is not None:
+                raise CompositionError(
+                    "RUNTIME_LIFECYCLE_BAIL_NOT_ALLOWED",
+                    f"{RUNTIME_STOPPING.name} 不接受 Bail",
+                )
+            self._stopping_completed = True
+        # 6. 后取得的资源仍未关闭时，不提前释放它可能依赖的旧资源。
         for effect in reversed(tuple(self.effects)):
             await effect.aclose()
         self.dependency_store = {}
@@ -792,7 +1361,7 @@ class Fiber:
 
 
 class CompositionRoot:
-    """拥有初始装配、不可逆的绑定冻结和整棵资源树的退出。"""
+    """拥有依赖图、局部激活与排空，以及整棵资源树的退出。"""
 
     RECENT_INCIDENT_LIMIT = 128
 
@@ -801,39 +1370,26 @@ class CompositionRoot:
         generation_id: str,
         *,
         audit: CompositionAudit | None = None,
-        candidate_incident_limit: int | None = None,
     ) -> None:
         if not generation_id:
             raise ValueError("generation_id 不能为空")
-        if candidate_incident_limit is not None and candidate_incident_limit <= 0:
-            raise ValueError("candidate_incident_limit 必须大于零")
         self.generation_id = generation_id
         self._instance_token = object()
         self._next_fiber_id = 1
         self._next_provider_revision = 1
         self._composition_revision = 0
-        self._frozen = False
         self._fibers: dict[int, Fiber] = {}
-        self._providers: dict[ServiceKey[object], _Provider] = {}
+        self._providers: dict[ServiceKey[Any], _Provider] = {}
         self._health_entries: dict[tuple[int, str], _HealthEntry] = {}
         self._incident_sequence = 0
-        self._incident_counts: dict[str, int] = {}
-        self._candidate_incident_limit = candidate_incident_limit
-        self._incident_overflowed = False
-        self._recent_incidents: deque[IncidentView] = deque(
-            maxlen=(
-                candidate_incident_limit
-                if candidate_incident_limit is not None
-                else self.RECENT_INCIDENT_LIMIT
-            )
-        )
+        self._incident_counts: dict[tuple[int, str], int] = {}
+        self._recent_incidents: deque[IncidentView] = deque(maxlen=self.RECENT_INCIDENT_LIMIT)
         self._audit = audit or CompositionAudit()
         self._events = EventRegistry(
             self._bump_composition_revision,
             self._record_listener_failure,
         )
         self._internal_cleanups: list[tuple[str, Callable[[], object]]] = []
-        self._runtime_scope_acquirer: Callable[[], Awaitable[Any]] | None = None
         self._dispose_task: asyncio.Task[None] | None = None
         self.root_fiber = Fiber(
             root=self,
@@ -855,66 +1411,12 @@ class CompositionRoot:
 
         return self._instance_token
 
-    @property
-    def frozen(self) -> bool:
-        """服务绑定与挂载树是否已经不可逆地冻结。"""
-        return self._frozen
-
-    def freeze(self) -> None:
-        """装配完成后固定绑定；资源、服务内部状态和诊断仍归原 owner。"""
-
-        if self._frozen:
-            return
-        # 1. 不把仍在挂载或退出的 Fiber 固定成可发布组合。
-        for fiber in (self.root_fiber, *self._fibers.values()):
-            if (
-                fiber._transition.locked()
-                or fiber.state in {FiberState.LOADING, FiberState.UNLOADING, FiberState.DISPOSED}
-                or (fiber._dispose_task is not None and not fiber._dispose_task.done())
-            ):
-                raise CompositionError(
-                    "COMPOSITION_NOT_SETTLED", f"{fiber.name} 尚未完成装配或正在退出",
-                )
-        if self._dispose_task is not None:
-            raise CompositionError("COMPOSITION_NOT_SETTLED", "Root 已开始退出")
-        # 2. 同步提交后没有解冻路径；后续组合变化必须建立新 Root。
-        self._frozen = True
-
-    def _require_unfrozen(self, operation: str) -> None:
-        if self._frozen:
-            raise CompositionError(
-                "COMPOSITION_FROZEN", f"Root 已冻结，不能 {operation}；请建立新 Root",
-            )
-
-    def _require_tree_removal(self, operation: str) -> None:
-        """冻结结构只随整个 Root 退出；失败退出仍由原 Root 继续持有。"""
-        if self._frozen and self.root_fiber.state != FiberState.UNLOADING:
-            raise CompositionError(
-                "COMPOSITION_FROZEN", f"Root 已冻结，只有整个 Root 退出时才能 {operation}",
-            )
-
-    def _bind_runtime_scope_acquirer(
-        self,
-        acquire: Callable[[], Awaitable[Any]],
-    ) -> None:
-        """Bind the Core-owned exact-Root lease source before mounting plugins."""
-
-        if self._runtime_scope_acquirer is not None:
-            raise RuntimeError("composition Root runtime scope 已绑定")
-        self._runtime_scope_acquirer = acquire
-
-    async def _acquire_runtime_scope(self):
-        acquire = self._runtime_scope_acquirer
-        if acquire is None:
-            raise RuntimeError("composition Root runtime scope 不可用")
-        return await acquire()
-
     async def mount(
         self,
         plugin: PluginApply,
         *,
         name: str | None = None,
-        inject: Iterable[ServiceKey[object]] | None = None,
+        inject: Iterable[ServiceKey[Any]] | None = None,
         runtime: PluginRuntime | None = None,
     ) -> Fiber:
         return await self._mount(
@@ -932,7 +1434,7 @@ class CompositionRoot:
         plugin: PluginApply,
         *,
         name: str,
-        inject: Iterable[ServiceKey[object]],
+        inject: Iterable[ServiceKey[Any]],
         runtime: PluginRuntime,
         plugin_module: ModuleType,
     ) -> Fiber:
@@ -987,6 +1489,9 @@ class CompositionRoot:
 
     def receipt(self) -> CompositionReceipt:
         fibers = tuple(self._fiber_view(fiber) for fiber in self._fibers.values())
+        incident_counts: dict[str, int] = {}
+        for (_fiber_id, owner), count in self._incident_counts.items():
+            incident_counts[owner] = incident_counts.get(owner, 0) + count
         external_effects = self._audit.external_effects
         required_pending = tuple(
             view.name
@@ -999,7 +1504,7 @@ class CompositionRoot:
             if not view.required_for_readiness and view.state != FiberState.ACTIVE
         )
         effects = tuple(
-            f"{fiber.name}:{effect.label}"
+            f"{fiber.path}:{effect.label}"
             for fiber in (self.root_fiber, *self._fibers.values())
             for effect in fiber.effects
         )
@@ -1015,7 +1520,6 @@ class CompositionRoot:
                 self.root_fiber.state == FiberState.ACTIVE
                 and not required_pending
                 and not required_degraded
-                and not self._incident_overflowed
                 and not external_effects
             ),
             fibers=fibers,
@@ -1027,8 +1531,8 @@ class CompositionRoot:
             required_degraded=required_degraded,
             incidents=self.recent_incidents(),
             incident_sequence=self._incident_sequence,
-            incident_counts=tuple(sorted(self._incident_counts.items())),
-            incident_overflowed=self._incident_overflowed,
+            incident_counts=tuple(sorted(incident_counts.items())),
+            incident_overflowed=False,
             writes=self._audit.writes,
             external_effects=external_effects,
         )
@@ -1051,11 +1555,11 @@ class CompositionRoot:
             sorted(
                 (
                     TopologyFiberView(
-                        name=fiber.name,
+                        name=fiber.path,
                         parent=(
                             None
                             if fiber.parent is self.root_fiber
-                            else cast(Fiber, fiber.parent).name
+                            else cast(Fiber, fiber.parent).path
                         ),
                         required_for_readiness=fiber.required_for_readiness,
                         dependencies=tuple(
@@ -1069,7 +1573,7 @@ class CompositionRoot:
         )
         effects = tuple(
             sorted(
-                f"{fiber.name}:{effect.label}"
+                f"{fiber.path}:{effect.label}"
                 for fiber in (
                     (self.root_fiber, *selected) if plugin_ids is None else selected
                 )
@@ -1130,6 +1634,49 @@ class CompositionRoot:
             if (runtime := fiber.runtime) is not None
         )
 
+    def fibers(self, *, plugin_id: str | None = None, generation_id: str | None = None) -> tuple[Fiber, ...]:
+        """查询实际登记的 Fiber，可限定准确插件和 generation。"""
+        return tuple(
+            fiber for fiber in self._fibers.values()
+            if (plugin_id is None or fiber.runtime is not None and fiber.runtime.plugin_id == plugin_id)
+            and (generation_id is None or fiber.runtime is not None and fiber.runtime.generation_id == generation_id)
+        )
+
+    def consumers(self, owners: Iterable[Fiber], *, declared: bool = False) -> tuple[Fiber, ...]:
+        """计算子作用域与依赖闭包；换代前读固定边，换代后读当前声明。"""
+        initial = set(owners)
+        affected = set(initial)
+        changed = True
+        while changed:
+            changed = False
+            for candidate in self._fibers.values():
+                if candidate in affected or candidate.state == FiberState.DISPOSED:
+                    continue
+                providers = (
+                    (self._providers.get(key) for key in candidate.dependencies)
+                    if declared else candidate.dependency_store.values()
+                )
+                if candidate.parent in affected or any(
+                    provider is not None and provider.owner in affected for provider in providers
+                ):
+                    affected.add(candidate)
+                    changed = True
+        return tuple(fiber for fiber in self._fibers.values() if fiber in affected - initial)
+
+    def require_ready(self, fibers: Iterable[Fiber]) -> None:
+        """核对实际登记的必需 Fiber 与其 health；可选分支不扩大就绪边界。"""
+        for candidate in set(fibers):
+            if self._fibers.get(candidate.fiber_id) is not candidate or not candidate.required_for_readiness:
+                continue
+            if candidate.state != FiberState.ACTIVE:
+                raise RuntimeError(f"目标依赖未 ACTIVE: {candidate.path} state={candidate.state}")
+            if candidate.error is not None:
+                raise RuntimeError(f"目标依赖启动失败: {candidate.path}") from candidate.error
+            degraded = tuple(entry.name for entry in self._health_entries.values()
+                             if entry.owner is candidate and entry.required and entry.reason is not None)
+            if degraded:
+                raise RuntimeError(f"目标依赖 required health 失败: {candidate.path}:{','.join(degraded)}")
+
     def plugin_runtime(self, plugin_id: str) -> PluginRuntime:
         """返回顶层插件 Fiber 使用的 Core-owned runtime。"""
 
@@ -1153,7 +1700,7 @@ class CompositionRoot:
     ) -> T | None:
         """Read one active provider selected by top-level plugin owner."""
 
-        provider = self._active_provider(cast(ServiceKey[object], key))
+        provider = self._active_provider(cast(ServiceKey[Any], key))
         if provider is None:
             return None
         runtime = provider.owner.runtime
@@ -1165,33 +1712,67 @@ class CompositionRoot:
             return None
         return cast(T, provider.value)
 
+    def _service_provider(self, key: ServiceKey[T]) -> tuple[Context, T]:
+        """Return the still-registered provider Context and exact value."""
+
+        provider = self._providers.get(cast(ServiceKey[Any], key))
+        if provider is None:
+            raise RuntimeError(f"当前 runtime scope 不提供服务: {key.name}")
+        if provider.revoking and not self._provider_owner_accessible(
+            provider,
+            provider.owner.context,
+        ):
+            raise RuntimeError(f"当前 runtime scope 不提供服务: {key.name}")
+        return provider.owner.context, cast(T, provider.value)
+
+    @staticmethod
+    def _provider_owner_accessible(
+        provider: _Provider,
+        context: Context,
+    ) -> bool:
+        """Allow only an exact owner permit or lifecycle borrowing task."""
+
+        current = asyncio.current_task()
+        if current is None:
+            return False
+        if provider.owner._call_owned_by_current_task() is not None:
+            return True
+        binding = _lifecycle_binding.get()
+        return (
+            binding is not None
+            and binding[0] is context
+            and binding[1] is current
+        )
+
     def provided_services(
         self,
         *,
         plugin_ids: frozenset[str] | None = None,
-    ) -> Mapping[ServiceKey[object], object]:
+    ) -> Mapping[ServiceKey[Any], object]:
         """Freeze active services selected by top-level plugin owner."""
 
         return {
             key: provider.value
             for key, provider in self._providers.items()
             if provider.owner.state == FiberState.ACTIVE
+            if not provider.revoking
             if plugin_ids is None
             or provider.owner.runtime is None
             or provider.owner.runtime.plugin_id in plugin_ids
         }
 
-    def plugin_service_owners(self) -> Mapping[ServiceKey[object], str]:
+    def plugin_service_owners(self) -> Mapping[ServiceKey[Any], str]:
         """Freeze active plugin-owned provider identities for graph checks."""
 
         return {
             key: runtime.plugin_id
             for key, provider in self._providers.items()
             if provider.owner.state == FiberState.ACTIVE
+            if not provider.revoking
             if (runtime := provider.owner.runtime) is not None
         }
 
-    def binding_contributors(self, key: ServiceKey[object]) -> tuple[Context, ...]:
+    def binding_contributors(self, key: ServiceKey[Any]) -> tuple[Context, ...]:
         """归档依赖来自当前服务 provider，不另存动态注册状态。"""
         provider = self._active_provider(key)
         if provider is None:
@@ -1207,9 +1788,9 @@ class CompositionRoot:
                 return fiber.runtime.plugin_id
         return None
 
-    def plugin_dependencies(self) -> Mapping[str, frozenset[ServiceKey[object]]]:
+    def plugin_dependencies(self) -> Mapping[str, frozenset[ServiceKey[Any]]]:
         """收集各插件及子 Fiber 声明的服务依赖。"""
-        dependencies: dict[str, set[ServiceKey[object]]] = {}
+        dependencies: dict[str, set[ServiceKey[Any]]] = {}
         for fiber in self._fibers.values():
             if fiber.runtime is not None:
                 dependencies.setdefault(fiber.runtime.plugin_id, set()).update(fiber.dependencies)
@@ -1221,14 +1802,13 @@ class CompositionRoot:
         parent: Fiber,
         plugin: PluginApply,
         name: str | None,
-        inject: Iterable[ServiceKey[object]] | None,
+        inject: Iterable[ServiceKey[Any]] | None,
         required_for_readiness: bool,
         runtime: PluginRuntime | None,
         plugin_module: ModuleType | None,
     ) -> Fiber:
         """Publish only after parent ownership exists, then reconcile."""
 
-        self._require_unfrozen("mount / inject")
         # 1. Resolve the narrow apply(ctx) contract.
         apply, resolved_name, dependencies = self._resolve_plugin(
             plugin,
@@ -1240,10 +1820,10 @@ class CompositionRoot:
                 "INACTIVE_PLUGIN_OWNER",
                 f"{parent.name} 不能挂载子插件",
             )
-        if any(fiber.name == resolved_name for fiber in self._fibers.values()):
+        if any(fiber.name == resolved_name for fiber in parent.children):
             raise CompositionError(
                 "DUPLICATE_PLUGIN",
-                f"同一拓扑不能重复挂载插件: {resolved_name}",
+                f"同一父 Fiber 下不能重复挂载插件: {parent.name}/{resolved_name}",
             )
 
         # 2. Parent ownership is visible before publication observers run.
@@ -1302,8 +1882,8 @@ class CompositionRoot:
         plugin: PluginApply,
         *,
         name: str | None,
-        inject: Iterable[ServiceKey[object]] | None,
-    ) -> tuple[PluginApply, str, tuple[ServiceKey[object], ...]]:
+        inject: Iterable[ServiceKey[Any]] | None,
+    ) -> tuple[PluginApply, str, tuple[ServiceKey[Any], ...]]:
         if not callable(plugin) or hasattr(plugin, "apply"):
             raise TypeError("插件必须是 callable")
         apply = plugin
@@ -1312,68 +1892,92 @@ class CompositionRoot:
         raw_dependencies = inject
         if raw_dependencies is None:
             raw_dependencies = ()
-        dependencies = tuple(cast(Iterable[ServiceKey[object]], raw_dependencies))
+        dependencies = tuple(cast(Iterable[ServiceKey[Any]], raw_dependencies))
         if len(set(dependencies)) != len(dependencies):
             raise ValueError(f"插件依赖重复: {resolved_name}")
         return apply, resolved_name, dependencies
 
     def _register_provider(
         self,
-        key: ServiceKey[object],
+        key: ServiceKey[Any],
         value: object,
         owner: Fiber,
         *, binding_contributors: Callable[[], tuple[Context, ...]] | None = None,
-    ) -> None:
-        self._require_unfrozen("provide Service")
-        existing = self._providers.get(key)
-        if existing is not None:
-            raise CompositionError(
-                "DUPLICATE_SERVICE",
-                f"Service {key.name} 已由 {existing.owner.name} 提供",
-            )
-        self._providers[key] = _Provider(
+    ) -> _Provider:
+        self._check_provider_registration(key)
+        provider = _Provider(
             key=key,
             value=value,
             owner=owner,
             revision=self._next_provider_revision,
             binding_contributors=binding_contributors,
         )
+        self._providers[key] = provider
         self._next_provider_revision += 1
         self._bump_composition_revision()
+        return provider
+
+    def _check_provider_registration(self, key: ServiceKey[Any]) -> None:
+        """Check frozen and duplicate errors before creating registration state."""
+
+        existing = self._providers.get(key)
+        if existing is not None:
+            raise CompositionError(
+                "DUPLICATE_SERVICE",
+                f"Service {key.name} 已由 {existing.owner.name} 提供",
+            )
 
     async def _remove_provider(
         self,
-        key: ServiceKey[object],
-        owner: Fiber,
+        registration: _Provider,
     ) -> None:
-        provider = self._providers.get(key)
-        if provider is None:
+        current = self._providers.get(registration.key)
+        if current is not registration:
             return
-        if provider.owner is not owner:
-            raise CompositionError(
-                "SERVICE_OWNER_MISMATCH",
-                f"{owner.name} 不能移除 {provider.owner.name} 的 Service {key.name}",
-            )
-        self._require_tree_removal("移除 Service 绑定")
-        if self._frozen:
-            # 先关闭持有此绑定的消费者；失败时服务和资源仍留在原 owner。
-            await self._reconcile_dependents((key,), exclude=owner)
-        del self._providers[key]
-        self._bump_composition_revision()
-        if not self._frozen:
-            await self._reconcile_dependents((key,), exclude=owner)
+        if not registration.revoking:
+            registration.revoking = True
+            self._bump_composition_revision()
 
-    def _active_provider(self, key: ServiceKey[object]) -> _Provider | None:
+        # Keep the exact record in the table until every consumer has released it.
+        await self._reconcile_dependents(
+            (registration.key,),
+            exclude=registration.owner,
+        )
+        pending = tuple(
+            fiber.name
+            for fiber in self._fibers.values()
+            if fiber is not registration.owner
+            and fiber.state != FiberState.DISPOSED
+            and any(
+                provider is registration
+                for provider in fiber.dependency_store.values()
+            )
+        )
+        if pending:
+            raise CompositionError(
+                "DEPENDENT_CLEANUP_PENDING",
+                f"{registration.owner.name} 仍被未关闭的消费者使用: {', '.join(pending)}",
+            )
+        if self._providers.get(registration.key) is not registration:
+            return
+        del self._providers[registration.key]
+        self._bump_composition_revision()
+
+    def _active_provider(self, key: ServiceKey[Any]) -> _Provider | None:
         provider = self._providers.get(key)
-        if provider is None or provider.owner.state != FiberState.ACTIVE:
+        if (
+            provider is None
+            or provider.revoking
+            or provider.owner.state != FiberState.ACTIVE
+        ):
             return None
         return provider
 
     def _dependency_snapshot(
         self,
-        dependencies: tuple[ServiceKey[object], ...],
-    ) -> dict[ServiceKey[object], _Provider] | None:
-        providers: dict[ServiceKey[object], _Provider] = {}
+        dependencies: tuple[ServiceKey[Any], ...],
+    ) -> dict[ServiceKey[Any], _Provider] | None:
+        providers: dict[ServiceKey[Any], _Provider] = {}
         for key in dependencies:
             provider = self._active_provider(key)
             if provider is None:
@@ -1383,7 +1987,7 @@ class CompositionRoot:
 
     @staticmethod
     def _provider_epoch(
-        providers: Mapping[ServiceKey[object], _Provider] | None,
+        providers: Mapping[ServiceKey[Any], _Provider] | None,
     ) -> tuple[tuple[str, int], ...] | None:
         if providers is None:
             return None
@@ -1393,7 +1997,7 @@ class CompositionRoot:
 
     def _provider_epoch_if_active(
         self,
-        dependencies: tuple[ServiceKey[object], ...],
+        dependencies: tuple[ServiceKey[Any], ...],
     ) -> tuple[tuple[str, int], ...] | None:
         return self._provider_epoch(self._dependency_snapshot(dependencies))
 
@@ -1402,6 +2006,20 @@ class CompositionRoot:
             key for key, provider in self._providers.items() if provider.owner is owner
         )
         await self._reconcile_dependents(keys, exclude=owner)
+
+    async def _notify_provider_registered(self, registration: _Provider) -> None:
+        """Reconcile only the exact live registration after ACTIVE publication."""
+
+        if (
+            self._providers.get(registration.key) is not registration
+            or registration.revoking
+            or registration.owner.state != FiberState.ACTIVE
+        ):
+            return
+        await self._reconcile_dependents(
+            (registration.key,),
+            exclude=registration.owner,
+        )
 
     async def _owner_became_inactive(self, owner: Fiber) -> None:
         keys = tuple(
@@ -1421,26 +2039,157 @@ class CompositionRoot:
                 f"{owner.name} 仍被未关闭的消费者使用: {', '.join(pending)}",
             )
 
-    async def _reconcile_dependents(
+    def _dependent_fibers(
         self,
-        keys: tuple[ServiceKey[object], ...],
+        keys: tuple[ServiceKey[Any], ...],
         *,
         exclude: Fiber,
-    ) -> None:
-        """初始化时解析依赖；冻结后只关闭消费者，不再重新装配。"""
+    ) -> list[Fiber]:
+        """Scan the same direct wait set used by provider reconciliation."""
 
-        if not keys:
-            return
-        affected = [
+        return [
             fiber
             for fiber in tuple(self._fibers.values())
             if fiber is not exclude
             and fiber.state != FiberState.DISPOSED
             and any(key in fiber.dependencies for key in keys)
         ]
+
+    def _service_wait_set_for(
+        self,
+        key: ServiceKey[Any],
+        owner: Fiber,
+        *,
+        registration: _Provider | None = None,
+    ) -> tuple[Fiber, ...]:
+        """Build the shared wait set without inventing a provider record."""
+
+        queue = deque(
+            self._dependent_fibers(
+                (key,),
+                exclude=owner,
+            )
+        )
+        if registration is not None:
+            for fiber in tuple(self._fibers.values()):
+                if (
+                    fiber is not owner
+                    and fiber.state != FiberState.DISPOSED
+                    and any(
+                        provider is registration
+                        for provider in fiber.dependency_store.values()
+                    )
+                ):
+                    queue.append(fiber)
+
+        affected: set[Fiber] = set()
+        while queue:
+            fiber = queue.popleft()
+            if fiber in affected or fiber.state == FiberState.DISPOSED:
+                continue
+            affected.add(fiber)
+            for child in tuple(fiber.children):
+                if child.state != FiberState.DISPOSED:
+                    queue.append(child)
+            owned_keys = tuple(
+                key
+                for key, provider in self._providers.items()
+                if provider.owner is fiber
+            )
+            for consumer in self._dependent_fibers(
+                owned_keys,
+                exclude=fiber,
+            ):
+                queue.append(consumer)
+            for consumer in tuple(self._fibers.values()):
+                if (
+                    consumer is not fiber
+                    and consumer.state != FiberState.DISPOSED
+                    and any(
+                        provider.owner is fiber
+                        for provider in consumer.dependency_store.values()
+                    )
+                ):
+                    queue.append(consumer)
+        return tuple(affected)
+
+    def _guard_service_close(self, registration: _Provider) -> None:
+        """Reject the original caller before service revocation can self-wait."""
+
+        if self._providers.get(registration.key) is not registration:
+            return
+        self._guard_service_wait(
+            registration.key,
+            registration.owner,
+            registration=registration,
+            operation="撤销",
+        )
+
+    def _guard_service_notify(
+        self,
+        key: ServiceKey[Any],
+        owner: Fiber,
+    ) -> None:
+        """Reject an ACTIVE notification that would wait on its own lifecycle."""
+
+        self._guard_service_wait(key, owner, operation="通知")
+
+    def _guard_service_wait(
+        self,
+        key: ServiceKey[Any],
+        owner: Fiber,
+        *,
+        registration: _Provider | None = None,
+        operation: str,
+    ) -> None:
+        """Check the shared exact owner/call/lifecycle wait set."""
+
+        current = asyncio.current_task()
+        if current is None:
+            raise CompositionError(
+                "OWNER_CALL_CONTEXT",
+                "Service registration close 需要实际 Task 上下文",
+            )
+        for fiber in self._service_wait_set_for(
+            key,
+            owner,
+            registration=registration,
+        ):
+            if fiber._call_owned_by_current_task() is not None:
+                raise CompositionError(
+                    "REENTRANT_CALL_WAIT",
+                    f"{fiber.name} 的 Service {operation}不能等待该任务仍持有的在途调用",
+                )
+            if fiber._transition_owner is current:
+                raise CompositionError(
+                    "REENTRANT_LIFECYCLE_WAIT",
+                    f"{fiber.name} 的 Service {operation}不能等待该任务持有的生命周期过渡",
+                )
+            binding = _lifecycle_binding.get()
+            if (
+                binding is not None
+                and binding[0] is fiber.context
+                and binding[1] is current
+            ):
+                raise CompositionError(
+                    "REENTRANT_LIFECYCLE_WAIT",
+                    f"{fiber.name} 的 Service {operation}不能等待该任务借用的生命周期",
+                )
+
+    async def _reconcile_dependents(
+        self,
+        keys: tuple[ServiceKey[Any], ...],
+        *,
+        exclude: Fiber,
+    ) -> None:
+        """服务变化只重新协调实际消费者。"""
+
+        if not keys:
+            return
+        affected = self._dependent_fibers(keys, exclude=exclude)
         if affected:
             results = await asyncio.gather(
-                *(fiber.dispose() if self._frozen else fiber.reconcile() for fiber in affected),
+                *(fiber.reconcile() for fiber in affected),
                 return_exceptions=True,
             )
             errors = [result for result in results if isinstance(result, BaseException)]
@@ -1462,6 +2211,20 @@ class CompositionRoot:
                 f"Fiber {owner.name} 已注册健康项: {name}",
             )
         return _HealthEntry(owner=owner, name=name, required=required)
+
+    def _check_required_health(self, owner: Fiber) -> None:
+        """ACTIVE 前检查本 owner 已登记的 required 健康项均可用。"""
+
+        degraded = [
+            entry.name
+            for entry in self._health_entries.values()
+            if entry.owner is owner and entry.required and entry.reason is not None
+        ]
+        if degraded:
+            raise CompositionError(
+                "UNHEALTHY_OWNER",
+                f"{owner.name} 的必需健康项未就绪: {', '.join(degraded)}",
+            )
 
     def _register_health(self, entry: _HealthEntry) -> None:
         key = (entry.owner.fiber_id, entry.name)
@@ -1501,7 +2264,7 @@ class CompositionRoot:
     def _health_view(self) -> tuple[HealthView, ...]:
         entries = [
             HealthView(
-                owner=entry.owner.name,
+                owner=entry.owner.path,
                 name=entry.name,
                 required=entry.required,
                 healthy=entry.reason is None,
@@ -1512,7 +2275,7 @@ class CompositionRoot:
         for fiber in (self.root_fiber, *self._fibers.values()):
             entries.extend(
                 HealthView(
-                    owner=fiber.name,
+                    owner=fiber.path,
                     name=f"task:{name}",
                     required=fiber.required_for_readiness,
                     healthy=False,
@@ -1531,18 +2294,16 @@ class CompositionRoot:
         error_type: str | None = None,
     ) -> IncidentView:
         self._incident_sequence += 1
-        self._incident_counts[fiber.name] = self._incident_counts.get(fiber.name, 0) + 1
+        count_key = (fiber.fiber_id, fiber.path)
+        self._incident_counts[count_key] = self._incident_counts.get(count_key, 0) + 1
         incident = IncidentView(
+            fiber_id=fiber.fiber_id,
             sequence=self._incident_sequence,
-            owner=fiber.name,
+            owner=fiber.path,
             kind=kind,
             message=message,
             error_type=error_type,
         )
-        limit = self._candidate_incident_limit
-        if limit is not None and len(self._recent_incidents) >= limit:
-            self._incident_overflowed = True
-            return incident
         self._recent_incidents.append(incident)
         return incident
 
@@ -1615,7 +2376,7 @@ class CompositionRoot:
     def _fiber_view(self, fiber: Fiber) -> FiberView:
         return FiberView(
             fiber_id=fiber.fiber_id,
-            name=fiber.name,
+            name=fiber.path,
             state=fiber.state,
             required_for_readiness=fiber.required_for_readiness,
             missing_services=fiber.missing_services,

@@ -1,37 +1,6 @@
 # Docker 调试沙盒
 
-## 统一变更影响 Gate
-
-实现者只需运行一个公开入口：
-
-```bash
-python docker/debug/gate.py run --base origin/main
-```
-
-Gate 先用 `tests_scenarios/contracts/impact.toml` 解释 Git diff，再运行所选公开语义场景。每个场景都使用新的 `/tmp/akashic-change-gate-*` sandbox，容器只读挂载候选源码，只允许写本次 `/sandbox` 与 tmpfs `/tmp`。`workspace`、`plugin-home`、`HOME` 和 config 都从空目录建立；Gate 不接收正式运行路径。
-
-```text
-Git diff
-   │
-   ▼
-公开 capability/state/scenario catalog
-   │
-   ├── 公开 Docker 场景（所有贡献者可运行）
-   └── plan.json：group + digest，不含 provider 身份
-```
-
-常用维护命令：
-
-```bash
-python docker/debug/gate.py audit
-python docker/debug/gate.py plan --base origin/main
-```
-
-如果同一 diff 同时包含生产 source set 与 protected contract/policy paths，`plan` 和 `run` 会扩大为完整公开场景，同时仍分别列出两组路径。未知可执行改动和触及 baseline gap 仍以非零退出。`migrations/**` 本身不在该 protected 集合内；已注册的 Core 和插件 bundle 迁移由 append-only 检查保护；0066 的历史删除按精确内容身份单独审计。
-
-`init` 只用于仓库第一次建立 coverage baseline。baseline 已存在时再次执行会失败，不能覆盖人工合同。新增未映射可执行文件会先运行全量公开语义场景，最终仍以 `unmapped_change` 失败。报告位于 `docker/debug/reports/change-gate/<run-id>/`。
-
-公开 Gate 不安装也不枚举私有插件，不依赖外部私有验证或 provider 身份；公开报告是当前仓库的合并依据。
+现行 PR 验证是概念基线 pytest（`pytest -q tests`）与静态检查，保留清单见 [`docs/refactor/orthogonality-test-baseline.md`](../../docs/refactor/orthogonality-test-baseline.md)。统一变更影响 Gate（`gate.py`、`tests_scenarios/contracts/`）已删除。本目录下的探针只作按需手动诊断，不是合并门槛。
 
 ## Citation + Meme 纯 v3 WebUI Gate
 
@@ -48,25 +17,6 @@ python docker/debug/plugin_passive_webui_v3_e2e.py --require-clean-core
 
 证据写入 `docker/debug/reports/plugin-passive-webui-v3/gate.json`；模型响应由 Compose 私网内
 的 deterministic model-gate 提供，不调用外部生产 provider。
-
-### Shell execution 固定 Runtime 场景
-
-`shell_execution_contract` 在 change-gate 的只读 Arch Linux runtime 中运行，不读取
-宿主 `HOME` 或正式 workspace。普通路径覆盖短命令、非零退出、显式/默认 shell、
-login 开关、长命令增量输出和多 execution 隔离；edge case 覆盖 PTY 多次输入、等待
-取消、stop 与 initial/poll 竞态、执行进程组清理、输出 head/tail、recent-8 LRU、owner
-隔离、截止点退出、主 ReAct/SubAgent active execution pin、turn owner 回收和 Drift
-owner 隔离。
-
-只运行该固定场景可使用：
-
-```bash
-python docker/debug/gate.py run --base <仅含合同的前置提交>
-```
-
-Gate 根据 runtime source set 自动选择该场景，并验证候选源码只读、临时 workspace、
-Compose cleanup 和无残留容器/网络/卷。完整 diff 同时修改受保护合同与生产源码时必须
-执行完整公开场景，不能用 focused 场景替代。
 
 ## 程序化控制面验收门
 
@@ -146,15 +96,16 @@ storage，不写入 `config.toml`。配置与凭据只写入一次性 sandbox，
 Gate 失败。证据位于
 `docker/debug/reports/akasha-v2-runtime/<run-id>/`。
 
-`scripts/build_akasha_db.py` 仍是旧 schema 的离线 builder，只能用于它已有的 legacy
-重建合同；本 Gate 不把它当作新 Message 链路的 offline rebuild 验证。
+`scripts/build_akasha_db.py` 已随旧稀疏索引一起退役；新 Message 链路的离线重放由
+`docker/debug/akasha_replay_dry_run.py` 在副本上执行，重放前后的学习图用
+`docker/debug/akasha_replay_compare.py` 对比共同前缀。
 
 ## Yoyo 迁移检查
 
 迁移使用普通 pytest 覆盖执行与失败重试，CI 另以精简检查保护已注册 migration 不被改写：
 
 ```bash
-python -m pytest tests/test_migration_runner.py tests/test_yoyo_migration_append_only.py
+python -m pytest tests/test_migration_runner.py
 python scripts/check_yoyo_migrations.py --base origin/main
 ```
 
@@ -182,6 +133,10 @@ fleet 报告固定来源和 v3-only 静态合同；真实 MCP handshake/readines
 实现。它先把调用方提供的 canonical checkout 与 exact lock 对账，再运行 Core 已有的
 Content/Wake/Drift/Session 组合 fixture，最后在每个插件自己的目录运行其原样 fixture。
 因此修改一个插件的业务模型只需要更新该插件与 exact revision，不会给 Core 增加来源分支。
+Content coexistence probe 在隔离 workspace 中启动 Content、MessageLog 和插件所需的内建
+provider，再用 `Manager.install` 从已核对的 checkout 安装插件；它检查同一个
+`Manager.live_root`、活动 generation、Content 行数及前后逻辑状态。
+receipt 同时保留 live Root id 和 Content 状态，不能通过并排挂载候选目录代替正式安装。
 
 ```text
 exact lock ──► checkout SHA/manifest/no old seam
@@ -244,11 +199,12 @@ python docker/debug/content_wake_h5_e2e.py \
 `content-source-interop.lock.json`。显式 `--seed-protected-fixture` 只接受空的隔离目录，并写入
 带一行数据的 `sessions.db`、旧 proactive/wake/drift DB 与历史 Markdown/JSON；不复制正式数据。
 不使用 seed 时，调用者也必须提供至少包含非空 Session、旧 proactive DB 和 archive 的 fixture，
-空 protected target 会在安装前失败。runner 复用 Wake provider 的快照，对账 path、inode、hash、
+空 protected target 会在安装前失败。runner 复用 Wake provider 对 protected workspace 数据的快照，对账 path、inode、hash、
 size、SQLite integrity/quick_check/row counts，前后不相等时本次组合失败。owner pytest 由
 Core dev Python 运行，实际插件 service 只通过 `AKASHIC_PLUGIN_FIXTURE_PYTHON` 使用回执中的
 artifact runtime；一次性 root 内固定版本的 pytest layer 仅验证 artifact 隔离，不进入 owner
 fixture，Core site-packages 不会暴露给插件 service 解释器。
+这里的快照只用于证明受保护的 workspace 数据未改变，不代表或控制插件 runtime Root。
 真实 DeepSeek 命令只作为 `PENDING` 项进入 index；没有单独授权时 runner 不调用外部 provider。
 生成的证据留在一次性 root，不提交进 Git。
 
@@ -272,8 +228,9 @@ fixture source ── Timer ──▶ eventmail.content_source.v1 submit
 ```
 
 真实 selected case 固定使用 `deepseek-v4-flash`。runner 从外置副本加载普通 `models` 和
-`openai-compatible` 插件，经 `RuntimeModelControl` 写连接、模型和默认 role，再由 exact
-snapshot 的 `CHAT_MODELS` 执行；Core 不读取 provider 配置。credential 只从进程环境读取，
+`openai-compatible` 插件，经 live Root 的 `models/command` RPC（实际 `RpcMethod` 与
+Models provider `Context`）写连接、模型和默认 role，再由同一 Root 的 `CHAT_MODELS`
+exact owner scope 执行；Core 不读取 provider 配置。credential 只从进程环境读取，
 不写入临时 TOML 或报告。运行前先完成确定性的 settlement crash/restart、
 ACK retry、quiet 和 empty-poll 检查，之后才允许一次真实 logical provider request：
 
@@ -366,28 +323,25 @@ container
 
 ## 插件变更 Gate
 
-pure-v3 候选证据由 fleet、Mobile 和公共 WebUI 三个边界组成。所有 Gate
+pure-v3 候选证据由 fleet 和公共 WebUI 两个边界组成。所有 Gate
 使用 exact commit 锁、一次性 workspace/plugin-home/HOME 与受控端点，不读写正式
 Akashic workspace、正式凭据或 hua-home 服务。
 
-这些是插件候选与发布 Gate，不是普通 Core Pull Request 的固定矩阵。普通 Pull Request
-运行全部保留回归和按 diff 选场景的统一变更影响 Gate；当改动进入插件候选时，
-`Plugin v3 Candidate Gates` 手动 workflow 只运行 fleet completeness、Mobile 和公共 WebUI。
+这些是插件候选与发布时按需手动运行的诊断，不是 Pull Request 的合并门槛，也没有对应的
+CI workflow。
 
 ```text
 精确能力 lock
       │
       ├── fleet ─────── 全插件来源、v3-only 与 retired exclusion
-      ├── Mobile ────── Python catalog / JS ABI / plugin tests
       └── WebUI ─────── Citation / Meme / public WebSocket
 ```
 
-候选 workflow 保留的独立边界：
+手动运行入口：
 
 ```bash
 python docker/debug/plugin_v3_fleet_gate.py \
   --require-clean-core --require-full-core-history
-python docker/debug/plugin_v3_mobile_gate.py --require-clean-core
 python docker/debug/plugin_passive_webui_v3_e2e.py --require-clean-core
 ```
 
@@ -526,11 +480,8 @@ python docker/debug/context_probe.py \
   --reset-workspace \
   --start-agent \
   --stop-agent \
-  --quiet-agent \
-  --disable-qq
+  --quiet-agent
 ```
-
-`--disable-qq` 会在运行期间临时给当前 profile 的 `[channels.qq]` 加 `enabled = false`，结束后恢复原配置，适合只测 CLI 但该 profile 配了 QQ 的情况。
 
 默认报告写到：
 
@@ -613,7 +564,7 @@ python docker/debug/replay_controller.py \
   --start-at 2026-05-01T00:00:00+08:00
 ```
 
-该 profile 仍需要自己的 `config.toml`。可以运行 `setup`，或复制另一份专用调试配置。启动前应关闭 Telegram、QQ 等外部渠道，并将待测发送目标设为 `channel = "replay"`。
+该 profile 仍需要自己的 `config.toml`。可以运行 `setup`，或复制另一份专用调试配置。启动前应关闭 Telegram 等外部渠道，并将待测发送目标设为 `channel = "replay"`。
 
 ```bash
 AKASHIC_DEBUG_PROFILE=wake-replay \

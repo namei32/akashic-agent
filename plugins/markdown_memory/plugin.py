@@ -19,12 +19,15 @@ from agent.plugin_composition import (
     RUNTIME_STARTED,
     RUNTIME_STOPPING,
     Context,
+    CompositionError,
+    FiberState,
     ModelRequest,
 )
 from agent.plugin_composition.bindings import BINDINGS, Bindings
 from agent.plugin_composition.messages import MESSAGE_CATALOG
 from agent.plugin_composition.models import BoundChatModel, ChatModels, ContextLengthError, LLMResponse, ModelError
 from agent.plugin_contracts.json_store import atomic_write_text
+from core.common.file_io import run_file_io
 from agent.plugin_composition.messages import MessageCatalog
 from agent.plugin_contracts import ContentPart, Input, Message, Output, ToolResult
 from ._boundaries import (
@@ -36,6 +39,8 @@ from .llm_json import load_json_object_loose
 
 if TYPE_CHECKING:
     from agent.plugin_composition.messages import MessageReader
+
+from agent.plugin_contracts.inspection import DOCUMENTS, Document
 
 from .store import DEFAULT_SELF_MD, MEMORY_WRITES, MarkdownProfileStore, content_digest
 
@@ -55,7 +60,7 @@ workspace_files = (
 
 MaterialData = Mapping[str, object]
 inject = (CHAT_MODELS, MATERIALS, BINDINGS, MESSAGE_CATALOG, CONTENT, CONTEXT,
-          TURN_PROJECTION, COMPACTION_SUMMARIES)
+          TURN_PROJECTION, COMPACTION_SUMMARIES, COMPACTION_READER)
 
 
 _MEMORY_HEADINGS = (
@@ -276,107 +281,106 @@ async def start_store(
 
     async with profile_lock(lock_path.with_name(_UPDATE_LOCK_NAME)):
         async with profile_lock(lock_path):
-            for source_ref in store.pending_source_refs():
-                store.apply_pending(source_ref)
-        await _migrate_pending(
-            store,
-            lock_path,
-            pending_path,
-            snapshot_path,
-            retired_path,
-        )
+            def recover() -> None:
+                _recover_profile(store)
+                _migrate_pending(store, pending_path, snapshot_path, retired_path)
+            await run_file_io(recover)
 
 
-async def _migrate_pending(
+def _recover_profile(store: MarkdownProfileStore) -> tuple[str, str]:
+    """在调用者持有两文件锁时恢复 receipt，再读取同一完整档案。"""
+    for source_ref in store.pending_source_refs():
+        store.apply_pending(source_ref)
+    return store.read_memory(), store.read_self()
+
+
+def _migrate_pending(
     store: MarkdownProfileStore,
-    lock_path: Path,
     pending_path: Path,
     snapshot_path: Path,
     retired_path: Path,
 ) -> None:
-    """Merge exact retired queue bytes once, then preserve their file boundary."""
+    """在已有两文件锁内保留退休队列原文与恢复边界。"""
 
-    async with profile_lock(lock_path):
-        migration = store.read_legacy_pending_migration()
-        if migration is None:
-            pending = (
-                pending_path.read_text(encoding="utf-8")
-                if pending_path.exists()
-                else ""
-            )
-            snapshot = (
-                snapshot_path.read_text(encoding="utf-8")
-                if snapshot_path.exists()
-                else ""
-            )
-            if not pending and not snapshot:
-                return
-            migration = {
-                "version": 1,
-                "pending": pending,
-                "pending_digest": content_digest(pending),
-                "snapshot": snapshot,
-                "snapshot_digest": content_digest(snapshot),
-            }
-            store.write_legacy_pending_migration(migration)
-        pending = migration.get("pending")
-        snapshot = migration.get("snapshot")
-        pending_digest = migration.get("pending_digest")
-        snapshot_digest = migration.get("snapshot_digest")
-        if not all(
-            isinstance(value, str)
-            for value in (pending, snapshot, pending_digest, snapshot_digest)
-        ):
-            raise ValueError("legacy PENDING migration receipt schema 无效")
-        assert isinstance(pending, str)
-        assert isinstance(snapshot, str)
-        if (
-            content_digest(pending) != pending_digest
-            or content_digest(snapshot) != snapshot_digest
-        ):
-            raise ValueError("legacy PENDING migration receipt digest 无效")
-        encoded_migration = json.dumps(
-            migration,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
+    migration = store.read_legacy_pending_migration()
+    if migration is None:
+        pending = (
+            pending_path.read_text(encoding="utf-8")
+            if pending_path.exists()
+            else ""
         )
-        digest = hashlib.sha256(encoded_migration.encode("utf-8")).hexdigest()
-        source_ref = f"legacy-pending:{digest}"
-        combined = "\n".join(item for item in (snapshot, pending) if item)
-        if not store.is_applied(source_ref):
-            draft = store.read_draft(source_ref)
-            if draft is None:
-                draft = _prepare_legacy_draft(combined, store)
-                _ = store.write_draft(
-                    source_ref,
-                    draft,
-                    session_key="legacy-pending",
-                    generation=0,
-                )
-            check_draft(draft)
-            store.apply_draft(source_ref, draft)
-        archive = json.dumps(
-            {"source_ref": source_ref, **migration},
-            ensure_ascii=False,
-            sort_keys=True,
-            indent=2,
-        ) + "\n"
-        if retired_path.exists() and retired_path.read_text(encoding="utf-8") != archive:
-            raise RuntimeError("PENDING retired archive 内容冲突")
-        current_pending = pending_path.read_text(encoding="utf-8") if pending_path.exists() else ""
-        current_snapshot = (
-            snapshot_path.read_text(encoding="utf-8") if snapshot_path.exists() else ""
+        snapshot = (
+            snapshot_path.read_text(encoding="utf-8")
+            if snapshot_path.exists()
+            else ""
         )
-        if current_pending not in {"", pending}:
-            raise RuntimeError("PENDING.md 在退休 receipt 后出现新内容，拒绝清空")
-        if current_snapshot not in {"", snapshot}:
-            raise RuntimeError("PENDING.snapshot.md 在退休 receipt 后出现新内容，拒绝清空")
-        atomic_write_text(retired_path, archive, domain="pending_retirement")
-        atomic_write_text(pending_path, "", domain="pending_retirement")
-        atomic_write_text(snapshot_path, "", domain="pending_retirement")
-        store.mark_legacy_pending_retired(source_ref)
-
+        if not pending and not snapshot:
+            return
+        migration = {
+            "version": 1,
+            "pending": pending,
+            "pending_digest": content_digest(pending),
+            "snapshot": snapshot,
+            "snapshot_digest": content_digest(snapshot),
+        }
+        store.write_legacy_pending_migration(migration)
+    pending = migration.get("pending")
+    snapshot = migration.get("snapshot")
+    pending_digest = migration.get("pending_digest")
+    snapshot_digest = migration.get("snapshot_digest")
+    if not all(
+        isinstance(value, str)
+        for value in (pending, snapshot, pending_digest, snapshot_digest)
+    ):
+        raise ValueError("legacy PENDING migration receipt schema 无效")
+    assert isinstance(pending, str)
+    assert isinstance(snapshot, str)
+    if (
+        content_digest(pending) != pending_digest
+        or content_digest(snapshot) != snapshot_digest
+    ):
+        raise ValueError("legacy PENDING migration receipt digest 无效")
+    encoded_migration = json.dumps(
+        migration,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(encoded_migration.encode("utf-8")).hexdigest()
+    source_ref = f"legacy-pending:{digest}"
+    combined = "\n".join(item for item in (snapshot, pending) if item)
+    if not store.is_applied(source_ref):
+        draft = store.read_draft(source_ref)
+        if draft is None:
+            draft = _prepare_legacy_draft(combined, store)
+            _ = store.write_draft(
+                source_ref,
+                draft,
+                session_key="legacy-pending",
+                generation=0,
+            )
+        check_draft(draft)
+        store.apply_draft(source_ref, draft)
+    archive = json.dumps(
+        {"source_ref": source_ref, **migration},
+        ensure_ascii=False,
+        sort_keys=True,
+        indent=2,
+    ) + "\n"
+    if retired_path.exists() and retired_path.read_text(encoding="utf-8") != archive:
+        raise RuntimeError("PENDING retired archive 内容冲突")
+    current_pending = pending_path.read_text(encoding="utf-8") if pending_path.exists() else ""
+    current_snapshot = (
+        snapshot_path.read_text(encoding="utf-8") if snapshot_path.exists() else ""
+    )
+    if current_pending not in {"", pending}:
+        raise RuntimeError("PENDING.md 在退休 receipt 后出现新内容，拒绝清空")
+    if current_snapshot not in {"", snapshot}:
+        raise RuntimeError("PENDING.snapshot.md 在退休 receipt 后出现新内容，拒绝清空")
+    atomic_write_text(retired_path, archive, domain="pending_retirement")
+    atomic_write_text(pending_path, "", domain="pending_retirement")
+    atomic_write_text(snapshot_path, "", domain="pending_retirement")
+    store.mark_legacy_pending_retired(source_ref)
 
 
 def _prepare_legacy_draft(
@@ -630,7 +634,7 @@ async def _unapplied_groups(
 ) -> tuple[tuple[Message, ...], ...] | None:
     """只取未应用 generation 真正送入摘要模型的完整组原文。"""
     applied_reference: str | None = None
-    latest = store.latest_applied(record.session_id)
+    latest = await run_file_io(lambda: store.latest_applied(record.session_id))
     if latest is not None:
         latest_ref, generation = latest
         newer = record if record.generation > generation else lookup.resolve(
@@ -667,7 +671,7 @@ async def _unapplied_groups(
     selected_ids = {identity for batch in reversed(batches) for identity in batch}
 
     # 归档 lookup 依赖当前 task 的 lease；只把独立 reader 的解码移出事件循环。
-    snapshot = await asyncio.to_thread(reader.snapshot)
+    snapshot = await run_file_io(reader.snapshot)
     covered = summary_range(snapshot, record.source_message_ids)
     # 历史 suppress 是整个工作单元的资格，不能只删用户行后继续学习其回答。
     by_id = {message.message_id: message for message in snapshot[:covered.stop]}
@@ -718,15 +722,15 @@ async def project(
     # 1. 更新串行；两文件锁只保护已提交档案的读取和安装，不覆盖模型等待。
     async with profile_lock(lock_path.with_name(_UPDATE_LOCK_NAME)):
         async with profile_lock(lock_path):
-            for pending in store.pending_source_refs():
-                store.apply_pending(pending)
-            before_memory, before_self = store.read_memory(), store.read_self()
+            before_memory, before_self = await run_file_io(lambda: _recover_profile(store))
         # 2. Binding 固定原始记录身份；当前 compaction 读取该记录及其 v0/v1/v2 父链。
         metadata = bindings.describe(reference, COMPACTION_SUMMARIES)
         record = summaries.resolve(metadata, session_id=message.session_id)
-        if store.is_applied(record.reference):
+        applied, draft = await run_file_io(lambda: (
+            store.is_applied(record.reference), store.read_draft(record.reference),
+        ))
+        if applied:
             return
-        draft = store.read_draft(record.reference)
         groups = await _unapplied_groups(
             record, summaries, reader, store, sources, projection,
             compaction=compaction, post_commit_effect=post_commit_effect,
@@ -747,10 +751,13 @@ async def project(
             raise ValueError("不支持的 Markdown 草稿版本")
         # 2. 读者只会看到完整的旧档案或新档案；两次文件安装与回执在同一短锁内。
         async with profile_lock(lock_path):
-            _ = store.write_draft(record.reference, draft, session_key=record.session_id, generation=record.generation)
-            # 取消前若已留下 draft，下一次沿同一恢复点继续，不重算 before-image。
-            check_draft(draft)
-            store.apply_draft(record.reference, draft)
+            def install() -> None:
+                assert draft is not None
+                _ = store.write_draft(record.reference, draft, session_key=record.session_id, generation=record.generation)
+                # 草稿先落盘；失败后沿同一 before-image 恢复。
+                check_draft(draft)
+                store.apply_draft(record.reference, draft)
+            await run_file_io(install)
 
 
 async def apply(ctx: Context) -> None:
@@ -767,18 +774,27 @@ async def apply(ctx: Context) -> None:
         return store.read_writes(after, limit)
 
     _ = await ctx.provide(MEMORY_WRITES, read_writes)
+    await ctx.inject((DOCUMENTS,), publish_documents, name="documents")
 
     async def prepare(snapshot: tuple[Message, ...], source: str) -> MaterialData:
         # 完整初始态只投影 Store 的同一默认值；不创建文件或消费旧队列。
         state_files = tuple(ctx.workspace_file(name) for name in workspace_files
                             if not name.endswith(".lock"))
-        if not any(path.exists() for path in state_files):
+        if not await run_file_io(lambda: any(path.exists() for path in state_files)):
             self_profile, memory = DEFAULT_SELF_MD.strip(), ""
         else:
             async with profile_lock(lock_path, create=False):
-                self_profile = ctx.workspace_file("memory/SELF.md").read_text(encoding="utf-8").strip()
-                memory = ctx.workspace_file("memory/MEMORY.md").read_text(encoding="utf-8").strip()
-        parts: list[str] = []
+                self_path = ctx.workspace_file("memory/SELF.md")
+                memory_path = ctx.workspace_file("memory/MEMORY.md")
+                self_profile, memory = await run_file_io(lambda: (
+                    self_path.read_text(encoding="utf-8").strip(),
+                    memory_path.read_text(encoding="utf-8").strip(),
+                ))
+        parts: list[str] = [
+            "## 档案位置\n"
+            f"- 长期记忆：{ctx.workspace_file('memory/MEMORY.md')}\n"
+            f"- 自我认知：{ctx.workspace_file('memory/SELF.md')}"
+        ]
         if self_profile:
             parts.append("## Akashic 自我认知\n\n" + self_profile)
         if memory:
@@ -796,34 +812,39 @@ async def apply(ctx: Context) -> None:
                     for session, head in heads.items():
                         if head <= cursor.get(session, -1):
                             continue
-                        async with ctx.runtime_scope():
-                            assert store is not None
-                            reader = catalog.reader(session)
-                            if reader.attributes.learning != "eligible":
-                                cursor[session] = head
-                                continue
-                            messages = await asyncio.to_thread(
-                                reader.snapshot, after_seq=cursor.get(session, -1), through_seq=head,
-                            )
-                            for message in messages:
-                                try:
-                                    compaction = ctx.get(COMPACTION_READER)
-                                    await project(message, reader=reader, bindings=ctx.require(BINDINGS),
-                                                  store=store, models=ctx.require(CHAT_MODELS), lock_path=lock_path,
-                                    sources=config.sources, projection=ctx.require(TURN_PROJECTION),
-                                    content=ctx.require(CONTENT), context=context,
-                                    summaries=ctx.require(COMPACTION_SUMMARIES),
-                                    compaction=compaction)
-                                except ModelError as error:
-                                    if not error.retryable:
-                                        raise
-                                    logger.warning(
-                                        "Markdown 模型暂时失败，将重试原消息: session=%s message=%s error=%s",
-                                        session, message.message_id, type(error).__name__, exc_info=True,
-                                    )
-                                    retry = True
-                                    break
-                                cursor[session] = message.seq
+                        try:
+                            async with ctx.runtime_scope():
+                                assert store is not None
+                                reader = catalog.reader(session)
+                                if reader.attributes.learning != "eligible":
+                                    cursor[session] = head
+                                    continue
+                                messages = await run_file_io(lambda: reader.snapshot(
+                                    after_seq=cursor.get(session, -1), through_seq=head,
+                                ))
+                                for message in messages:
+                                    try:
+                                        compaction = ctx.get(COMPACTION_READER)
+                                        await project(message, reader=reader, bindings=ctx.require(BINDINGS),
+                                                      store=store, models=ctx.require(CHAT_MODELS), lock_path=lock_path,
+                                        sources=config.sources, projection=ctx.require(TURN_PROJECTION),
+                                        content=ctx.require(CONTENT), context=context,
+                                        summaries=ctx.require(COMPACTION_SUMMARIES),
+                                        compaction=compaction)
+                                    except ModelError as error:
+                                        if not error.retryable:
+                                            raise
+                                        logger.warning(
+                                            "Markdown 模型暂时失败，将重试原消息: session=%s message=%s error=%s",
+                                            session, message.message_id, type(error).__name__, exc_info=True,
+                                        )
+                                        retry = True
+                                        break
+                                    cursor[session] = message.seq
+                        except CompositionError as error:
+                            if error.code != "OWNER_UNAVAILABLE" or ctx.fiber.state not in {FiberState.UNLOADING, FiberState.DISPOSED}:
+                                raise
+                            return
                     if retry:
                         break
             if not retry:
@@ -835,8 +856,10 @@ async def apply(ctx: Context) -> None:
         nonlocal store, watcher
         # 首次创建默认档案和 schema 也不能向读者暴露部分初始化。
         async with profile_lock(lock_path.with_name(_UPDATE_LOCK_NAME)), profile_lock(lock_path):
-            store = MarkdownProfileStore(ctx.workspace_file("memory/MEMORY.md"), ctx.workspace_file("memory/SELF.md"),
-                                         ctx.workspace_file("memory/markdown-profile-writes.db"))
+            paths = tuple(ctx.workspace_file(name) for name in (
+                "memory/MEMORY.md", "memory/SELF.md", "memory/markdown-profile-writes.db",
+            ))
+            store = await run_file_io(lambda: MarkdownProfileStore(*paths))
         await start_store(store, lock_path, ctx.workspace_file("memory/PENDING.md"),
                            ctx.workspace_file("memory/PENDING.snapshot.md"), ctx.workspace_file("memory/PENDING.retired.md"))
         watcher = await ctx.spawn(follow(ctx.require(MESSAGE_CATALOG)), name="markdown-memory")
@@ -849,6 +872,21 @@ async def apply(ctx: Context) -> None:
             except asyncio.CancelledError:
                 pass
 
-    _ = await ctx.require(MATERIALS).register(ctx, name="markdown_memory", prepare=prepare, prompt=True, priority=200)
+    _ = await ctx.require(MATERIALS).register(ctx, kind="profile", name="markdown_memory", prepare=prepare, prompt=True, priority=200)
     _ = await ctx.on(RUNTIME_STARTED, start)
     _ = await ctx.on(RUNTIME_STOPPING, stop)
+
+
+async def publish_documents(ctx: Context) -> None:
+    """只发布档案 owner 拥有的两份只读文件。"""
+    for identity, title, relative_path, group, description, order in (
+        ("memory", "长期记忆", "memory/MEMORY.md", "memory", "沉淀后的长期事实、偏好与经验。", 100),
+        ("self", "自我认知", "memory/SELF.md", "identity", "Agent 对自身状态与能力边界的认识。", 200),
+    ):
+        path = ctx.workspace_file(relative_path)
+        def read(limit: int, path: Path = path) -> bytes:
+            with path.open("rb") as file:
+                return file.read(limit)
+        await ctx.require(DOCUMENTS).register(ctx, Document(
+            identity, title, relative_path, group, description, read, order,
+        ))

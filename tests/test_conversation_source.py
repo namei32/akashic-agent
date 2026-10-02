@@ -1,17 +1,16 @@
 from session.message import ContentReferences
 import asyncio
+from collections.abc import Awaitable
+from typing import cast
 from contextlib import asynccontextmanager
-
 import pytest
-
-from agent.plugin_composition.tasks import Tasks, StaleTask
-from plugins.sources.session import SourceSession as Conversation, needs_reply
-from session.log import MessageConflict, MessageLog, WriterExpired
-from session.message import ContentPart, Control, Input, Output, ToolCall, ToolResult, CallRef
-
+from agent.plugin_composition.tasks import Tasks
+from plugins.sources.session import SourceSession as Conversation
+from session.log import MessageLog, WriterExpired
+from session.message import ContentPart, Control, Input, Output
 
 @asynccontextmanager
-async def source(tmp_path, run):
+async def source(tmp_path, run, *, changed=None):
     log = MessageLog(tmp_path / "sessions.db")
     tasks = Tasks()
     def writer(body, *, source="conversation", author="app", call_ref=None):
@@ -24,14 +23,13 @@ async def source(tmp_path, run):
         return await run(task, reader, output)
     conversation = Conversation(
         reader=log.reader("s"), inputs=writer(Input), controls=writer(Control),
-        tasks=tasks,
+        tasks=tasks, changed=changed,
     )
     try:
         yield conversation, log, writer, program
     finally:
         await tasks.close()
         log.close()
-
 
 @pytest.mark.asyncio
 async def test_interrupt_inputs_survive_and_old_output_cannot_commit(tmp_path):
@@ -73,220 +71,150 @@ async def test_interrupt_inputs_survive_and_old_output_cannot_commit(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_pause_survives_results_and_restart_new_input_wakes(tmp_path):
-    entered = asyncio.Event()
+@pytest.mark.parametrize("closing", [False, True])
+async def test_source_commit_drains_before_cancel_and_rejects_late_start(tmp_path, monkeypatch, closing):
+    """C3/C4/C5：取消不丢提交收据，新输入先提交时旧 intent 不能启动效果。"""
+    import sqlite3
+    from contextlib import closing as close_connection
+    from agent.plugin_composition.tasks import TaskServiceClosed
+    from plugins.sources.session import check_source
+    from tests.test_akasha_execution import WorkerGate, loop_turn
+
+    changed = []
+    started = asyncio.Event()
+    outputs = []
+
+    def record(reader, name, pending):
+        asyncio.get_running_loop()
+        changed.append((name, reader.head()))
+
     async def run(task, reader, writer):
-        entered.set()
+        outputs.append(writer)
+        started.set()
         await asyncio.Event().wait()
-    async with source(tmp_path, run) as (conversation, log, writer, program):
-        await conversation.accept("u1", Input(()))
+
+    async with source(tmp_path, run, changed=record) as (conversation, log, make_writer, program):
+        original = await conversation.accept("first", Input(()))
         task = await conversation.start(program)
-        await entered.wait()
-        with pytest.raises(StaleTask):
-            await conversation.control("stale", Control("pause", 0), expected_head=0, handle="old")
-        log.save_binding("tool", {"version": 1})
-        call = writer(Output).append("call", Output((ToolCall("tool", {}),), "continue"))
-        paused = await conversation.control("stop", Control("pause", call.seq), expected_head=call.seq, handle=task.handle)
-        assert await conversation.control("stop", Control("pause", call.seq), expected_head=call.seq, handle=task.handle) == paused
-        writer(ToolResult, call_ref=CallRef("call", 0)).append("result", ToolResult(CallRef("call", 0), "success", ()))
-        assert await conversation.start(program) is None
-        assert not needs_reply(log.reader("s").snapshot(), "conversation")
-        # 新对象没有持久 active/attempt；同一日志足以恢复暂停。
-        restarted = Conversation(reader=log.reader("s"), inputs=writer(Input), controls=writer(Control),
-                                 tasks=Tasks())
-        assert await restarted.start(program) is None
-        await conversation.accept("u2", Input(()))
-        assert needs_reply(log.reader("s").snapshot(), "conversation")
+        assert task is not None
+        await started.wait()
+        gate = WorkerGate()
+        notify = log._notify
+        stopped = False
 
+        def committed():
+            nonlocal stopped
+            notify()
+            if not stopped and log.reader("s").get("second") is not None:
+                stopped = True
+                gate.stop()
 
-@pytest.mark.asyncio
-async def test_control_cannot_target_other_source_and_abandon_does_not_eat_new_input(tmp_path):
-    async def run(task, reader, writer):
-        return None
-    async with source(tmp_path, run) as (conversation, log, writer, program):
-        await conversation.accept("u1", Input(()))
-        writer(Output, source="timer").append("timer", Output((), "complete"))
-        with pytest.raises(MessageConflict, match="同来源"):
-            await conversation.control("wrong", Control("pause", 1), expected_head=0, handle=None)
-        await conversation.accept("u2", Input(()))
-        await conversation.control("abandon", Control("abandon", 0), expected_head=2, handle=None)
-        assert needs_reply(log.reader("s").snapshot(), "conversation")
-        with pytest.raises(MessageConflict, match="关闭"):
-            await conversation.control("again", Control("abandon", 0), expected_head=3, handle=None)
-        await conversation.control("stop", Control("pause", 2), expected_head=3, handle=None)
-        assert await conversation.start(program) is None
-        await conversation.control("resume", Control("resume", 2), expected_head=4, handle=None)
-        assert needs_reply(log.reader("s").snapshot(), "conversation")
-
-
-@pytest.mark.asyncio
-async def test_explicit_retry_reuses_input_and_replays_resume_after_later_messages(tmp_path):
-    attempts = 0
-    async def run(task, reader, writer):
-        nonlocal attempts
-        attempts += 1
-        if attempts == 1:
-            raise ValueError("model request failed")
-        return writer.append("a", Output((ContentPart("text", "answer"),), "complete"))
-    async with source(tmp_path, run) as (conversation, log, writer, program):
-        await conversation.accept("u1", Input((ContentPart("text", "question"),)))
-        with pytest.raises(ValueError, match="model request"):
-            await (await conversation.start(program)).join()
-        resumed = await conversation.resume("retry", "u1")
-        assert isinstance(resumed.body, Control) and resumed.body.action == "resume"
-        assert needs_reply(log.reader("s").snapshot(), "conversation")
-        await (await conversation.start(program)).join()
-        await conversation.accept("u2", Input((ContentPart("text", "next"),)))
-        assert await conversation.resume("retry", "u1") == resumed
-        with pytest.raises(MessageConflict, match="另一条输入"):
-            await conversation.resume("retry", "u2")
-        assert [m.message_id for m in log.reader("s").snapshot() if isinstance(m.body, Input)] == ["u1", "u2"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("closed", ["complete", "abandon", "running", "newer"])
-async def test_retry_rejects_closed_active_or_superseded_inputs(tmp_path, closed):
-    entered, release = asyncio.Event(), asyncio.Event()
-    async def run(task, reader, writer):
-        entered.set()
-        await release.wait()
-    async with source(tmp_path, run) as (conversation, log, writer, program):
-        await conversation.accept("u1", Input(()))
-        writer(Control).append("failed", Control("failure", 0, "failure"))
-        if closed == "complete":
-            writer(Output).append("a", Output((), "quiet"))
-        elif closed == "abandon":
-            await conversation.control("abandon", Control("abandon", 0), expected_head=1, handle=None)
-        elif closed == "newer":
-            await conversation.accept("u2", Input(()))
-        else:
-            await conversation.resume("first-retry", "u1")
-            await conversation.start(program)
-            await entered.wait()
+        monkeypatch.setattr(log, "_notify", committed)
+        job = asyncio.create_task(conversation.accept("second", Input(())))
+        state = log.owner("first-effect")
+        close_job = None
+        queued = None
+        effect = None
         try:
-            with pytest.raises(MessageConflict):
-                await conversation.resume("retry", "u1")
+            # 1. SQL 已提交，loop 通知还没运行；旧 Task 此时仍有 active 权限。
+            await gate.wait(job)
+            assert task.active
+            with log.reader("s").read_snapshot():
+                assert log.reader("s").get("second") is not None
+            await loop_turn()
+            job.cancel()
+
+            def claim(tx):
+                check_source(task, log.reader("s"), "conversation", original.seq, transaction=tx)
+                return tx.save("started", {"phase": "started"}, expected_version=None)
+
+            effect = asyncio.create_task(state.transact_async(claim))
+            if closing:
+                queued = asyncio.create_task(conversation.start(program))
+                await loop_turn()
+                close_job = asyncio.create_task(conversation._tasks.close())
+                await loop_turn()
+                assert not close_job.done(), "关闭必须等待已接纳磁盘提交"
+            # 2. 取消仍排空 worker，通知一次并撤权；晚到的首次 intent 整体回滚。
+            gate.release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await job
+            with pytest.raises(asyncio.CancelledError):
+                await effect
+            if close_job is not None:
+                await close_job
+            if queued is not None:
+                with pytest.raises(TaskServiceClosed):
+                    await queued
+            with pytest.raises(asyncio.CancelledError):
+                await task.join()
+            assert changed == [("conversation", 0), ("conversation", 1)]
+            assert state.read("started") is None
+            assert log.reader("s").get("first") == original
+            assert [m.message_id for m in log.reader("s").snapshot()] == ["first", "second"]
+            with pytest.raises(WriterExpired):
+                outputs[0].append("old-output", Output((), "complete"))
+            assert await conversation._inputs.append_async(
+                "first", Input(()), on_commit=lambda _message, created: pytest.fail("replay was newly created") if created else None,
+            ) == original
+            with close_connection(sqlite3.connect(tmp_path / "sessions.db")) as raw:
+                assert raw.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+                assert not raw.execute("PRAGMA foreign_key_check").fetchall()
         finally:
-            release.set()
+            gate.release.set()
+            await asyncio.gather(*(cast(Awaitable[object], item) for item in (job, effect, queued, close_job) if item is not None), return_exceptions=True)
 
 
 @pytest.mark.asyncio
-async def test_stop_and_duplicate_stop_wait_for_cleanup_without_cancelling_it_twice(tmp_path):
-    entered, draining, release = (asyncio.Event() for _ in range(3))
-    held = []
-    async def run(task, reader, writer):
-        held.append(writer)
-        entered.set()
-        try:
-            await asyncio.Event().wait()
-        finally:
-            draining.set()
-            await release.wait()
-    async with source(tmp_path, run) as (conversation, log, writer, program):
-        await conversation.accept("u1", Input(()))
-        task = await conversation.start(program)
-        await entered.wait()
-        stopping = asyncio.create_task(conversation.control(
-            "stop", Control("pause", 0), expected_head=0, handle=task.handle))
-        await draining.wait()
-        assert not stopping.done()
-        with pytest.raises(WriterExpired):
-            held[0].append("stale", Output((), "quiet"))
-        # 等待者退出不会向已经结算中的旧工作再送一次取消。
-        stopping.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await stopping
-        assert not task.done
-        repeated = asyncio.create_task(conversation.control(
-            "stop", Control("pause", 0), expected_head=0, handle=task.handle))
-        release.set()
-        assert (await repeated).message_id == "stop"
-        assert task.done
-        assert [m.message_id for m in log.reader("s").snapshot()] == ["u1", "stop"]
+@pytest.mark.parametrize("automatic", [False, True])
+async def test_stop_waiting_for_storage_preserves_reply_and_explicit_head(tmp_path, monkeypatch, automatic):
+    """C3/C4：内部停止重选前缀，显式 head 不得被自动放宽，原回复保持完整。"""
+    from session.log import MessageWriter, SourceHeadConflict
+    waiting = asyncio.Event()
+    release = asyncio.Event()
+    answer_ready = asyncio.Event()
+    finish = asyncio.Event()
+    original = MessageWriter.append_async
 
-
-@pytest.mark.asyncio
-async def test_completion_waits_for_human_reply_and_cancellation_does_not_cancel_human(tmp_path):
-    entered, release = asyncio.Event(), asyncio.Event()
-    async def human(task, reader, writer):
-        entered.set()
-        await release.wait()
-        return writer.append("human-answer", Output((), "complete"))
-    async with source(tmp_path, human) as (conversation, log, writer, program):
-        await conversation.accept("human", Input(()))
-        task = await conversation.start(program)
-        await entered.wait()
-        waiting = asyncio.Event()
-        async def report(task, reader):
-            pytest.fail("completion cannot start while human reply is active")
-        async def complete():
+    async def append(writer, message_id, body, **kwargs):
+        if message_id == "stop":
             waiting.set()
-            return await conversation.complete(report)
-        pending = asyncio.create_task(complete())
-        await waiting.wait()
-        pending.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await pending
-        assert task.active
-        release.set()
-        await task.join()
-        assert log.reader("s").get("human-answer") is not None
+            await release.wait()
+        return await original(writer, message_id, body, **kwargs)
 
+    async def run(task, reader, writer):
+        answer_ready.set()
+        await finish.wait()
+        return writer.append("answer", Output((), "complete"),
+                             expected_source_head=reader.head(source="conversation"))
 
-@pytest.mark.asyncio
-async def test_new_human_input_revokes_completion_then_result_resumes_after_reply(tmp_path):
-    entered, revoked, drain = asyncio.Event(), asyncio.Event(), asyncio.Event()
-    attempts = []
-    async def human(task, reader, writer):
-        return writer.append("human-answer", Output((), "complete"))
-    async with source(tmp_path, human) as (conversation, log, writer, program):
-        writer(Output).append("previous-answer", Output((), "complete"))
-        async def report(task, reader):
-            output = writer(Output, source="background:one")
-            task.on_close(output.expire)
-            attempts.append(output)
-            if len(attempts) == 1:
-                entered.set()
-                try:
-                    await asyncio.Event().wait()
-                finally:
-                    revoked.set()
-                    await drain.wait()
-            assert reader.get("human-answer") is not None
-            return output.append("report", Output((ContentPart("text", "result"),), "complete"))
-        pending = asyncio.create_task(conversation.complete(report))
-        await entered.wait()
-        await conversation.accept("human", Input(()))
-        await revoked.wait()
-        with pytest.raises(WriterExpired):
-            attempts[0].append("late", Output((), "complete"))
-        start = asyncio.create_task(conversation.start(program))
-        drain.set()
-        await (await start).join()
-        result = await asyncio.wait_for(pending, 3)
-        assert result.message_id == "report"
-        assert [m.message_id for m in log.reader("s").snapshot()] == ["previous-answer", "human", "human-answer", "report"]
-        assert len(attempts) == 2
-
-
-def test_reply_wake_reads_only_latest_input_prefix_and_matches_full_history(tmp_path, monkeypatch):
-    from contextlib import closing
-    with closing(MessageLog(tmp_path / "wake.db")) as log:
-        def append(identity, body):
-            return log.writer("s", author="test", source="conversation", body_types=(type(body),),
-                              content={}).append(identity, body)
-        reader = log.reader("s")
-        assert not needs_reply(reader, "conversation")
-        bodies = (Input(()), Control("pause", 0), Control("resume", 1),
-                  Input(()), Control("abandon", 3), Input(()), Output((), "continue"),
-                  Control("failure", 6), Control("resume", 7), Output((), "complete"),
-                  Input(()), Control("pause", 9))
-        for index, body in enumerate(bodies):
-            append(str(index), body)
-            assert needs_reply(reader, "conversation") == needs_reply(reader.snapshot(), "conversation")
-        original = reader.snapshot
-        def narrow(**kwargs):
-            assert kwargs["after_seq"] == 10
-            return original(**kwargs)
-        monkeypatch.setattr(reader, "snapshot", narrow)
-        assert needs_reply(reader, "conversation")
+    monkeypatch.setattr(MessageWriter, "append_async", append)
+    async with source(tmp_path, run) as (conversation, log, _writer, program):
+        first = await conversation.accept("input", Input(()))
+        task = await conversation.start(program)
+        assert task is not None
+        await answer_ready.wait()
+        operation = conversation.pause("stop") if automatic else conversation.control(
+            "stop", Control("pause", first.seq), expected_head=first.seq, handle=task.handle,
+        )
+        job = asyncio.create_task(operation)
+        try:
+            await waiting.wait()
+            finish.set()
+            answer = await task.join()
+            release.set()
+            if automatic:
+                stop = await job
+                assert isinstance(stop.body, Control) and stop.body.through_seq == answer.seq
+                assert [m.message_id for m in log.reader("s").snapshot()] == ["input", "answer", "stop"]
+                assert await conversation.pause("stop") == stop
+            else:
+                with pytest.raises(SourceHeadConflict):
+                    await job
+                assert [m.message_id for m in log.reader("s").snapshot()] == ["input", "answer"]
+            assert log.reader("s").get("input") == first
+            assert log.reader("s").get("answer") == answer
+        finally:
+            finish.set()
+            release.set()
+            await asyncio.gather(job, return_exceptions=True)

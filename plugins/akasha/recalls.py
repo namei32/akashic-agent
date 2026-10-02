@@ -1,6 +1,7 @@
 """实际查询的耐久出处独立于学习图，正文仍从 Message 读取。"""
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime
 import numpy as np
@@ -12,7 +13,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, FiniteFloat, m
 from .application.cycle import MemoryCycle, RetrievalTicket
 from .domain.model import Turn
 from .infrastructure.consumption import Consumption
-from .infrastructure.sparse_index.encoding import tokenize
+from .infrastructure.lexical import tokenize
 from agent.plugin_composition.messages import MessageCatalog, OwnerStore
 from agent.plugin_contracts import CallRef
 from agent.plugin_contracts import json_value
@@ -23,6 +24,13 @@ if TYPE_CHECKING:
     from .learning import Learning
 
 Text = Annotated[str, Field(min_length=1)]
+
+
+def context_identity(session_id: str, source: str, input_message_id: str) -> str:
+    """Preserve the original JSON bytes used by the automatic-recall producer."""
+    return "context:" + hashlib.sha256(json.dumps(
+        [session_id, source, input_message_id], ensure_ascii=False,
+    ).encode()).hexdigest()
 
 
 class ContextSource(BaseModel):
@@ -108,6 +116,29 @@ class RecallRecordsRead:
             return None
         return Recall.model_validate_json(json.dumps(json_value(record.value)))
 
+    def legacy_page(self, before: str = "g", *, limit: int = 64) -> tuple[tuple[tuple[str, Recall], ...], str | None]:
+        """Page the retired uuid4().hex namespace, skipping deterministic keys.
+
+        The two ranges cover every legacy hexadecimal ID without decoding the
+        interleaved context: namespace. Current writers only use context:/tool:.
+        A full final page deliberately needs one empty continuation to prove EOF.
+        """
+        if not "0" < before <= "g" or before.startswith("context:"):
+            raise ValueError("旧召回分页位置无效")
+        rows: list[tuple[str, Recall]] = []
+        while len(rows) < limit:
+            start = "context;" if before > "context;" else "0"
+            page = self._state.scan(start="recall:" + start, stop="recall:" + before,
+                                    limit=limit - len(rows))
+            rows.extend((key.removeprefix("recall:"), Recall.model_validate_json(
+                json.dumps(json_value(record.value)))) for key, record in page)
+            if len(rows) == limit:
+                return tuple(rows), rows[-1][0]
+            if start == "0":
+                return tuple(rows), None
+            before = "context:"
+        raise AssertionError("旧召回分页未前进")
+
     def list(self) -> tuple[tuple[str, Recall], ...]:
         """按实际查询时间返回最新记录，不读取或重算学习图。"""
         records = tuple(
@@ -152,9 +183,7 @@ def select_hits(
 
     def hit(turn: Turn, score: float, lane: Literal["dense", "completion"],
             sources: tuple[str, ...], basins: tuple[str, ...] = ()) -> Hit:
-        suffix = turn.node_id - state.legacy_prefix.count
-        members = ((turn.user_message_id, turn.assistant_message_id) if suffix < 0
-                   else tuple(identity for _, identity in state.applied[suffix].members))
+        members = tuple(identity for _, identity in state.applied[turn.node_id].members)
         return Hit(node_id=turn.node_id, session_id=turn.session_key, message_ids=members,
                    score=score, lane=lane, sources=sources, basin_ids=basins)
 

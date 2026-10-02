@@ -1,76 +1,64 @@
 import asyncio
-from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
+from collections.abc import AsyncGenerator, Callable, Mapping
 from contextlib import aclosing
-from typing import Protocol, cast
+from typing import cast
 
-from agent.plugin_composition import Context, Effect, ServiceKey, RUNTIME_STARTED, RUNTIME_STOPPING
-from agent.plugin_composition.messages import MESSAGE_CATALOG, MESSAGE_WRITERS, SESSION_ADMISSION
-from agent.plugin_composition.tasks import TASKS, Task, TaskAdmission, RestartGate, RESTART_GATE
+from agent.plugin_composition import (
+    RUNTIME_STARTED,
+    RUNTIME_STOPPING,
+    Context,
+)
 from agent.plugin_composition.control_frames import CONTROL_FRAMES
+from agent.plugin_composition.messages import (
+    MESSAGE_CATALOG,
+    MESSAGE_WRITERS,
+    SESSION_ADMISSION,
+    MessageReader,
+)
 from agent.plugin_composition.rpc import rpc_method_key
+from agent.plugin_composition.models import MODEL_CATALOG, ChatModelSelection
+from agent.plugin_composition.tasks import (
+    RESTART_GATE,
+    TASKS,
+)
+from agent.plugin_contracts import (
+    ContentPart,
+    ContentReferences,
+    Control,
+    Input,
+)
+from agent.plugin_contracts.models import MODEL_SELECTION
+from agent.plugin_contracts.content import (
+    CONTENT as CONTENT,
+)
+from agent.plugin_contracts.delivery import (
+    FINAL_OUTPUT_DELIVERY as FINAL_OUTPUT_DELIVERY,
+    FinalOutputDelivery as FinalOutputDelivery,
+    FinalOutputWaiter as FinalOutputWaiter,
+)
+from agent.plugin_contracts.sources import (
+    CHECK_ORIGIN as CHECK_ORIGIN,
+    SOURCE_CHANGED_V3 as SOURCE_CHANGED,
+    SOURCE_SESSION_V4 as SOURCE_SESSION,
+    SOURCES_V5 as SOURCES,
+    SessionFactoryV4 as SessionFactory,
+    SourceChangedV3 as SourceChanged,
+    GuardedSourceSession as SourceSession,
+)
+
+from .control import (
+    PROGRAMMATIC,
+    Programmatic,
+    check_session,
+    rpc_methods,
+)
 from .result import TURN_PROJECTION
-from agent.plugin_composition.channels import ChannelInboundMessage
-from agent.plugin_composition.messages import MessageReader, MessageWriter
-from agent.plugin_contracts import ContentPart, ContentReferences, Control, Input, Message
-
-from .control import PROGRAMMATIC, Programmatic, FinalOutputTurn, check_session, rpc_methods
-
-
-
-class ContentChecks(Protocol):
-    def check_text(self, part: ContentPart) -> ContentReferences: ...
-
-
-class FinalOutputWaiter(Protocol):
-    async def wait(self, reader: MessageReader, turn: FinalOutputTurn) -> None: ...
-
-
-class FinalOutputDelivery(Protocol):
-    def register(self, source: str, provider: FinalOutputWaiter) -> None: ...
-    def unregister(self, source: str, provider: FinalOutputWaiter) -> None: ...
-
-
-CONTENT = ServiceKey[ContentChecks]("content.v2")
-CHECK_ORIGIN = ServiceKey[Callable[[ContentPart], ContentReferences]]("conversation.check_origin.v1")
-FINAL_OUTPUT_DELIVERY = ServiceKey[FinalOutputDelivery]("delivery.final_output.v1")
-
-
-class SourceSession(Protocol):
-    async def accept(self, message_id: str, body: Input) -> Message: ...
-    async def pause(self, message_id: str) -> Message: ...
-    async def resume(self, message_id: str, input_id: str) -> Message: ...
-    async def start(self, program: Callable[[Task, MessageReader, str], Awaitable[object]]) -> Task | None: ...
-
-
-class SessionFactory(Protocol):
-    def __call__(
-        self, *, reader: MessageReader, inputs: MessageWriter, controls: MessageWriter,
-        tasks: TaskAdmission, changed: Callable[[MessageReader, str], None] | None = None,
-        restart_gate: RestartGate | None = None,
-    ) -> SourceSession: ...
-
-    def needs_reply(self, reader: MessageReader, source: str) -> bool: ...
-
-
-class SourceRegistry(Protocol):
-    async def register(
-        self, ctx: Context, *, name: str, open: Callable[[str], SourceSession],
-        needs_reply: Callable[[MessageReader], bool],
-        accept: Callable[[str, str, ChannelInboundMessage], Awaitable[Message]] | None = None,
-        channels: tuple[str, ...] | None = (),
-    ) -> Effect: ...
-
-
-SOURCES = ServiceKey[SourceRegistry]("sources.v2")
-SOURCE_SESSION = ServiceKey[SessionFactory]("source.session.v1")
-SOURCE_CHANGED = ServiceKey[Callable[[MessageReader, str], None]]("source.changed.v1")
-
 
 api_version = 3
 name = "programmatic"
 version = "1.0.0"
 desc = "程序调用的输入、停止、恢复与结果；默认保存原文但排除学习"
-inject = (CONTENT, CHECK_ORIGIN, SOURCES, SOURCE_SESSION, MESSAGE_WRITERS, SESSION_ADMISSION, TURN_PROJECTION, RESTART_GATE, CONTROL_FRAMES)
+inject = (MESSAGE_CATALOG, TASKS, CONTENT, CHECK_ORIGIN, SOURCES, SOURCE_SESSION, MESSAGE_WRITERS, SESSION_ADMISSION, TURN_PROJECTION, RESTART_GATE, CONTROL_FRAMES)
 
 
 def open_source(ctx: Context, session_id: str) -> SourceSession:
@@ -80,18 +68,30 @@ def open_source(ctx: Context, session_id: str) -> SourceSession:
     if reader.attributes.visibility != "internal":
         raise ValueError("程序调用 Session 尚未通过内部来源准入")
 
-    def changed(reader: MessageReader, source: str) -> None:
-        listener = ctx.get(SOURCE_CHANGED)
-        if listener is not None:
-            listener(reader, source)
-        programmatic = ctx.get(PROGRAMMATIC)
-        if programmatic is not None:
-            programmatic.settle_changed(reader, source)
+    def changed(reader: MessageReader, source: str, pending: bool) -> None:
+        ctx.emit(SOURCE_CHANGED, SourceChanged(reader, source, pending))
+
+    def check_model(part: ContentPart) -> ContentReferences:
+        """显式输入借 Models 的目录和选择规则，不给来源模型执行权。"""
+        with ctx.borrow(MODEL_SELECTION) as selection, ctx.borrow(MODEL_CATALOG) as catalog:
+            if selection is None or catalog is None:
+                raise ValueError("当前组合不提供模型选择能力")
+            references = selection.check(part)
+            value = cast(Mapping[str, str | None], part.value)
+            # 新输入不能把拼错的 ID 当作已删除的历史偏好而回退。
+            if value["model_id"] is not None:
+                try:
+                    catalog.snapshot().model(value["model_id"])
+                except KeyError as error:
+                    raise ValueError(f"未知模型: {value["model_id"]}") from error
+            catalog.validate_chat_selection(ChatModelSelection(value["model_id"], value["reasoning_effort"]))
+            return references
 
     writers = ctx.require(MESSAGE_WRITERS)
     return ctx.require(SOURCE_SESSION)(reader=reader,
         inputs=writers.bind(ctx, author="user", source="programmatic", body_types=(Input,),
-            content={"text": ctx.require(CONTENT).check_text, "channel.origin": ctx.require(CHECK_ORIGIN)})(session_id),
+            content={"text": ctx.require(CONTENT).check_text, "channel.origin": ctx.require(CHECK_ORIGIN),
+                     "model.selection": check_model})(session_id),
         controls=writers.bind(ctx, author="app", source="programmatic", body_types=(Control,),
             content={})(session_id),
         tasks=ctx.require(TASKS).open(ctx), changed=changed,
@@ -113,7 +113,7 @@ async def apply(ctx: Context) -> None:
         async with aclosing(stream):
             async for heads in stream:
                 for session_id in heads:
-                    programmatic.settle_changed(catalog.reader(session_id), "programmatic")
+                    await programmatic.settle_changed(catalog.reader(session_id), "programmatic")
 
     async def start(_event: object) -> None:
         nonlocal watcher

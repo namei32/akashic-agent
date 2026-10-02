@@ -1,28 +1,41 @@
 from __future__ import annotations
 
 import json
-from html import escape
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
+from html import escape
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from agent.plugin_composition import Context, ServiceKey
+from agent.plugin_composition import Context
 from agent.plugin_composition.models import ModelRequest
 from agent.plugin_contracts import (
     Message,
 )
-from .api import ContextModel, ContextOverflow, check_summary, MaterialData, Materials, Summary, decode_material, settled_prefixes, summary_range
-from .materials import ContextMaterials, MATERIALS
+from agent.plugin_contracts.context import (
+    CONTEXT as CONTEXT,
+    MATERIALS_V4,
+)
+
+from .api import (
+    ContextModel,
+    ContextOverflow,
+    MaterialData,
+    Materials,
+    Summary,
+    check_summary,
+    decode_material,
+    settled_prefixes,
+    summary_range,
+)
+from .materials import ContextMaterials
 
 api_version = 3
 name = "context"
 version = "1.0.0"
 desc = "用固定日志和已取得材料组成请求，不执行检索或摘要"
 inject = ()
-
-
 
 
 class Config(BaseModel):
@@ -97,6 +110,7 @@ class ContextBuilder:
         tools: Sequence[Mapping[str, Any]] = (),
         max_output_tokens: int,
         window_start: str | None = None,
+        current_reminder_input_id: str | None = None,
     ) -> ModelRequest:
         """纯函数式组装；容量不足明确报错，由调用程序取得更小视图。"""
         if type(max_output_tokens) is not int or max_output_tokens < 0:
@@ -105,6 +119,10 @@ class ContextBuilder:
         # 1. Model owner 保留自身的 call IDs 与 opaque replay，Context 不重造它们。
         snapshot = tuple(snapshot)
         cutoff = _summary_cutoff(snapshot, decoded_materials.summary)
+        reminder = self._reminder_content(decoded_materials)
+        if reminder is None:
+            current_reminder_input_id = None
+        replay_reminder = reminder if current_reminder_input_id is not None else None
         if window_start is not None:
             if decoded_materials.summary is not None:
                 raise ValueError("已有摘要的请求不能重新选择首次窗口")
@@ -115,11 +133,19 @@ class ContextBuilder:
             if start and start not in settled_prefixes(snapshot[:start]):
                 raise ValueError("首次窗口不能切开尚未结算的工具调用")
             cutoff = -1 if start == 0 else snapshot[start - 1].seq
-            rendered = model.render(snapshot, after_seq=cutoff, fresh=True)
+            rendered = model.render(
+                snapshot,
+                after_seq=cutoff,
+                fresh=True,
+                current_reminder=replay_reminder,
+                current_reminder_input_id=current_reminder_input_id,
+            )
         else:
             rendered = model.render(
                 snapshot, after_seq=cutoff,
                 summary_reference=None if decoded_materials.summary is None else decoded_materials.summary.reference,
+                current_reminder=replay_reminder,
+                current_reminder_input_id=current_reminder_input_id,
             )
         if any(
             row["role"] not in {"user", "assistant", "tool"}
@@ -145,7 +171,6 @@ class ContextBuilder:
                 }
             )
         rows.extend(rendered.messages)
-        reminder = self._reminder_content(decoded_materials)
         if reminder is not None:
             rows.append({"role": "user", "content": reminder})
         request = replace(
@@ -175,22 +200,21 @@ class ContextBuilder:
         tools: Sequence[Mapping[str, Any]] = (),
         max_output_tokens: int,
         window_start: str | None = None,
+        current_reminder_input_id: str | None = None,
     ) -> tuple[ModelRequest, str | None]:
         """返回请求及容量拒绝说明；异常类型留在 Context owner 内。"""
         try:
             return self.build(
                 snapshot, materials=materials, model=model, tools=tools,
                 max_output_tokens=max_output_tokens, window_start=window_start,
+                current_reminder_input_id=current_reminder_input_id,
             ), None
         except ContextOverflow as overflow:
             return overflow.request, str(overflow)
-
-
-CONTEXT = ServiceKey[ContextBuilder]("context.v2")
 
 
 async def apply(ctx: Context) -> None:
     config = Config.model_validate(ctx.config)
     _ = await ctx.provide(CONTEXT, ContextBuilder())
     materials = ContextMaterials(ctx, prompt_sources=config.prompt_sources, summary_source=config.summary_source or None)
-    _ = await ctx.provide(MATERIALS, materials, binding_contributors=materials.binding_contributors)
+    _ = await ctx.provide(MATERIALS_V4, materials, binding_contributors=materials.binding_contributors)

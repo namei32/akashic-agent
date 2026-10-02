@@ -2,9 +2,17 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from datetime import datetime
+from copy import deepcopy
 from typing import Protocol
 
 from agent.plugin_composition import Context, EmitEventKey, ServiceKey
+from agent.plugin_contracts.proactive import (
+    DRIFT_DELIVERY_V2,
+    DRIFT_WAKE_V2,
+)
+
+from core.common.file_io import run_file_io
+
 from .store import DriftStore
 
 api_version = 3
@@ -17,133 +25,84 @@ workspace_roots = ()
 workspace_files = ()
 
 
-class DriftWakeServices(Protocol):
-    def snapshot(self, now: datetime) -> Mapping[str, object]: ...
-
-    def select(
-        self,
-        ref: Mapping[str, object],
-        accepted_turn: Mapping[str, object],
-        now: datetime,
-    ) -> Mapping[str, object]: ...
-
-    def transition(self, token: str, action: str) -> Mapping[str, object]: ...
-
-    def selected(self, limit: int = 100) -> tuple[Mapping[str, object], ...]: ...
-
-    def selection(
-        self, accepted_turn: Mapping[str, object]
-    ) -> Mapping[str, object] | None: ...
-
-
-DRIFT_WAKE = ServiceKey[DriftWakeServices]("drift.wake.v1")
-
-
-class DriftProposalServices(Protocol):
-    def propose(
-        self,
-        proposal_id: str,
-        revision: str,
-        payload: Mapping[str, object],
-        due_at: datetime,
-        *,
-        next_due: datetime | None = None,
+class AsyncDriftProposalServices(Protocol):
+    async def propose(
+        self, proposal_id: str, revision: str, payload: Mapping[str, object],
+        due_at: datetime, *, next_due: datetime | None = None,
     ) -> Mapping[str, object]: ...
 
 
-DRIFT_PROPOSALS = ServiceKey[DriftProposalServices]("drift.proposals.v1")
+DRIFT_PROPOSALS_V2 = ServiceKey[AsyncDriftProposalServices]("drift.proposals.v2")
 DRIFT_CHANGED = EmitEventKey[None]("drift.changed")
 
 
-class DriftDeliveryServices(Protocol):
-    def pending(self, limit: int = 100) -> tuple[Mapping[str, object], ...]: ...
+class _AsyncProposalServices:
+    def __init__(self, store: DriftStore, changed: Callable[[], None]) -> None:
+        self._store, self._changed = store, changed
 
-    def lookup(
-        self, accepted_turn: Mapping[str, object]
-    ) -> Mapping[str, object] | None: ...
+    async def propose(
+        self, proposal_id: str, revision: str, payload: Mapping[str, object],
+        due_at: datetime, *, next_due: datetime | None = None,
+    ) -> Mapping[str, object]:
+        """固定来源内容；真实提交后在原 loop 发事件，取消也不丢通知。"""
+        saved_payload = deepcopy(dict(payload))
+        inserted = False
 
-    def settle(
-        self, selection_token: str, settlement_ref: str
-    ) -> Mapping[str, object]: ...
+        def write() -> Mapping[str, object]:
+            nonlocal inserted
+            result = self._store.propose(proposal_id, revision, saved_payload, due_at, next_due=next_due)
+            inserted = result["inserted"] is True
+            return result
+
+        try:
+            return await run_file_io(write)
+        finally:
+            if inserted:
+                self._changed()
 
 
-DRIFT_DELIVERY = ServiceKey[DriftDeliveryServices]("drift.delivery.v1")
-
-
-class _WakeServices:
+class _AsyncWakeServices:
     def __init__(self, store: DriftStore) -> None:
         self._store = store
 
-    def snapshot(self, now: datetime) -> Mapping[str, object]:
-        return self._store.snapshot(now)
+    async def snapshot(self, now: datetime) -> Mapping[str, object]:
+        return await run_file_io(lambda: self._store.snapshot(now))
 
-    def select(
+    async def select(
         self,
         ref: Mapping[str, object],
         accepted_turn: Mapping[str, object],
         now: datetime,
     ) -> Mapping[str, object]:
-        return self._store.select(ref, accepted_turn, now)
+        return await run_file_io(lambda: self._store.select(ref, accepted_turn, now))
 
-    def transition(self, token: str, action: str) -> Mapping[str, object]:
-        return self._store.transition(token, action)
+    async def transition(self, token: str, action: str) -> Mapping[str, object]:
+        return await run_file_io(lambda: self._store.transition(token, action))
 
-    def selected(self, limit: int = 100) -> tuple[Mapping[str, object], ...]:
-        return self._store.selected(limit)
-
-    def selection(
+    async def selection(
         self, accepted_turn: Mapping[str, object]
     ) -> Mapping[str, object] | None:
-        return self._store.selection(accepted_turn)
+        return await run_file_io(lambda: self._store.selection(accepted_turn))
 
 
-class _ProposalServices:
-    def __init__(self, store: DriftStore, changed: Callable[[], None]) -> None:
-        self._store = store
-        self._changed = changed
-
-    def propose(
-        self,
-        proposal_id: str,
-        revision: str,
-        payload: Mapping[str, object],
-        due_at: datetime,
-        *,
-        next_due: datetime | None = None,
-    ) -> Mapping[str, object]:
-        result = self._store.propose(
-            proposal_id,
-            revision,
-            payload,
-            due_at,
-            next_due=next_due,
-        )
-        if result["inserted"]:
-            self._changed()
-        return result
-
-
-class _DeliveryServices:
+class _AsyncDeliveryServices:
     def __init__(self, store: DriftStore) -> None:
         self._store = store
 
-    def pending(self, limit: int = 100) -> tuple[Mapping[str, object], ...]:
-        return self._store.pending_delivery(limit)
-
-    def lookup(
+    async def lookup(
         self, accepted_turn: Mapping[str, object]
     ) -> Mapping[str, object] | None:
-        return self._store.delivery(accepted_turn)
+        return await run_file_io(lambda: self._store.delivery(accepted_turn))
 
-    def settle(self, selection_token: str, settlement_ref: str) -> Mapping[str, object]:
-        return self._store.settle_delivery(selection_token, settlement_ref)
+    async def settle(self, selection_token: str, settlement_ref: str) -> Mapping[str, object]:
+        return await run_file_io(lambda: self._store.settle_delivery(selection_token, settlement_ref))
 
 
 async def apply(ctx: Context) -> None:
     """Publish the narrow Drift view over one generation-scoped store."""
 
     store = DriftStore(ctx.data_root / "drift.sqlite3")
-    store.initialize()
-    _ = await ctx.provide(DRIFT_PROPOSALS, _ProposalServices(store, lambda: ctx.emit(DRIFT_CHANGED, None)))
-    _ = await ctx.provide(DRIFT_WAKE, _WakeServices(store))
-    _ = await ctx.provide(DRIFT_DELIVERY, _DeliveryServices(store))
+    await run_file_io(store.initialize)
+    _ = await ctx.provide(DRIFT_PROPOSALS_V2, _AsyncProposalServices(store, lambda: ctx.emit(DRIFT_CHANGED, None)))
+    _ = await ctx.provide(DRIFT_WAKE_V2, _AsyncWakeServices(store))
+    _ = await ctx.provide(DRIFT_DELIVERY_V2, _AsyncDeliveryServices(store))

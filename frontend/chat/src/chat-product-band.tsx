@@ -1,72 +1,87 @@
-import { BookOpenText, Bot, Gauge, Palette, SlidersHorizontal } from "lucide-react";
+import { Bot, Gauge, Palette, SlidersHorizontal } from "lucide-react";
+import type { KeyboardEvent, ReactNode } from "react";
 import { akashicBrandIcon } from "./akashic-brand";
 
 export interface ChatProductBandProps {
-  surface: "chat" | "runtime";
   chatReady: boolean;
   themeLabel: string;
-  onOpenRuntime: () => void;
   onCycleTheme: () => void;
 }
 
-/** Standalone `/chat` top product band — mirrors dashboard L-shape destinations. */
-export function ChatProductBand({
-  surface,
-  chatReady,
-  themeLabel,
-  onOpenRuntime,
-  onCycleTheme,
-}: ChatProductBandProps) {
-  const dashboardHref = chatReady ? "/" : undefined;
+interface BandItem {
+  id: string;
+  label: string;
+  icon: ReactNode;
+  href?: string;
+  disabled?: boolean;
+}
+
+/** 顶部目的地：普通横排链接导航，视觉与工作台顶栏共用 theme/src/product-band.css。 */
+export function ChatProductBand({ chatReady, themeLabel, onCycleTheme }: ChatProductBandProps) {
+  const items: BandItem[] = [
+    { id: "chat", label: "对话", icon: <Bot size={16} aria-hidden="true" />, href: "/chat" },
+    {
+      id: "workbench",
+      label: "工作台",
+      icon: <Gauge size={16} aria-hidden="true" />,
+      href: chatReady ? "/" : undefined,
+      disabled: !chatReady,
+    },
+    { id: "models", label: "模型", icon: <SlidersHorizontal size={16} aria-hidden="true" />, href: "/#models" },
+  ];
+
+  const onKeyDown = (event: KeyboardEvent<HTMLElement>) => {
+    if (event.key !== "ArrowRight" && event.key !== "ArrowLeft") return;
+    const links = [...event.currentTarget.querySelectorAll<HTMLElement>(".product-band__item:not(.is-disabled)")];
+    const current = links.indexOf(event.target as HTMLElement);
+    if (current < 0) return;
+    event.preventDefault();
+    const next = (current + (event.key === "ArrowRight" ? 1 : -1) + links.length) % links.length;
+    links[next]?.focus();
+  };
 
   return (
-    <header className="chat-product-band" aria-label="Akashic 主导航">
-      <div className="chat-product-band__brand" title="Akashic">
+    <header className="product-band" aria-label="Akashic 主导航">
+      <div className="product-band__brand" title="Akashic">
         <span
-          className="chat-product-band__mark"
+          className="product-band__mark"
           style={{ WebkitMaskImage: `url(${akashicBrandIcon})`, maskImage: `url(${akashicBrandIcon})` }}
           aria-hidden="true"
         />
         <strong>Akashic</strong>
       </div>
-      <nav className="chat-product-band__nav" aria-label="主要功能">
-        <a
-          className={`chat-product-band__item ${surface === "chat" ? "is-active" : ""}`}
-          href="/chat"
-          aria-current={surface === "chat" ? "page" : undefined}
-        >
-          <Bot size={16} aria-hidden="true" />
-          <span>对话</span>
-        </a>
-        {dashboardHref ? (
-          <a className="chat-product-band__item" href={dashboardHref}>
-            <Gauge size={16} aria-hidden="true" />
-            <span>工作台</span>
-          </a>
-        ) : (
-          <span className="chat-product-band__item is-disabled" aria-disabled="true">
-            <Gauge size={16} aria-hidden="true" />
-            <span>工作台</span>
-          </span>
-        )}
-        <button
-          type="button"
-          className={`chat-product-band__item ${surface === "runtime" ? "is-active" : ""}`}
-          aria-current={surface === "runtime" ? "page" : undefined}
-          onClick={onOpenRuntime}
-        >
-          <BookOpenText size={16} aria-hidden="true" />
-          <span>知识与运行</span>
-        </button>
-        <a className="chat-product-band__item" href="/#models">
-          <SlidersHorizontal size={16} aria-hidden="true" />
-          <span>模型</span>
-        </a>
+      <nav className="product-band__nav" aria-label="主要功能" onKeyDown={onKeyDown}>
+        <div className="product-band__track">
+          {items.map((item) => {
+            const current = item.id === "chat";
+            const className = `product-band__item${item.disabled ? " is-disabled" : ""}`;
+            if (item.disabled || !item.href) {
+              return (
+                <span key={item.id} className={className} aria-disabled={item.disabled || undefined}>
+                  {item.icon}
+                  <span>{item.label}</span>
+                </span>
+              );
+            }
+            return (
+              <a
+                key={item.id}
+                className={className}
+                href={item.href}
+                tabIndex={current ? 0 : -1}
+                aria-current={current ? "page" : undefined}
+              >
+                {item.icon}
+                <span>{item.label}</span>
+              </a>
+            );
+          })}
+        </div>
       </nav>
-      <div className="chat-product-band__footer">
-        <button type="button" className="chat-product-band__item" onClick={onCycleTheme} title={`主题 · ${themeLabel}`}>
+      <div className="product-band__footer">
+        <button type="button" className="product-band__action" onClick={onCycleTheme} title={`主题 · ${themeLabel}`}>
           <Palette size={16} aria-hidden="true" />
-          <span className="chat-product-band__theme-label">{themeLabel}</span>
+          <span className="product-band__theme-label">{themeLabel}</span>
         </button>
       </div>
     </header>

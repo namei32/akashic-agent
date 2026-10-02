@@ -1,15 +1,18 @@
 """Codex must accept the immutable messages and tools in a ModelRequest."""
 
 import json
-from dataclasses import replace
 
 import httpx
 import pytest
 
-from agent.plugin_composition import ModelRequest
+from agent.plugin_composition import (
+    BoundModelDescriptor,
+    CapabilitySources,
+    ModelCapabilities,
+    ModelRequest,
+)
 from core.net.http import HttpClient
 from plugins.codex.responses import CodexResponses
-from tests.model_plugin_fakes import BoundChatModelFake
 
 
 @pytest.mark.asyncio
@@ -50,7 +53,14 @@ async def test_frozen_request_can_be_estimated_and_sent(lite):
     driver = CodexResponses(
         http=http,
         credential=Credential(),
-        descriptor=replace(BoundChatModelFake(object()).descriptor, driver_id="codex"),
+        descriptor=BoundModelDescriptor(
+            binding_id="test-binding", plugin_snapshot_id="test-plugin-snapshot",
+            model_revision=1, model_id="test-runtime", connection_id="test-connection",
+            driver_id="codex", driver_contract_version="1", auth_identity="test",
+            model="test-model", role="agent", reasoning_effort=None,
+            capabilities=ModelCapabilities(), capability_sources=CapabilitySources(),
+            capability_digest="test-capabilities",
+        ),
         config={"use_responses_lite": lite},
     )
     try:

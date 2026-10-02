@@ -6,17 +6,28 @@ import inspect
 import re
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Protocol, cast
 from types import MappingProxyType, ModuleType
+from typing import Any, Protocol, cast
 
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
-from starlette.convertors import FloatConvertor, IntegerConvertor, PathConvertor, StringConvertor, UUIDConvertor
+from starlette.convertors import (
+    FloatConvertor,
+    IntegerConvertor,
+    PathConvertor,
+    StringConvertor,
+    UUIDConvertor,
+)
 from starlette.routing import WebSocketRoute
 
 from agent.plugin_composition import Context, DashboardContext
 from agent.plugin_composition.diagnostics import plugin_entrypoint
-from agent.plugin_composition.model import CompositionError, ServiceKey, resolve_declared_workspace_file, resolve_declared_workspace_root
+from agent.plugin_composition.model import (
+    CompositionError,
+    ServiceKey,
+    resolve_declared_workspace_file,
+    resolve_declared_workspace_root,
+)
 from agent.plugin_composition.ui import UI, DashboardBinding, DashboardRoute
 
 
@@ -31,10 +42,18 @@ class Closeable(Protocol):
 class DashboardResources:
     """保留实际模块和关闭顺序；失败时不先解除 owner。"""
 
-    def __init__(self, ctx: Context, loader: Callable[[], ModuleType], *, has_web: bool) -> None:
+    def __init__(
+        self,
+        ctx: Context,
+        loader: Callable[[], ModuleType],
+        *,
+        has_web: bool,
+        registry: object,
+    ) -> None:
         self.ctx = ctx
         self.loader = loader
         self.has_web = has_web
+        self._registry = registry
         self.closeables: list[Closeable] = []
         self._started = False
 
@@ -47,7 +66,8 @@ class DashboardResources:
 
     def build(
         self, *, occupied: list[DashboardRoute],
-        workload_urls: Mapping[tuple[str, str], str], validation: bool,
+        workload_urls: Mapping[tuple[str, str], str],
+        validation: bool,
     ) -> DashboardBinding:
         """延迟加载原包模块，校验域路由，并保留实际返回的资源。"""
         # 1. 同一次资源取得只能执行一次；失败由原 Effect 清理。
@@ -91,11 +111,14 @@ class DashboardResources:
                 or len(set(dependencies)) != len(dependencies)):
             raise ValueError("Dashboard inject 必须是不重复的 ServiceKey tuple")
 
-        def resolve(key: ServiceKey[object]) -> object:
+        def resolve(key: ServiceKey[Any]) -> object:
             """只在路由实际租约内解析声明能力，旧 Dashboard 不能借新 generation。"""
             if key not in dependencies:
                 raise CompositionError("SERVICE_UNDECLARED", f"Dashboard 未声明能力: {key.name}")
-            ctx.require_runtime_owner(UI, ctx.require(UI))
+            # 旧 generation 的 Fiber 已退役：scope 校验不能先经 ctx.require
+            # 取服务（INACTIVE_SERVICE 会吞掉 runtime scope 拒绝）。直接以
+            # 注册时的实际 Ui 实例证明 owner 归属。
+            ctx.require_runtime_owner(UI, self._registry)
             return ctx.require(key)
 
         dashboard_context = DashboardContext(
@@ -104,6 +127,7 @@ class DashboardResources:
             data_root=data_root,
             validation=validation,
             _resolve=resolve,
+            _context=ctx,
             _workspace_roots=tuple(
                 (name, resolve_declared_workspace_root(workspace, name))
                 for name in workspace_roots
@@ -152,9 +176,9 @@ class DashboardResources:
             plugin_id=runtime.plugin_id,
             app=app,
             routes=routes,
+            context=ctx,
             runtime_workspace=workspace,
             runtime_data_root=data_root,
-            validation=validation,
             module_name=module.__name__,
             generation_id=runtime.generation_id,
             has_web=self.has_web,

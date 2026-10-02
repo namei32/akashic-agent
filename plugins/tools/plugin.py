@@ -1,28 +1,61 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from dataclasses import dataclass
+import inspect
 import re
-from typing import Literal, Protocol, cast
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
+from dataclasses import dataclass
+from typing import cast
 
-from agent.plugin_composition import Context, Effect, ServiceKey, RUNTIME_STARTED, RUNTIME_STOPPING
-from agent.plugin_composition.bindings import Bindings
-from agent.plugin_contracts import CallRef, ContentPart, ContentReferences, ToolResult, freeze_json
-from agent.plugin_composition.messages import MessageReader
-from agent.plugin_composition.tasks import ExternalRootPermit
-
-from .api import (
-    Authorize, BoundTool, CallSource, MessageReply, ProviderBoundTool, Result,
-    coerce_result, display_name, result_message_id,
+from agent.plugin_composition import (
+    RUNTIME_STARTED,
+    RUNTIME_STOPPING,
+    Context,
+    Effect,
 )
+from agent.plugin_composition.bindings import BINDINGS, Bindings
+from agent.plugin_composition.messages import (
+    MESSAGE_CATALOG,
+    MESSAGE_WRITERS,
+    OWNER_STATE,
+    MessageReader,
+)
+from agent.plugin_composition.tasks import TASKS, ExternalRootPermit, TaskAdmission
+from agent.plugin_contracts import (
+    CallRef,
+    ContentPart,
+    ContentReferences,
+    ToolResult,
+    freeze_json,
+)
+from agent.plugin_contracts.content import (
+    CONTENT as CONTENT,
+)
+from agent.plugin_contracts.tools import (
+    ALL_TOOLS as ALL_TOOLS,
+    TOOL_BIND_SAVED as TOOL_BIND_SAVED,
+    TOOL_DISPLAY_NAME as TOOL_DISPLAY_NAME,
+    TOOLS as TOOLS,
+    ToolRef as ToolRef,
+    ToolView as ToolView,
+    tool_key,
+)
+
 from .abandon import follow_abandon, reject_start
+from .api import (
+    Authorize,
+    BoundTool,
+    CallSource,
+    MessageReply,
+    ProviderBoundTool,
+    Result,
+    coerce_result,
+    display_name,
+    result_message_id,
+)
 from .execution import ToolExecution
 from .program import TOOL_PROGRAM, ToolProgramFactory
-from agent.plugin_composition.bindings import BINDINGS
-from agent.plugin_composition.messages import MESSAGE_CATALOG, MESSAGE_WRITERS, OWNER_STATE
-from agent.plugin_composition.tasks import TASKS
 
 api_version = 3
 name = "tools"
@@ -30,34 +63,29 @@ version = "1.0.0"
 desc = "声明工具并固定实际实现；一次调用的回执独立于会话"
 
 
-ContentCheck = Callable[[ContentPart], ContentReferences]
-
-
-class ContentViewCapability(Protocol):
-    @property
-    def checks(self) -> Mapping[str, ContentCheck]: ...
-
-
-class ContentCapability(Protocol):
-    def bind(self) -> AbstractAsyncContextManager[ContentViewCapability]: ...
+def _matches_saved_description(current: Mapping[str, object], saved: Mapping[str, object]) -> bool:
+    """Accept only the two retired display fields from an archived v2 binding."""
+    if current == saved:
+        return True
+    legacy = dict(saved)
+    risk = legacy.pop("risk", None)
+    hint = legacy.pop("search_hint", None)
+    if (
+        "risk" in saved and risk not in {"read-only", "read-write", "external-side-effect"}
+        or "search_hint" in saved and hint is not None and not isinstance(hint, str)
+    ):
+        return False
+    return ("risk" in saved or "search_hint" in saved) and legacy == current
 
 
 # 与 content owner 共享名字，不共享其实现模块或 Python 类型身份。
-CONTENT = ServiceKey[ContentCapability]("content.v2")
-inject = (CONTENT,)
+
+inject = (CONTENT, BINDINGS, MESSAGE_CATALOG, MESSAGE_WRITERS, OWNER_STATE, TASKS)
 
 Prepare = Callable[[Mapping[str, object]], Awaitable[Mapping[str, object]]]
 BindingAuthorize = Callable[[Mapping[str, object]], Awaitable[str | None]]
 OpenTarget = Callable[[Mapping[str, object]], AbstractAsyncContextManager[ProviderBoundTool]]
-Capture = Callable[[Mapping[str, object]], Mapping[str, object]]
-
-
-@dataclass(frozen=True, slots=True)
-class ToolRef:
-    """引用当前 composition Root 中的一次真实工具注册。"""
-
-    name: str
-    description: Mapping[str, object]
+Capture = Callable[[Mapping[str, object]], Mapping[str, object] | Awaitable[Mapping[str, object]]]
 
 
 @dataclass(slots=True)
@@ -68,33 +96,7 @@ class _Registration:
     capture: Capture | None
     preparation: _Preparation | None = None
     authorization: _Authorization | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class ToolView:
-    """消费者获授的一组真实工具引用。"""
-
-    refs: tuple[ToolRef, ...]
-
-    def __post_init__(self) -> None:
-        refs = tuple(self.refs)
-        names = tuple(ref.name for ref in refs)
-        if len(set(names)) != len(names):
-            raise ValueError("工具 view 不能包含重复名称")
-        object.__setattr__(self, "refs", refs)
-
-    def select(self, name: str) -> ToolRef:
-        for ref in self.refs:
-            if ref.name == name:
-                return ref
-        raise PermissionError(f"工具不属于获授 view: {name}")
-
-    def without(self, names: frozenset[str]) -> ToolView:
-        return ToolView(tuple(ref for ref in self.refs if ref.name not in names))
-
-    @classmethod
-    def combine(cls, *views: ToolView) -> ToolView:
-        return cls(tuple(ref for view in views for ref in view.refs))
+    parallel: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,7 +134,8 @@ class _ToolView:
         """贡献先转换，实际工具一次接纳最终参数；授权在这之后执行。"""
         self._check_active()
         if self._preparation is not None:
-            arguments = await self._preparation.prepare(arguments)
+            async with self._preparation.context.runtime_scope():
+                arguments = await self._preparation.prepare(arguments)
             self._check_active()
         result = await self._target.prepare(arguments, source)
         self._check_active()
@@ -154,8 +157,9 @@ class _ToolView:
 class ToolCatalog:
     """普通注册表拥有工具描述、目标与参数准备；不管理消息或循环。"""
 
-    def __init__(self, ctx: Context):
+    def __init__(self, ctx: Context, task_admission: TaskAdmission):
         self._ctx = ctx
+        self._task_admission = task_admission
         self._tools: dict[str, _Registration] = {}
         self._groups: dict[str, tuple[bool, str]] = {}
 
@@ -193,8 +197,7 @@ class ToolCatalog:
         capture: Capture | None = None,
         public: bool = True,
         idempotent: bool = False,
-        risk: Literal["read-only", "read-write", "external-side-effect"] = "read-write",
-        search_hint: str | None = None,
+        parallel: bool = False,
     ) -> ToolRef:
         """目标自行校验参数 schema；注册表固定发现描述与真实资源入口。"""
         self._check_context(ctx)
@@ -205,14 +208,10 @@ class ToolCatalog:
             raise ValueError("工具名或描述无效")
         if parameters.get("type") != "object":
             raise ValueError("工具参数必须声明 object schema")
-        if risk not in {"read-only", "read-write", "external-side-effect"}:
-            raise ValueError("工具风险声明无效")
-        if search_hint is not None and not isinstance(search_hint, str):
-            raise TypeError("工具搜索提示必须是字符串或 None")
-        if any(type(value) is not bool for value in (idempotent, public)):
-            raise TypeError("工具执行和发现选项必须是 bool")
+        if any(type(value) is not bool for value in (idempotent, public, parallel)):
+            raise TypeError("工具执行选项必须是 bool")
         if capture is not None and not callable(capture):
-            raise TypeError("工具 capture 必须是同步回调")
+            raise TypeError("工具 capture 必须是可调用对象")
         descriptor = cast(
             Mapping[str, object],
             freeze_json(
@@ -223,14 +222,12 @@ class ToolCatalog:
                     "description": description,
                     "parameters": parameters,
                     "idempotent": idempotent,
-                    "risk": risk,
-                    "search_hint": search_hint,
                 }
             ),
         )
 
         reference = ToolRef(name, descriptor)
-        registration = _Registration(reference, ctx, open, capture)
+        registration = _Registration(reference, ctx, open, capture, parallel=parallel)
 
         def setup() -> Callable[[], None]:
             if name in self._tools:
@@ -242,7 +239,18 @@ class ToolCatalog:
 
             return cleanup
 
-        _ = await ctx.effect(setup, label=f"tool:{name}")
+        effect = await ctx.effect(setup, label=f"tool:{name}")
+        try:
+            _ = await ctx.provide(tool_key(name), reference)
+        except BaseException as error:
+            # 发布失败时撤销本次目录注册，避免留下无法声明依赖的工具。
+            try:
+                await effect.aclose()
+            except BaseException as cleanup_error:
+                raise BaseExceptionGroup(
+                    f"工具发布与目录撤销失败: {name}", [error, cleanup_error],
+                ) from None
+            raise
         return reference
 
     async def register_prepare(
@@ -290,6 +298,11 @@ class ToolCatalog:
             return cleanup
 
         return await ctx.effect(setup, label=f"tool-authorize:{name}")
+
+    def allows_parallel(self, name: str) -> bool:
+        """调度只读取 owner 声明；未知工具一律不能重叠。"""
+        registration = self._tools.get(name)
+        return registration is not None and registration.parallel
 
     def _check_context(self, ctx: Context) -> None:
         if ctx.root_instance_token is not self._ctx.root_instance_token:
@@ -341,9 +354,10 @@ class ToolCatalog:
         """清理 owner 等待原效果退出；终态结果不等于资源已经释放。"""
         from .api import durable_call_key
 
-        tasks = self._ctx.require(TASKS).open(self._ctx)
         for ref in calls:
-            task = await tasks.admit(("effects", durable_call_key(ref)), lambda slot: slot.current)
+            task = await self._task_admission.admit(
+                ("effects", durable_call_key(ref)), lambda slot: slot.current,
+            )
             if task is not None:
                 try:
                     _ = await task.join()
@@ -352,12 +366,11 @@ class ToolCatalog:
                     if caller is not None and caller.cancelling():
                         raise
 
-    def bind(
+    async def bind(
         self, ref: ToolRef, bindings: Bindings, *,
         configuration: Mapping[str, object] | None = None,
     ) -> str:
         """从真实注册 Context 固定闭包，不让调用者省略准备贡献或重选目标。"""
-        name = ref.name
         registration = self._registration(ref)
         preparation = registration.preparation
         authorization = registration.authorization
@@ -368,41 +381,57 @@ class ToolCatalog:
             *(() if preparation is None else (preparation.context,)),
             *(() if authorization is None else (authorization.context,)),
         )
-        state: Mapping[str, object] | None = None
-        if registration.capture is not None:
-            _ = self._ctx.require_runtime_owner(TOOLS, self)
-            options = freeze_json({} if configuration is None else configuration)
-            if not isinstance(options, Mapping):
-                raise TypeError("工具 binding 配置必须是 JSON 对象")
-            captured = freeze_json(registration.capture(cast(Mapping[str, object], options)))
-            if not isinstance(captured, Mapping):
-                raise TypeError("工具 binding state 必须是 JSON 对象")
-            state = cast(Mapping[str, object], captured)
-        return bindings.bind(
-            TOOLS,
-            {
-                "tool": ref.description,
-                "prepare": None if preparation is None else preparation.name,
-                **({"authorize": authorization.name} if authorization is not None else {}),
-                **({"state": state} if state is not None else {}),
-            },
-            contributors=contributors,
-        )
+        async with self._ctx.runtime_scope(), AsyncExitStack() as stack:
+            # capture 可以挂起；实际贡献者在绑定提交前都不能被排空。
+            for contributor in dict.fromkeys(contributors):
+                await stack.enter_async_context(contributor.runtime_scope())
+            state: Mapping[str, object] | None = None
+            if registration.capture is not None:
+                _ = self._ctx.require_runtime_owner(TOOLS, self)
+                options = freeze_json({} if configuration is None else configuration)
+                if not isinstance(options, Mapping):
+                    raise TypeError("工具 binding 配置必须是 JSON 对象")
+                prepared = registration.capture(cast(Mapping[str, object], options))
+                if inspect.isawaitable(prepared):
+                    prepared = await prepared
+                captured = freeze_json(prepared)
+                if not isinstance(captured, Mapping):
+                    raise TypeError("工具 binding state 必须是 JSON 对象")
+                state = cast(Mapping[str, object], captured)
+            return bindings.bind(
+                TOOLS,
+                {
+                    "tool": ref.description,
+                    "prepare": None if preparation is None else preparation.name,
+                    **({"authorize": authorization.name} if authorization is not None else {}),
+                    **({"state": state} if state is not None else {}),
+                },
+                contributors=contributors,
+            )
 
-    def _bind_saved(
+    async def bind_scoped(
+        self, ref: ToolRef, bindings: Bindings, *,
+        configuration: Mapping[str, object] | None = None,
+    ) -> str:
+        """Capture one tool under both its registry and contributor owners."""
+        return await self.bind(ref, bindings, configuration=configuration)
+
+    async def bind_saved(
         self,
         metadata: Mapping[str, object],
         bindings: Bindings,
         *,
         configuration: Mapping[str, object],
     ) -> str:
-        """从已归档的精确注册派生新配置，不按当前名称重选实现。"""
+        """核对原业务描述后派生新配置，不改选另一个工具。"""
         description = metadata.get("tool")
         if not isinstance(description, Mapping):
             raise ValueError("工具 binding 描述无效")
         name = description.get("name")
         registration = self._tools.get(name) if isinstance(name, str) else None
-        if registration is None or registration.ref.description != description:
+        if registration is None or not _matches_saved_description(
+            registration.ref.description, description
+        ):
             raise ValueError("工具 binding 与归档注册不一致")
         preparation = registration.preparation
         authorization = registration.authorization
@@ -418,7 +447,7 @@ class ToolCatalog:
             raise ValueError("工具 binding 参数准备与归档注册不一致")
         if authorization is not None and metadata["authorize"] != authorization.name:
             raise ValueError("工具 binding 限制与归档注册不一致")
-        return self.bind(
+        return await self.bind_scoped(
             registration.ref,
             bindings,
             configuration=configuration,
@@ -433,7 +462,7 @@ class ToolCatalog:
 
     @asynccontextmanager
     async def open(self, metadata: Mapping[str, object]) -> AsyncIterator[BoundTool]:
-        """只启动所选目标；资源和环境由实际目标 owner 按归档身份打开。"""
+        """核对固定业务描述后打开当前工具，由实际 owner 保留执行资源。"""
         if not isinstance(metadata.get("tool"), Mapping):
             raise ValueError("工具 binding 描述无效")
         description = cast(Mapping[str, object], metadata["tool"])
@@ -442,7 +471,7 @@ class ToolCatalog:
             raise ValueError("工具 binding 缺少工具名")
         registration = self._tools[name]
         preparation = registration.preparation
-        if registration.ref.description != description or metadata["prepare"] != (
+        if not _matches_saved_description(registration.ref.description, description) or metadata["prepare"] != (
             None if preparation is None else preparation.name
         ):
             raise ValueError("归档工具描述或参数准备与 binding 不一致")
@@ -468,14 +497,15 @@ class ToolCatalog:
                 raise ValueError("工具 binding state 必须是 JSON 对象")
             state = cast(Mapping[str, object], captured)
         async with self._ctx.runtime_scope():
-            async with registration.open(state) as target:
-                if target.idempotent != description["idempotent"]:
-                    raise ValueError("工具幂等协议与固定描述不一致")
-                view = _ToolView(target, preparation)
-                try:
-                    yield view
-                finally:
-                    view.close()
+            async with registration.context.runtime_scope():
+                async with registration.open(state) as target:
+                    if target.idempotent != description["idempotent"]:
+                        raise ValueError("工具幂等协议与固定描述不一致")
+                    view = _ToolView(target, preparation)
+                    try:
+                        yield view
+                    finally:
+                        view.close()
 
     async def authorize(
         self, metadata: Mapping[str, object], arguments: Mapping[str, object]
@@ -489,22 +519,20 @@ class ToolCatalog:
         registration = self._tools.get(cast(str, description["name"]))
         authorization = (
             None
-            if registration is None or registration.ref.description != description
-            else registration.authorization
+            if registration is None or not _matches_saved_description(
+                registration.ref.description, description
+            ) else registration.authorization
         )
         if authorization is None or metadata["authorize"] != authorization.name:
             raise ValueError("归档工具限制与 binding 不一致")
         async with self._ctx.runtime_scope():
-            return await authorization.authorize(arguments)
-
-TOOLS = ServiceKey[ToolCatalog]("tools.v1")
-ALL_TOOLS = ServiceKey[Callable[[], ToolView]]("tools.all.v1")
-TOOL_DISPLAY_NAME = ServiceKey[Callable[[str], str]]("tools.display-name.v1")
+            async with authorization.context.runtime_scope():
+                return await authorization.authorize(arguments)
 
 
 @asynccontextmanager
 async def open_tool(bindings: Bindings, binding_id: str) -> AsyncIterator[BoundTool]:
-    """真实 binding 选出归档注册表，目标 facade 拥有其资源 lease。"""
+    """当前注册表校验原 binding，目标 facade 拥有其执行资源。"""
     async with bindings.open(binding_id, TOOLS) as (catalog, metadata):
         async with catalog.open(metadata) as target:
             yield target
@@ -516,9 +544,9 @@ async def bind_saved_tool(
     *,
     configuration: Mapping[str, object],
 ) -> str:
-    """从真实原 binding 派生新配置，并保留它的归档 provider 闭包。"""
+    """从原 binding 派生新配置，由当前兼容 provider 保存来源证据。"""
     async with bindings.open(binding_id, TOOLS) as (catalog, metadata):
-        return catalog._bind_saved(
+        return await catalog.bind_saved(
             metadata,
             bindings,
             configuration=configuration,
@@ -526,8 +554,9 @@ async def bind_saved_tool(
 
 
 async def apply(ctx: Context) -> None:
-    catalog = ToolCatalog(ctx)
-    _ = await ctx.provide(ServiceKey("tools.bind-saved.v1"), bind_saved_tool)
+    task_admission = ctx.require(TASKS).open(ctx)
+    catalog = ToolCatalog(ctx, task_admission)
+    _ = await ctx.provide(TOOL_BIND_SAVED, bind_saved_tool)
     _ = await ctx.provide(TOOLS, catalog)
     _ = await ctx.provide(TOOL_PROGRAM, ToolProgramFactory(ctx, catalog))
     _ = await ctx.provide(ALL_TOOLS, catalog._all_view)

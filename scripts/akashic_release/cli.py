@@ -10,7 +10,7 @@ _SOURCE_ROOT = Path(__file__).resolve().parents[2]
 if str(_SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(_SOURCE_ROOT))
 
-from scripts.akashic_release.activate import activate_release
+from scripts.akashic_release.activate import activate_release, resume_release
 from scripts.akashic_release.doctor import verify_release
 from scripts.akashic_release.manifest import read_json, release_lock
 from scripts.akashic_release.migrate import migration_plan
@@ -21,8 +21,6 @@ from scripts.akashic_release.prepare import (
 )
 from scripts.akashic_release.source import commit_subject, resolve_target
 from scripts.akashic_release.source import verify_bootstrap_checkout
-from scripts.akashic_release.systemd import install_units
-from scripts.akashic_release.systemd import install_operator_entrypoint
 from scripts.akashic_release.systemd import verify_external_service_contract
 
 _DEFAULT_ORIGIN = "https://github.com/kachofugetsu09/akashic-agent.git"
@@ -61,6 +59,11 @@ def install(args: argparse.Namespace) -> dict[str, object]:
     )
     _confirm(commit, commit_subject(checkout, run=_run), current, yes=args.yes)
 
+    if args.inputs is not None and args.plan is None:
+        raise ValueError("--inputs 需要 --plan")
+    if args.no_activate and (args.plan is not None or args.backup):
+        raise ValueError("--no-activate 只准备产物；部署清单和备份选项在实际安装时提供")
+
     with release_lock(paths.run / "release.lock"):
         paths.create_layout()
         verify_host_prerequisites(mise=args.mise, run=_run)
@@ -72,17 +75,8 @@ def install(args: argparse.Namespace) -> dict[str, object]:
             origin=args.origin,
             mise=args.mise,
             run=_run,
-        )
-        units_changed = install_units(
-            checkout=paths.source(commit),
-            backup_root=paths.backups,
-            run=_run,
-            unit_root=args.unit_root,
-        )
-        cli_changed = install_operator_entrypoint(
-            checkout=paths.source(commit),
-            backup_root=paths.backups,
-            target=args.cli_path,
+            runtime_env=args.runtime_env,
+            installed_unit=args.unit_root / "akashic-host-bridge.service",
         )
         status = "prepared"
         if not args.no_activate:
@@ -92,13 +86,16 @@ def install(args: argparse.Namespace) -> dict[str, object]:
                 environment_file=args.runtime_env,
                 mise=args.mise,
                 run=_run,
+                plan=args.plan,
+                inputs=args.inputs,
+                backup=args.backup,
+                unit_root=args.unit_root, cli_path=args.cli_path,
             )
     return {
         "status": status,
         "commit": commit,
         "imageId": manifest["imageId"],
-        "unitsChanged": units_changed,
-        "cliChanged": cli_changed,
+        "backupRequested": args.backup,
     }
 
 
@@ -107,26 +104,13 @@ def doctor(args: argparse.Namespace) -> dict[str, object]:
     return {"status": "healthy", "runtimeEnv": str(args.runtime_env)}
 
 
-def rollback(args: argparse.Namespace) -> dict[str, object]:
+def resume(args: argparse.Namespace) -> dict[str, object]:
     paths = ReleasePaths(args.root.resolve(strict=True))
-    previous_path = paths.activation / "previous.json"
-    previous = str(read_json(previous_path)["targetCommit"])
-    _confirm(previous, "previous prepared generation", None, yes=args.yes)
     with release_lock(paths.run / "release.lock"):
-        status = activate_release(
-            paths=paths,
-            manifest_path=paths.release(previous),
-            environment_file=args.runtime_env,
-            mise=args.mise,
-            run=_run,
-        )
-    return {"status": status, "commit": previous}
-
-
-def pair_mobile(args: argparse.Namespace) -> dict[str, object]:
-    from scripts.akashic_release.mobile_pair import pair_mobile as run_pairing
-
-    return run_pairing(args.runtime_env)
+        status = resume_release(paths=paths, attempt_path=args.attempt,
+                                environment_file=args.runtime_env, mise=args.mise, run=_run,
+                                unit_root=args.unit_root, cli_path=args.cli_path)
+    return {"status": status, "attempt": str(args.attempt)}
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -148,22 +132,23 @@ def _parser() -> argparse.ArgumentParser:
     )
     install_parser.add_argument("--yes", action="store_true")
     install_parser.add_argument("--no-activate", action="store_true")
+    install_parser.add_argument("--plan", type=Path, help="显式外置插件目标；省略时更新 Core/Bridge 与内置 preset，并先执行必要内置迁移")
+    install_parser.add_argument("--inputs", type=Path, help="清单引用的 bundle/wheels 目录")
+    install_parser.add_argument("--backup", action="store_true", help="停止期备份 state 和 runtime.env；默认不备份")
     install_parser.set_defaults(handler=install)
 
     doctor_parser = subparsers.add_parser("doctor")
     doctor_parser.add_argument("--runtime-env", type=Path, default=_DEFAULT_ENV)
     doctor_parser.set_defaults(handler=doctor)
 
-    rollback_parser = subparsers.add_parser("rollback")
-    rollback_parser.add_argument("--root", type=Path, default=_DEFAULT_ROOT)
-    rollback_parser.add_argument("--runtime-env", type=Path, default=_DEFAULT_ENV)
-    rollback_parser.add_argument("--mise", type=Path, default=_DEFAULT_MISE)
-    rollback_parser.add_argument("--yes", action="store_true")
-    rollback_parser.set_defaults(handler=rollback)
-
-    pair_parser = subparsers.add_parser("pair-mobile")
-    pair_parser.add_argument("--runtime-env", type=Path, default=_DEFAULT_ENV)
-    pair_parser.set_defaults(handler=pair_mobile)
+    resume_parser = subparsers.add_parser("resume", help="只重试已发布版本的启动和验收")
+    resume_parser.add_argument("--root", type=Path, default=_DEFAULT_ROOT)
+    resume_parser.add_argument("--runtime-env", type=Path, default=_DEFAULT_ENV)
+    resume_parser.add_argument("--mise", type=Path, default=_DEFAULT_MISE)
+    resume_parser.add_argument("--attempt", type=Path, required=True)
+    resume_parser.add_argument("--unit-root", type=Path, default=Path("/etc/systemd/system"))
+    resume_parser.add_argument("--cli-path", type=Path, default=Path.home() / ".local/bin/akashic-release")
+    resume_parser.set_defaults(handler=resume)
 
     migrate_parser = subparsers.add_parser("migrate")
     migrate_parser.add_argument("--snapshot-manifest", type=Path, required=True)

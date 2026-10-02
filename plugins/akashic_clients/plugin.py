@@ -8,19 +8,22 @@ from agent.plugin_composition import (
     InboundIdentity,
 )
 
-from .capabilities import CLIENT_CAPABILITIES
+from .capabilities import CLIENT_CAPABILITIES, INSPECTION_RPC_KEYS
+from agent.plugin_composition.models import MODEL_CALL_STATS
 from .channel import build_akashic_channel_factory
-from agent.plugin_composition.channels import CHANNEL_INPUT
+from agent.plugin_composition.channels import CHANNEL_INPUT_V2 as CHANNEL_INPUT
 from .config import AkashicClientsConfig
+from .navigation import NavigationPreferences
+from agent.plugin_composition.messages import OWNER_STATE
 
 api_version = 3
 name = "akashic_clients"
 version = "1.0.0"
-desc = "Web and Mobile Akashic client channel"
+desc = "Web Akashic client channel"
 author = "Akashic"
 # Every dependency is a separate composition capability.  In particular,
 # there is no client-wide service bus for Core to assemble.
-inject = (CHANNELS, CHANNEL_INPUT, *CLIENT_CAPABILITIES)
+inject = (CHANNELS, CHANNEL_INPUT, OWNER_STATE, *CLIENT_CAPABILITIES)
 Config = AkashicClientsConfig
 
 
@@ -43,8 +46,12 @@ async def apply(ctx: Context) -> None:
                     ChannelCapability.TURN_STREAM,
                 }
             ),
-            factory=build_akashic_channel_factory(config, ctx.runtime.workspace),
+            factory=build_akashic_channel_factory(
+                config, ctx.runtime.workspace,
+                NavigationPreferences(lambda: ctx.require(OWNER_STATE).open(ctx)),
+            ),
             inbound_identity=InboundIdentity.PROVIDER_MESSAGE_ID,
+            optional_services=frozenset((*INSPECTION_RPC_KEYS, MODEL_CALL_STATS)),
         ),
     )
 

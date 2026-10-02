@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 
+from core.common.file_io import run_file_io
+
 from agent.plugin_composition.context import Context
 from agent.plugin_composition.effect import Effect
 from agent.plugin_composition.model import ServiceKey
@@ -23,6 +25,7 @@ from session.log import (
     SessionAttributes as SessionAttributes,
     WriterExpired as WriterExpired,
     MessageConflict as MessageConflict,
+    SourceHeadConflict as SourceHeadConflict,
     InvalidPage as InvalidPage,
 )
 from session.message import Body, CallRef, ContentPart, ContentReferences, Control, Input, Output, ToolCall, ToolResult
@@ -109,10 +112,24 @@ class OwnerState:
     def __init__(self, log: _MessageLog | None):
         self._log = log
 
+    @property
+    def available(self) -> bool:
+        """Tell providers whether this Root has formal owner storage."""
+        return self._log is not None
+
     def open(self, ctx: Context) -> OwnerStore:
         if self._log is None:
             raise RuntimeError("candidate 验证期禁止访问正式 owner state")
         return self._log.owner("plugin:" + ctx.require_runtime_owner(OWNER_STATE, self))
+
+    def open_scoped(self, ctx: Context, scope: str) -> OwnerStore:
+        """同一 owner 的独立子空间；其他消费者的 key 扫描互不可见。"""
+        if self._log is None:
+            raise RuntimeError("candidate 验证期禁止访问正式 owner state")
+        if not isinstance(scope, str) or not scope or ":" in scope:
+            raise ValueError("owner state 子空间名必须是非空且不含冒号的字符串")
+        owner = ctx.require_runtime_owner(OWNER_STATE, self)
+        return self._log.owner(f"plugin:{owner}:{scope}")
 
 
 class SessionAdmission:
@@ -120,12 +137,58 @@ class SessionAdmission:
 
     def __init__(self, log: _MessageLog | None):
         self._log = log
+        self._dimensions: dict[str, tuple[Context, Callable[[str], None]]] = {}
+
+    # 每个 scope 维度只有一个 owner 负责校验取值；卸载只释放内存注册。
+    async def register_dimension(
+        self, ctx: Context, *, name: str, check: Callable[[str], None],
+    ) -> Effect:
+        if ctx.require(SESSION_ADMISSION) is not self:
+            raise PermissionError("维度注册不属于当前 SessionAdmission")
+        _ = SessionAttributes(scope=((name, "probe"),))
+        def setup():
+            if name in self._dimensions:
+                raise ValueError(f"Session 维度已有 owner: {name}")
+            self._dimensions[name] = (ctx, check)
+            def cleanup() -> None:
+                del self._dimensions[name]
+            return cleanup
+        return await ctx.effect(setup, label="session-dimension:" + name)
 
     def ensure(self, ctx: Context, session_id: str, attributes: SessionAttributes) -> SessionAttributes:
         if self._log is None:
             raise RuntimeError("candidate 验证期禁止接纳正式 Session")
         _ = ctx.require_runtime_owner(SESSION_ADMISSION, self)
+        # 1. 维度值只在首次接纳时由其 owner 校验；已有 Session 只比较固定事实。
+        if attributes.scope and not self._admitted(session_id):
+            self._check_dimensions(attributes)
+        # 2. 固定事实写入与冲突检查仍由同一个 create-once 事务完成。
         return self._log.ensure_session(session_id, attributes)
+
+    async def ensure_async(self, ctx: Context, session_id: str, attributes: SessionAttributes) -> SessionAttributes:
+        """原 scope 校验维度；完整 create-once 事务进入文件线程并排空取消。"""
+        log = self._log
+        if log is None:
+            raise RuntimeError("candidate 验证期禁止接纳正式 Session")
+        _ = ctx.require_runtime_owner(SESSION_ADMISSION, self)
+        if attributes.scope and not await run_file_io(lambda: self._admitted(session_id)):
+            self._check_dimensions(attributes)
+        return await log.ensure_session_async(session_id, attributes)
+
+    def _check_dimensions(self, attributes: SessionAttributes) -> None:
+        for name, value in attributes.scope:
+            grant = self._dimensions.get(name)
+            if grant is None:
+                raise PermissionError(f"Session 维度没有 owner: {name}")
+            grant[1](value)
+
+    def _admitted(self, session_id: str) -> bool:
+        assert self._log is not None
+        try:
+            _ = self._log.catalog().attributes(session_id)
+        except ValueError:
+            return False
+        return True
 
 
 MESSAGE_WRITERS = ServiceKey[MessageWriters]("core.message_writers")

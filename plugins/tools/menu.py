@@ -1,15 +1,18 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+import inspect
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol, cast
+from typing import Any, cast
 
 from agent.plugin_composition.bindings import Bindings
 from agent.plugin_composition.models import ToolCall as ModelToolCall
 from agent.plugin_contracts import CallRef, ToolCall
+from agent.plugin_contracts.tools import CommitAfter as CommitAfter
+from agent.plugin_contracts.tools import ToolPresentation as ToolPresentation
 
 from .execution import MessageReply, Result, ToolExecution
-from .plugin import TOOLS, ToolCatalog, ToolView
+from .plugin import TOOLS
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,21 +38,6 @@ class ToolCallDecode:
     def accepted(self) -> bool:
         """判断模型调用是否已经解码到获授 binding。"""
         return self.binding_id is not None
-
-
-
-class ToolPresentation(Protocol):
-    """定义一次程序固定的 schema、wire 解码和系统提示词。"""
-
-    @property
-    def schemas(self) -> tuple[Mapping[str, Any], ...]: ...
-
-    @property
-    def system_prompt(self) -> str: ...
-
-    def decode(self, call: ModelToolCall) -> tuple[str, Mapping[str, object]] | str: ...
-
-    def configuration(self, name: str) -> Mapping[str, object] | None: ...
 
 
 class NativePresentation:
@@ -91,41 +79,25 @@ class ToolMenu:
 
     def __init__(
         self,
-        catalog: ToolCatalog,
         bindings: Bindings,
         execution: ToolExecution,
-        reply: Callable[[CallRef], MessageReply],
+        reply: Callable[[CallRef], MessageReply | Awaitable[MessageReply]],
         *,
-        view: ToolView | None = None,
         limit: int | None = None,
-        fixed_bindings: Mapping[str, str] | None = None,
+        fixed_bindings: Mapping[str, str],
         presentation: ToolPresentation | None = None,
+        parallel_names: frozenset[str] = frozenset(),
     ):
-        if (view is None) == (fixed_bindings is None):
-            raise ValueError("工具菜单必须且只能取得 current view 或固定 binding")
         if limit is not None and (type(limit) is not int or limit < 1):
             raise ValueError("工具菜单容量必须为正整数或 None")
+        self._parallel_names = frozenset(parallel_names)
         self._bindings = bindings
         self._execution = execution
         self._reply = reply
 
-        if fixed_bindings is not None:
-            self._bound = dict(fixed_bindings)
-            descriptions = self._descriptions()
-            self._presentation = presentation or NativePresentation(descriptions)
-        else:
-            assert view is not None
-            current = {ref.name: ref for ref in view.refs}
-            descriptions = {name: ref.description for name, ref in current.items()}
-            self._presentation = presentation or NativePresentation(descriptions)
-            self._bound = {
-                name: catalog.bind(
-                    ref,
-                    bindings,
-                    configuration=self._presentation.configuration(name),
-                )
-                for name, ref in current.items()
-            }
+        self._bound = dict(fixed_bindings)
+        descriptions = self._descriptions()
+        self._presentation = presentation or NativePresentation(descriptions)
         if limit is not None and len(self._presentation.schemas) > limit:
             raise ValueError(
                 "模型工具容量不足以容纳固定展示: "
@@ -183,13 +155,30 @@ class ToolMenu:
         )
         return cast(str, description["name"])
 
+    def parallel(self, binding_id: str) -> bool:
+        """只有注册时显式允许的只读工具可以重叠；失效 binding 一律串行。"""
+        try:
+            return self.name(binding_id) in self._parallel_names
+        except Exception:
+            return False
+
     def check_call(self, call: ToolCall) -> None:
         if call.binding_id not in self._bound.values():
             raise PermissionError("工具请求不属于本次获授 view")
 
-    async def execute(self, call: CallRef) -> Result:
-        reply = self._reply(call)
+    async def execute(self, call: CallRef, *, commit_after: CommitAfter | None = None) -> Result:
+        opened = self._reply(call)
+        reply = await opened if inspect.isawaitable(opened) else opened
         try:
-            return await self._execution.execute_call(reply)
+            return await self._execution.execute_call(reply, commit_after=commit_after)
+        finally:
+            reply.writer.expire()
+
+    async def settle_abandoned(self, call: CallRef) -> Result:
+        """持久 abandon 区内缺回执的调用直接结算；与 watcher 共用同一幂等入口。"""
+        opened = self._reply(call)
+        reply = await opened if inspect.isawaitable(opened) else opened
+        try:
+            return await self._execution.settle_abandoned(reply)
         finally:
             reply.writer.expire()

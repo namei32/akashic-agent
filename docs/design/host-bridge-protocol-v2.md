@@ -42,7 +42,7 @@ Bridge service 拥有 boot admission 和 manager lease；ShellProcessManager 拥
 
 | RPC | Context 之外的请求字段与规则 |
 |---|---|
-| Inspect、ClaimBoot、Probe、Heartbeat、ShutdownManager、ActiveExecutions | 无 |
+| Inspect、ClaimBoot、Probe、OpenManager、Heartbeat、ShutdownManager、ActiveExecutions | 无 |
 | Exec | 必需非空 command、owner_session_key；argv 非空且元素非空；env 为 string map，可空且 value 可空；cwd optional；必需 tty（false 合法）、yield_time_ms（零合法，等待仍按原 manager clamp）、max_output_tokens（≥0）、hard_timeout_s（>0） |
 | WriteStdin | 必需 execution_id>0、非空 owner_session_key、chars（空代表等待）、yield_time_ms、max_output_tokens≥0 |
 | Stop | 必需 execution_id>0、非空 owner_session_key |
@@ -58,10 +58,22 @@ Bridge service 拥有 boot admission 和 manager lease；ShellProcessManager 拥
 | read | 必需 path；optional offset≥0，省略为0；optional limit≥1，省略为None |
 | write | 必需 path、content，允许空内容 |
 | edit | 必需 path、old_text、new_text；optional replace_all，省略为false |
-| list | 必需 path |
+| list | 必需 path；optional limit 为 1～500，省略为 500；optional after 为上一页的完整文件名 |
 
 文件字符串允许空值，继续由原文件工具解释；missing 与显式空值不同。无法匹配 oneof 或缺少
 必需字段时拒绝调用。原工具“文件不存在”“匹配多处”等业务错误仍是 OK RPC 的文本结果。
+
+目录分页由同一个 ListDirOperation 拥有，本地工具和 Bridge 不各自定义上限。
+参数错误是可见的工具错误；正常页面按区分大小写的文件名升序返回，最多 500 项和
+10,000 UTF-8 字节（包括续读提示）。仍有条目时提示可复制的 JSON 字符串 after；
+下一页只取名字严格大于 after 的条目。每页重新遍历当前目录，不承诺跨页快照：
+游标之前的新条目可能不出现，删除或重命名也可能改变后续页面。遍历耗时随目录规模
+增长，但工作集只保留 limit+1 个名字，文件类型只查询实际展示的一页。
+Python client 在 protobuf 构造前拒绝布尔 limit（ValueError），避免 bool 被转成整数；
+数值范围与目录业务错误仍由 ListDirOperation 返回，wire 不复制这些规则。
+
+此边界限制新产生的目录结果，不改写历史工具事实，不代替 #371 的通用结果归档与回读。
+新增字段仍按 RUN-015 成对发布同 commit 的 Core/Bridge，混合版本不在支持合同内。
 
 ## 3. 响应字段
 
@@ -69,7 +81,7 @@ Bridge service 拥有 boot admission 和 manager lease；ShellProcessManager 拥
 |---|---|
 | Inspect、Probe | 非空 release_commit/toolchain_digest；非空 capabilities 集合，元素非空 |
 | ClaimBoot | 非空 owner_boot_id；previous_boot_id optional，省略表示此前无 owner；必需 cleaned_manager_count、cleaned_execution_count，可为0 |
-| Heartbeat | 必需 alive，成功须为true |
+| OpenManager、Heartbeat | 必需 alive，成功须为true |
 | Exec、WriteStdin | 必需 output bytes（可空）、wall_time_ms/original_token_count/output_omitted_bytes≥0、非空 finish_reason；必需 result oneof：execution_id>0 或 exit_code（零与负信号值合法）；output_path optional，设置时非空 |
 | Stop | 必需 stopped，false 的存在性不能丢失 |
 | TerminateOwner、ShutdownManager | attempted/cleaned 为正整数集合，可空；failures 为 execution_id>0、非空 error_type/message 列表，可空 |
@@ -86,6 +98,7 @@ Bridge service 拥有 boot admission 和 manager lease；ShellProcessManager 拥
 
 结构/范围错误为 INVALID_ARGUMENT；缺失、重复、格式错误或不匹配的 token 为 PERMISSION_DENIED；
 release、toolchain、boot 或 owner 的权限错误仍为 PERMISSION_DENIED；内部未预期错误为 INTERNAL。
+manager 不存在为 NOT_FOUND；正在回收或 cleanup 未确认为 FAILED_PRECONDITION。
 命令非零退出是正常 ExecutionReply。请求身份只在 RPC 入口认证一次，内部仍逐操作检查实时 lease。
 
 取消显式传播 CancelledError，不改为 INTERNAL，不终止已登记的 execution。Exec 响应丢失、
@@ -128,3 +141,18 @@ service package 是唯一协议 major owner：`akashic.host.v2`。V1 route 返�
    40KB、1MiB 输出、1/8/32 并发、PTY；记录 p50/p95，不把编码成本当端到端速度。
 4. 运行生成一致性、类型检查、现有 Python/Web 回归和 change-impact Gate，再由 Terra xhigh
    对完整实现 diff 和证据做独立审查。未执行/环境失败项保持未验证。
+
+## 运行期恢复补充
+
+[0075](../decisions/0075-host-bridge-runtime-recovery.md) 区分连接探测和执行租约：
+
+- Inspect 只验证发布身份，供部署检查使用；Probe 还核对 active boot，两者都不创建 manager。
+- OpenManager 是唯一创建入口；客户端首次业务请求前串行登记，成功后只续期、不重新登记。
+  首次登记响应丢失时，业务请求尚未发出，再次登记安全；Exec/WriteStdin/FileTool 不重放。
+- Heartbeat 与业务 RPC 只使用已存在 manager；缺失时拒绝，不能创建空执行表。
+  未打开的客户端 shutdown 只关闭本地传输；打开后远端不存在不是 cleanup 成功证据。
+- UNAVAILABLE/DEADLINE_EXCEEDED 只允许健康探测和心跳继续尝试；NOT_FOUND 或身份/租约错误
+  终结旧 manager。单次业务 INTERNAL/INVALID_ARGUMENT 不等于 manager 丢失。
+- 同一 release 的 Core/Bridge 必须成对发布；不能用混合版本运行 OpenManager 新合同。
+
+文件线程排空、状态消费者和本地实验见[运行期可靠性](host-bridge-reliability.md)。

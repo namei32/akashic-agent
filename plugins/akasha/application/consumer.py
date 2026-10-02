@@ -8,47 +8,62 @@ from datetime import datetime
 from itertools import groupby
 from functools import partial
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from agent.plugin_composition.bindings import Bindings
 from agent.plugin_composition.messages import MessageCatalog, MessageEmbeddings
 
 from ..domain.features import BurstAwareFeaturePool
-from ..domain.model import ContextState, EmbeddingSpaceMismatchError, MemoryConfig, Turn
-from ..infrastructure.consumption import Applied, Consumption, LegacyPrefix, turns_digest, load_legacy_prefix, legacy_embedding_model
-from ..infrastructure.frozen_history import FrozenHistory
+from ..domain.model import (
+    ContextState,
+    EmbeddingSpaceMismatchError,
+    MemoryConfig,
+    MemoryRebuildRequiredError,
+    Turn,
+)
+from ..infrastructure.consumption import Applied, Consumption, Skipped
 from ..infrastructure.lease import WriterLease
 from ..infrastructure.persistence import load_consumption, load_memory_state, write_memory_database
 from .cycle import MemoryCycle
+
+if TYPE_CHECKING:
+    from ..projection import Sample
 
 
 class MessageConsumer:
     """拥有一个学习快照；调用者串行提交已用固定规则验证的材料。"""
 
-    def __init__(self, path: Path, *, turns: list[Turn], state: Consumption, config: MemoryConfig):
+    def __init__(
+        self, path: Path, *, turns: list[Turn], state: Consumption, config: MemoryConfig,
+        deferred_publish: bool = False,
+    ):
         state.check_turns(turns)
         self.path = path
         self.state = state
         self.config = config
+        # 完整重建写的是丢弃用候选文件：每次学习都重写整库没有恢复价值，
+        # 因此允许把发布推迟到重放结束的一次原子写入。
+        self._deferred_publish = deferred_publish
         self._error: BaseException | None = None
         self._closed = False
         self._embedding_model: str | None = None
         self._lease = WriterLease(path)
         try:
-            # 1. 恢复只能装载已发布图；缺图或缺切换记录不能触发历史重学。
+            # 1. 恢复只能装载已发布图；缺图不能触发历史重学。
             if path.exists():
                 if load_consumption(path) != state:
                     raise ValueError("学习快照与已解析的消费出处不一致")
                 graph, events, evidence, context, recalls, burst = load_memory_state(
-                    path, turns=turns, config=config, source_index_sha256=None,
+                    path, turns=turns, config=config,
                 )
                 self._cycle = MemoryCycle.restore(
                     config=config, turns=turns, graph=graph, events=events,
                     evidence=evidence, context=context, recalls=recalls, burst_members=burst,
                 )
                 if turns:
-                    self._cycle.feature_pool = BurstAwareFeaturePool(turns, appendable=True)
+                    self._cycle.feature_pool = BurstAwareFeaturePool(self._cycle.turns, appendable=True)
             else:
-                if turns or state.legacy_prefix.count or state.applied:
+                if turns or state.applied:
                     raise ValueError("已有消费进度缺少学习图，不能自动重放")
                 self._cycle = MemoryCycle(config)
                 self._cycle.context = ContextState((), None, ())
@@ -62,63 +77,64 @@ class MessageConsumer:
             raise
 
     @classmethod
+    async def create(
+        cls, path: Path, *, turns: list[Turn], state: Consumption, config: MemoryConfig,
+        deferred_publish: bool = False,
+    ) -> MessageConsumer:
+        """在后台取得 writer；取消期间构造成功的资源仍必须关闭。"""
+        consumer: MessageConsumer | None = None
+
+        def build() -> None:
+            nonlocal consumer
+            consumer = cls(path, turns=turns, state=state, config=config,
+                           deferred_publish=deferred_publish)
+
+        try:
+            await run_memory_job(build)
+        except BaseException:
+            # run_memory_job 已排空线程，构造结果不会在关闭后才出现。
+            if consumer is not None:
+                consumer.close()
+            raise
+        assert consumer is not None
+        return consumer
+
+    @classmethod
     async def load(
-        cls, path: Path, *, legacy_index: Path | None, catalog: MessageCatalog,
+        cls, path: Path, *, catalog: MessageCatalog,
         embeddings: MessageEmbeddings, bindings: Bindings,
-        config: MemoryConfig, frozen_history: FrozenHistory | None = None,
+        config: MemoryConfig, cutover: bool = True,
     ) -> MessageConsumer:
         """先按原绑定还原材料，再取得唯一 writer 装载图；缺失来源不自动重学。"""
         from ..learning import AKASHA_LEARNING, LearningConfig
 
         # 1. 第一次启用固定已有日志上界，重启前也必须把空图与起点一起发布。
+        #    独立图的成员从接纳起就固定路由到它，不设上界而从头学习。
         if not path.exists():
-            if legacy_index is not None and legacy_index.exists():
-                raise ValueError("旧索引仍存在但学习图缺失，需要显式恢复")
-            state = Consumption(
-                legacy_prefix=LegacyPrefix(count=0, index_state_sha256="0" * 64,
-                                           turns_digest=turns_digest([])),
-                cutover_heads=tuple(sorted(catalog.snapshot_heads().items())),
-            )
-            return cls(path, turns=[], state=state, config=config)
-        state = load_consumption(path)
+            heads = catalog.snapshot_heads().items() if cutover else ()
+            state = Consumption(cutover_heads=tuple(sorted(heads)))
+            return await cls.create(path, turns=[], state=state, config=config)
+        state = await run_memory_job(partial(load_consumption, path))
         if state is None:
-            raise ValueError("旧学习图尚未完成 yoyo 消费切换")
-        if frozen_history is not None:
-            frozen_history.validate_consumption(state)
-        turns = load_legacy_prefix(state, legacy_index)
-        space = None
-        if state.legacy_prefix.count:
-            if legacy_index is None:
-                raise RuntimeError("已恢复旧前缀缺少其索引路径")
-            space = legacy_embedding_model(legacy_index)
-
-        # 2. 后缀逐项打开原算法闭包；不开模型、不嵌入，也不调用 commit。
+            raise MemoryRebuildRequiredError("学习图缺少当前消费出处，需要显式重建")
+        # 2. 逐项打开原算法闭包；不开模型、不嵌入，也不调用 commit。
+        turns: list[Turn] = []
+        space: str | None = None
         for identity, grouped in groupby(state.applied, key=lambda entry: entry.learning_binding):
             entries = tuple(grouped)
-            if frozen_history is not None and any(
-                frozen_history.uses_binding(entry.learning_binding) for entry in entries
-            ):
-                for entry in entries:
-                    frozen_space = frozen_history.embedding_for(entry)
-                    try:
-                        _check_embedding_space(frozen_space.identity, frozen_space.dimensions, space, turns)
-                    except EmbeddingSpaceMismatchError as error:
-                        raise ValueError("已发布 Akasha 学习图的 frozen embedding 空间不一致") from error
-                    space = frozen_space.identity
-                    turns.append(frozen_history.restore_turn(entry, catalog))
-                continue
             async with bindings.open(identity, AKASHA_LEARNING) as (learning, metadata):
                 rule = LearningConfig.model_validate(dict(metadata))
-                try:
+                def restore_entries() -> None:
+                    """按原前缀逐条恢复；后一条只能读取已完成的 previous。"""
                     _check_embedding_space(rule.embedding_model, rule.dimension, space, turns)
-                except EmbeddingSpaceMismatchError as error:
-                    raise ValueError("已发布 Akasha 学习图的 embedding 空间不一致") from error
+                    for entry in entries:
+                        turns.append(learning.restore(
+                            catalog, embeddings, rule, entry, previous=turns, state=state, bindings=bindings,
+                        ))
+
+                await run_memory_job(restore_entries)
                 space = rule.embedding_model
-                for entry in entries:
-                    turns.append(learning.restore(
-                        catalog, embeddings, rule, entry, previous=turns, state=state, bindings=bindings,
-                    ))
-        consumer = cls(path, turns=turns, state=state, config=config)
+        consumer = await cls.create(path, turns=turns, state=state, config=config)
         consumer._embedding_model = space
         return consumer
 
@@ -144,18 +160,23 @@ class MessageConsumer:
                 self.state.applied[-1].learning_binding, AKASHA_LEARNING,
             )))
             space = prior.embedding_model
-        if space is None and self.state.legacy_prefix.count:
-            raise RuntimeError("旧学习图必须通过 load 恢复其 embedding 身份")
+        if space is None and self.cycle.turns:
+            raise EmbeddingSpaceMismatchError("已学习图必须通过 load 恢复其 embedding 身份")
         _check_embedding_space(model, dimension, space, self.cycle.turns)
 
     async def consume(
         self, *, catalog: MessageCatalog, learning_binding: str,
         embeddings: MessageEmbeddings, bindings: Bindings,
         embed_batch: Callable[[list[str]], Awaitable[list[list[float]]]],
+        skip_missing_embeddings: bool = False,
+        member: Callable[[str], bool] | None = None,
     ) -> int:
-        """追赶一个固定日志前缀；在线只补缺向量，学习与进度仍一次发布。"""
+        """追赶一个固定日志前缀；在线只补缺向量，学习与进度仍一次发布。
+
+        member 选出路由到本图的 Session；每张图只消费自己的成员。
+        """
         from agent.plugin_contracts import Input, Output
-        from ..projection import applied_source
+        from ..projection import Sample, applied_source
 
         from ..learning import AKASHA_LEARNING, LearningConfig
 
@@ -163,14 +184,24 @@ class MessageConsumer:
         async with bindings.open(learning_binding, AKASHA_LEARNING) as (learning, metadata):
             rule = LearningConfig.model_validate(dict(metadata))
             # 图空间从原出处恢复；切换模型不能把新向量接到旧图中。
-            self.check_embedding_space(rule.embedding_model, rule.dimension, bindings)
-            heads = catalog.snapshot_heads()
+            await run_memory_job(partial(
+                self.check_embedding_space, rule.embedding_model, rule.dimension, bindings,
+            ))
+            heads = {
+                session: head for session, head in catalog.snapshot_heads().items()
+                if member is None or member(session)
+            }
             cutover = dict(self.state.cutover_heads)
             applied = {entry.ending[1] for entry in self.state.applied}
+            skipped = {item.ending[1] for item in self.state.skipped}
             records = embeddings.bind(learning.text)
             count = 0
-            for sample in learning.samples(catalog, rule, heads=heads):
-                if sample.ending.seq <= cutover.get(sample.ending.session_id, -1) or sample.ending.message_id in applied:
+            # 投影会读取历史正文；与图发布共用排空后才取消的后台执行方式。
+            samples = await run_memory_job(partial(learning.samples, catalog, rule, heads=heads))
+            for sample in samples:
+                if sample.ending.seq <= cutover.get(sample.ending.session_id, -1):
+                    continue
+                if sample.ending.message_id in applied or sample.ending.message_id in skipped:
                     continue
                 inputs = [message for message in sample.messages if isinstance(message.body, Input)]
                 if not any(learning.text(message).strip() for message in inputs) or not learning.text(sample.ending).strip():
@@ -178,23 +209,85 @@ class MessageConsumer:
                 if not isinstance(sample.ending.body, Output) or sample.ending.body.finish != "complete":
                     continue
                 # 2. 固定消息向量先于学习发布，缺失之外的空间差异直接失败。
-                missing = [message for message in (*inputs, sample.ending)
-                           if learning.text(message).strip()
-                           and records.read(message, model=rule.embedding_model, dimension=rule.dimension) is None]
+                missing = await run_memory_job(lambda: [
+                    message for message in (*inputs, sample.ending)
+                    if learning.text(message).strip()
+                    and records.read(message, model=rule.embedding_model, dimension=rule.dimension) is None
+                ])
                 if missing:
+                    if skip_missing_embeddings:
+                        # 缺少固定向量的闭段明确跳过；跳过必须持久，避免在线路径稍后乱序补学。
+                        count += await run_memory_job(partial(
+                            self.skip, sample, reason="missing-embedding",
+                        ))
+                        skipped.add(sample.ending.message_id)
+                        continue
                     vectors = await embed_batch([learning.text(message) for message in missing])
                     if len(vectors) != len(missing) or any(len(vector) != rule.dimension for vector in vectors):
                         raise ValueError("embedding 返回数量或维度不匹配固定学习空间")
-                    for message, vector in zip(missing, vectors):
-                        records.save(message, model=rule.embedding_model, embedding=vector)
-                turn = learning.make_turn(sample, rule, embeddings, previous=self.cycle.turns,
-                                          state=self.state, bindings=bindings)
-                if turn is None:
-                    raise RuntimeError("已接纳的学习样本没有产生节点")
-                entry = applied_source(sample, learning_binding=learning_binding)
-                count += await run_memory_job(partial(self.apply, turn, entry))
-                self._embedding_model = rule.embedding_model
+                    def save_vectors() -> None:
+                        for message, vector in zip(missing, vectors):
+                            records.save(message, model=rule.embedding_model, embedding=vector)
+                    await run_memory_job(save_vectors)
+
+                def learn_sample() -> bool:
+                    """材料依赖当前图；发布完成后调用方才处理下一条经历。"""
+                    turn = learning.make_turn(sample, rule, embeddings, previous=self.cycle.turns,
+                                              state=self.state, bindings=bindings)
+                    if turn is None:
+                        raise RuntimeError("已接纳的学习样本没有产生节点")
+                    entry = applied_source(sample, learning_binding=learning_binding)
+                    applied = self.apply(turn, entry)
+                    self._embedding_model = rule.embedding_model
+                    return applied
+
+                count += await run_memory_job(learn_sample)
             return count
+
+    def publish_snapshot(self) -> str:
+        """按当前内存状态发布一次完整快照；延迟发布的重建用它收口。"""
+
+        return self.publish_snapshot_for(self.state)
+
+    def publish_snapshot_for(self, state: Consumption) -> str:
+        """用给定消费状态发布当前图；调用者负责保证它与图对应。"""
+
+        cycle = self.cycle
+        if cycle.context is None:
+            raise RuntimeError("已学习图缺少 context")
+        return write_memory_database(
+            self.path, turns=cycle.turns, graph=cycle.graph, events=cycle.events,
+            evidence=cycle.evidence, captures=[], context=cycle.context,
+            burst_members=cycle.burst_members, config=self.config, metadata={},
+            recalls=cycle.recalls, consumption=state,
+            previous_consumption=None if self._deferred_publish else self.state,
+        )
+
+    def skip(self, sample: Sample, *, reason: str) -> bool:
+        """把一个闭段记为明确跳过；重复记事必须完全一致。"""
+
+        entry = Skipped(
+            session_id=sample.ending.session_id,
+            ending=(sample.ending.seq, sample.ending.message_id),
+            reason=reason,
+        )
+        for existing in self.state.skipped:
+            if existing.ending[1] == entry.ending[1]:
+                if existing != entry:
+                    raise ValueError("重复跳过记事的出处不一致")
+                return False
+        state = self.state.mark_skipped(entry)
+        if self._deferred_publish:
+            self.state = state
+            return True
+        try:
+            _ = self.publish_snapshot_for(state)
+        except BaseException as error:
+            self._error = error
+            raise
+        self.state = state
+        return True
+
 
     def apply(self, turn: Turn, entry: Applied) -> bool:
         """重复通知不强化；提交失败后停止本实例，避免猜测外部发布是否成功。"""
@@ -226,14 +319,8 @@ class MessageConsumer:
         # 2. MemoryCycle 唯一学习一次；图与消费出处在一个完整文件中一起发布。
         try:
             _ = cycle.commit(turn, None)
-            if cycle.context is None:
-                raise RuntimeError("已学习图缺少 context")
-            _ = write_memory_database(
-                self.path, turns=cycle.turns, graph=cycle.graph, events=cycle.events,
-                evidence=cycle.evidence, captures=[], context=cycle.context,
-                burst_members=cycle.burst_members, config=self.config, metadata={},
-                recalls=cycle.recalls, consumption=state,
-            )
+            if not self._deferred_publish:
+                _ = self.publish_snapshot_for(state)
         except BaseException as error:
             # 发布可能已经 replace；回退 Python 指针不能证明文件没有提交。
             self._error = error

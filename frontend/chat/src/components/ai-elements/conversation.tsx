@@ -29,7 +29,7 @@ export const ConversationContent = ({
   ...props
 }: ConversationContentProps) => (
   <StickToBottom.Content
-    className={cn("flex flex-col gap-8 p-4", className)}
+    className={cn("flex flex-col", className)}
     scrollClassName="conversation-scroll"
     {...props}
   />
@@ -87,7 +87,7 @@ export const ConversationScrollButton = ({
       <Button
         aria-label="滚动到底部"
         className={cn(
-          "absolute bottom-4 left-[50%] translate-x-[-50%] rounded-full dark:bg-background dark:hover:bg-muted",
+          "absolute rounded-full",
           className
         )}
         onClick={handleScrollToBottom}
@@ -155,7 +155,7 @@ export const ConversationDownload = ({
   return (
     <Button
       className={cn(
-        "absolute top-4 right-4 rounded-full dark:bg-background dark:hover:bg-muted",
+        "absolute top-4 right-4 rounded-full",
         className
       )}
       onClick={handleDownload}

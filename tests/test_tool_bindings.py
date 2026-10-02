@@ -1,125 +1,54 @@
 from contextlib import asynccontextmanager
-from collections.abc import Mapping
-from functools import partial
-from pathlib import Path
-import shutil
+from types import SimpleNamespace
 from typing import cast
-
 import pytest
-
-from tests.fixtures.plugin_workspace import initialize_plugin_workspace
-
 from agent.plugin_composition.bindings import Bindings
-from agent.plugin_composition import CompositionRoot
+from agent.plugin_composition import CompositionRoot, RUNTIME_STARTED, RUNTIME_STARTING, RUNTIME_STOPPING
 from agent.plugin_composition.model import PluginRuntime, ServiceKey
-from agent.plugin_composition.tasks import Tasks
-from agent.plugins.manager import PluginManager
-from agent.plugins.snapshot import lease_runtime_snapshot
-from bus.event_bus import EventBus
-from plugins.tools.execution import ToolExecution
-from plugins.tools.plugin import (
-    ALL_TOOLS,
-    TOOL_DISPLAY_NAME,
-    ToolCatalog,
-    ToolRef,
-    open_tool,
-)
-from session.log import MessageLog
+from agent.plugin_composition.tasks import TASKS, PluginTasks
+from plugins.tool_search.plugin import LoadTools
+from plugins.tools.plugin import ToolCatalog, ToolRef
 
 TOOLS = ServiceKey("tools.v1")
 
-
-def write_plugins(path):
-    path.mkdir()
-    for name in ("tools", "content"):
-        shutil.copytree(Path(__file__).resolve().parents[1] / "plugins" / name,
-                        path / name, ignore=shutil.ignore_patterns("__pycache__"))
-    target = path / "target"
-    target.mkdir()
-    (target / "plugin.py").write_text("""
-from contextlib import asynccontextmanager
-from pathlib import Path
-from agent.plugin_composition import ServiceKey
-from dataclasses import dataclass
-from agent.plugin_contracts import ContentPart
-@dataclass(frozen=True)
-class Result:
-    outcome: str
-    parts: tuple[ContentPart, ...]
-api_version = 3
-name = "target"
-version = "1.0.0"
-inject = (ServiceKey("tools.v1"),)
-async def apply(ctx):
-    class Target:
-        idempotent = False
-        async def prepare(self, arguments, source=None):
-            if not isinstance(arguments["value"], str):
-                raise ValueError("value must be text")
-            return {"value": arguments["value"].strip()}
-        async def invoke(self, key, arguments):
-            log = ctx.data_root / "effects.txt"
-            log.parent.mkdir(parents=True, exist_ok=True)
-            with log.open("a") as file:
-                file.write(key + "\\n")
-            return Result("success", (ContentPart("text", "A:" + arguments["value"]),))
-        async def query(self, key):
-            return None
-    @asynccontextmanager
-    async def open_target(state):
-        yield Target()
-    ref = await ctx.require(inject[0]).register(
-        ctx, name="example", description="Example target A",
-        parameters={"type": "object", "properties": {"value": {"type": "string"}}, "required": ["value"], "additionalProperties": False},
-        open=open_target,
-    )
-    await ctx.provide(ServiceKey("fixture.example-ref"), ref)
-""")
-    prepare = path / "prepare"
-    prepare.mkdir()
-    (prepare / "plugin.py").write_text("""
-from agent.plugin_composition import ServiceKey
-api_version = 3
-name = "prepare"
-version = "1.0.0"
-inject = (ServiceKey("tools.v1"), ServiceKey("fixture.example-ref"))
-async def apply(ctx):
-    async def prepare(arguments):
-        return {"value": "restore:" + arguments["value"]}
-    await ctx.require(inject[0]).register_prepare(
-        ctx, tool=ctx.require(inject[1]), name="restore", prepare=prepare,
-    )
-""")
-
-
-def add_authorize(path):
-    policy = path / "authorize"
-    policy.mkdir()
-    (policy / "plugin.py").write_text("""
-from agent.plugin_composition import ServiceKey
-api_version = 3
-name = "authorize"
-version = "1.0.0"
-inject = (ServiceKey("tools.v1"), ServiceKey("fixture.example-ref"))
-async def apply(ctx):
-    async def authorize(arguments):
-        if arguments["value"] == "restore:blocked":
-            return "blocked by fixed policy"
-    await ctx.require(inject[0]).register_authorize(
-        ctx, tool=ctx.require(inject[1]), name="fixed-policy", authorize=authorize,
-    )
-""")
-
-
-def manager(tmp_path, sources, log=None):
-    return PluginManager(
-        plugin_dirs=sources,
-        event_bus=EventBus(),
-        workspace=tmp_path / "workspace",
-        installed_cache_root=tmp_path / "home" / "cache",
-        message_log=log,
+def _runtime(tmp_path, plugin_id):
+    return PluginRuntime(
+        plugin_id,
+        plugin_id + ":1",
+        tmp_path,
+        tmp_path / plugin_id / "data",
+        tmp_path / "workspace",
+        {},
     )
 
+async def _watch_lifecycle(ctx, events):
+    await ctx.on(RUNTIME_STARTING, lambda _event: events.append("starting"))
+    await ctx.on(RUNTIME_STARTED, lambda _event: events.append("started"))
+    await ctx.on(RUNTIME_STOPPING, lambda _event: events.append("stopping"))
+
+async def _mount_local_tools(root, tmp_path, events):
+    contexts = []
+    catalogs = []
+    admissions = []
+    plugin_tasks = PluginTasks()
+    await root.context.provide(TASKS, plugin_tasks)
+
+    async def apply(ctx):
+        contexts.append(ctx)
+        admission = ctx.require(TASKS).open(ctx)
+        admissions.append(admission)
+        catalog = ToolCatalog(ctx, admission)
+        catalogs.append(catalog)
+        await ctx.provide(TOOLS, catalog)
+        await _watch_lifecycle(ctx, events)
+
+    fiber = await root.mount(
+        apply,
+        name="tools-provider",
+        inject=(TASKS,),
+        runtime=_runtime(tmp_path, "tools-provider"),
+    )
+    return fiber, contexts[0], catalogs[0], plugin_tasks, admissions[0]
 
 @pytest.mark.asyncio
 async def test_prepare_and_authorize_follow_exact_registration_identity(tmp_path):
@@ -127,7 +56,9 @@ async def test_prepare_and_authorize_follow_exact_registration_identity(tmp_path
     root = CompositionRoot("exact-tool-contributions")
     refs = {}
     contexts = {}
-    catalog = ToolCatalog(root.context)
+    tools_fiber, _tools_ctx, catalog, plugin_tasks, _admission = await _mount_local_tools(
+        root, tmp_path, []
+    )
 
     def runtime(plugin_id):
         return PluginRuntime(
@@ -153,16 +84,6 @@ async def test_prepare_and_authorize_follow_exact_registration_identity(tmp_path
         first = await root.mount(
             lambda ctx: target(ctx, "first"), name="first", runtime=runtime("first")
         )
-        with pytest.raises(TypeError, match="搜索提示"):
-            await catalog.register(
-                contexts["first"],
-                name="bad_hint",
-                description="bad search hint",
-                parameters={"type": "object"},
-                open=open_target,
-                search_hint=cast(str, object()),
-            )
-
         async def contribute(ctx):
             async def prepare(arguments):
                 return {**arguments, "prepared_by": "first"}
@@ -188,7 +109,7 @@ async def test_prepare_and_authorize_follow_exact_registration_identity(tmp_path
                 return "binding"
 
         captured = CapturingBindings()
-        catalog.bind(refs["first"], cast(Bindings, captured))
+        await catalog.bind(refs["first"], cast(Bindings, captured))
         assert captured.metadata["prepare"] == "first-prepare"
         assert captured.metadata["authorize"] == "first-authorize"
 
@@ -197,10 +118,36 @@ async def test_prepare_and_authorize_follow_exact_registration_identity(tmp_path
         await root.mount(
             lambda ctx: target(ctx, "second"), name="second", runtime=runtime("second")
         )
-        catalog.bind(refs["second"], cast(Bindings, captured))
+        await catalog.bind(refs["second"], cast(Bindings, captured))
         assert captured.metadata == {
             "tool": refs["second"].description,
             "prepare": None,
+        }
+
+        @asynccontextmanager
+        async def open_resumable(_state):
+            yield SimpleNamespace(idempotent=False)
+
+        resumable = await catalog.register(
+            contexts["second"], name="resumable", description="resumable tool",
+            parameters={"type": "object"}, open=open_resumable, capture=lambda state: state,
+        )
+        legacy = {
+            "tool": {
+                **resumable.description,
+                "risk": "read-only",
+                "search_hint": "legacy display only",
+            },
+            "prepare": None,
+            "state": {},
+        }
+        async with catalog.open(legacy) as opened:
+            assert opened.idempotent is False
+        await catalog.bind_saved(legacy, cast(Bindings, captured), configuration={})
+        assert captured.metadata == {
+            "tool": resumable.description,
+            "prepare": None,
+            "state": {},
         }
 
         forged = ToolRef(stale.name, stale.description)
@@ -217,253 +164,79 @@ async def test_prepare_and_authorize_follow_exact_registration_identity(tmp_path
                     prepare=passthrough,
                 )
     finally:
+        await plugin_tasks.close()
+        await tools_fiber.dispose()
+        await root.dispose()
+
+@pytest.mark.asyncio
+async def test_parallel_flag_stays_out_of_binding_description(tmp_path):
+    """重叠执行由 owner 声明，独立于冻结的工具描述和效果类别。"""
+    root = CompositionRoot("parallel-flag")
+    tools_fiber, tools_ctx, catalog, plugin_tasks, _admission = await _mount_local_tools(
+        root, tmp_path, [],
+    )
+
+    @asynccontextmanager
+    async def open_target(_state):
+        yield object()
+
+    try:
+        async with tools_ctx.runtime_scope():
+            ref = await catalog.register(
+                tools_ctx, name="write_example", description="write",
+                parameters={"type": "object"}, open=open_target, parallel=True,
+            )
+            assert "parallel" not in ref.description
+            assert "risk" not in ref.description
+            assert catalog.allows_parallel("write_example") is True
+            assert catalog.allows_parallel("missing") is False
+    finally:
+        await plugin_tasks.close()
+        await tools_fiber.dispose()
         await root.dispose()
 
 
 @pytest.mark.asyncio
-async def test_display_name_reads_old_binding_without_opening_removed_tool(tmp_path):
-    sources = tmp_path / "plugins"
-    write_plugins(sources)
-    log = MessageLog(tmp_path / "sessions.db")
-    initialize_plugin_workspace(tmp_path / "workspace")
-    host = manager(tmp_path, [sources], log)
-    try:
-        await host.load_all()
-        async with lease_runtime_snapshot(host.snapshot_store) as snapshot:
-            from agent.plugin_composition.bindings import BINDINGS
-            ctx = snapshot.composition_root.context
-            binding_id = ctx.require(TOOLS).bind(
-                ctx.require(ALL_TOOLS)().select("example"), ctx.require(BINDINGS)
-            )
-        await host.terminate_all()
-        shutil.rmtree(sources / "target")
-        shutil.rmtree(sources / "prepare")
-        restored = manager(tmp_path, [sources], log)
-        try:
-            await restored.load_all()
-            async with lease_runtime_snapshot(restored.snapshot_store) as snapshot:
-                lookup = snapshot.composition_root.context.require(TOOL_DISPLAY_NAME)
-                assert lookup(binding_id) == "example"
-                with pytest.raises(KeyError):
-                    lookup("missing")
-            assert not list((tmp_path / "workspace").rglob("effects.txt"))
-        finally:
-            await restored.terminate_all()
-    finally:
-        await host.terminate_all()
-        log.close()
+async def test_load_tools_returns_only_the_requested_frozen_group():
+    """PLG-018: 准确插件 ID 不得选择其他已获授或未获授组。"""
+    tool = LoadTools((
+        {
+            "plugin": "calendar@github",
+            "purpose": "查看日历",
+            "tools": (
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "calendar_list",
+                        "description": "列出日历",
+                        "parameters": {"type": "object"},
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "calendar_events",
+                        "description": "查看事件",
+                        "parameters": {"type": "object"},
+                    },
+                },
+            ),
+        },
+    ))
 
+    loaded = await tool.invoke("load", {"plugin": "calendar@github"})
+    assert loaded.outcome == "success"
+    import json
+    value = loaded.parts[0].value
+    assert isinstance(value, str)
+    payload = json.loads(value)
+    assert payload["plugin"] == "calendar@github"
+    assert [item["function"]["name"] for item in payload["tools"]] == [
+        "calendar_list", "calendar_events",
+    ]
 
-@pytest.mark.asyncio
-async def test_ordinary_tool_binding_runs_in_the_selected_stable_scope(
-    tmp_path,
-):
-    sources = tmp_path / "plugins"
-    write_plugins(sources)
-    initialize_plugin_workspace(tmp_path / "workspace")
-    host = manager(tmp_path, [sources])
-    log = MessageLog(tmp_path / "sessions.db")
-    tasks = Tasks()
-    try:
-        await host.load_all()
-        async with lease_runtime_snapshot(host.snapshot_store) as snapshot:
-            assert snapshot.composition_root is not None
-            bindings = Bindings(log, host._archive, snapshot.composition_root)
-            ctx = snapshot.composition_root.context
-            catalog = ctx.require(TOOLS)
-            binding_id = catalog.bind(
-                ctx.require(ALL_TOOLS)().select("example"), bindings
-            )
-        authorized = []
-
-        async def authorize(binding, arguments):
-            authorized.append((binding, arguments))
-            return {"permission": "current"}
-
-        execution = ToolExecution(
-            log.owner("tools"),
-            tasks,
-            partial(open_tool, bindings),
-            authorize,
-            task_key="tools"
-        )
-        result = await execution.execute("request", binding_id, {"value": "input "})
-        assert result.parts[0].value == "A:restore:input"
-        assert authorized == [(binding_id, {"value": "restore:input"})]
-        assert (
-            await execution.execute("request", binding_id, {"value": "input "})
-        ).parts == result.parts
-        effects = list((tmp_path / "workspace").rglob("effects.txt"))
-        assert len(effects) == 1
-        assert effects[0].read_text().splitlines() == ["program:request"]
-        async with open_tool(bindings, binding_id) as expired:
-            assert not expired.idempotent
-        with pytest.raises(RuntimeError, match="释放"):
-            await expired.invoke("escaped", {"value": "should not run"})
-        assert effects[0].read_text().splitlines() == ["program:request"]
-    finally:
-        await tasks.close()
-        await host.terminate_all()
-        log.close()
-
-
-@pytest.mark.asyncio
-async def test_tool_configuration_is_owned_frozen_without_recapture(tmp_path):
-    sources = tmp_path / "plugins"
-    write_plugins(sources)
-    path = sources / "target/plugin.py"
-    source = path.read_text().replace('"A:" + arguments["value"]', 'state["prefix"] + arguments["value"]')
-    source = source.replace('    class Target:', '''    def capture(configuration):
-        if set(configuration) != {"prefix"} or not isinstance(configuration["prefix"], str):
-            raise ValueError("prefix configuration required")
-        return {"prefix": configuration["prefix"].strip()}
-    class Target:
-        def __init__(self, captured):
-            self.state = captured''').replace('state["prefix"] + arguments', 'self.state["prefix"] + arguments')
-    source = source.replace('yield Target()', 'yield Target(state)').replace('open=open_target,', 'open=open_target, capture=capture,')
-    path.write_text(source)
-    log = MessageLog(tmp_path / "sessions.db")
-    initialize_plugin_workspace(tmp_path / "workspace")
-    host = manager(tmp_path, [sources])
-    try:
-        await host.load_all()
-        async with lease_runtime_snapshot(host.snapshot_store) as snapshot:
-            assert snapshot.composition_root is not None
-            bindings = Bindings(log, host._archive, snapshot.composition_root)
-            ctx = snapshot.composition_root.context
-            catalog = ctx.require(TOOLS)
-            ref = ctx.require(ALL_TOOLS)().select("example")
-            with pytest.raises(ValueError, match="prefix configuration"):
-                catalog.bind(ref, bindings)
-            with pytest.raises(ValueError, match="prefix configuration"):
-                catalog.bind(ref, bindings, configuration={"unexpected": True})
-            options = {"prefix": " job-a: "}
-            identity = catalog.bind(ref, bindings, configuration=options)
-            options["prefix"] = "job-b:"
-            assert bindings.describe(identity, TOOLS)["state"] == {"prefix": "job-a:"}
-        async with open_tool(bindings, identity) as target:
-            prepared = await target.prepare({"value": "input"})
-            assert isinstance(prepared, Mapping)
-            result = await target.invoke("fixed", prepared)
-            assert result.parts[0].value == "job-a:restore:input"
-    finally:
-        await host.terminate_all()
-        log.close()
-
-
-@pytest.mark.asyncio
-async def test_binding_authorize_checks_final_arguments(tmp_path):
-    sources = tmp_path / "plugins"
-    write_plugins(sources)
-    log = MessageLog(tmp_path / "sessions.db")
-    initialize_plugin_workspace(tmp_path / "workspace")
-    host = manager(tmp_path, [sources], log)
-    try:
-        await host.load_all()
-        async with lease_runtime_snapshot(host.snapshot_store) as snapshot:
-            assert snapshot.composition_root is not None
-            bindings = Bindings(log, host._archive, snapshot.composition_root)
-            ctx = snapshot.composition_root.context
-            catalog = ctx.require(TOOLS)
-            old_binding = catalog.bind(
-                ctx.require(ALL_TOOLS)().select("example"), bindings
-            )
-        await host.terminate_all()
-
-        add_authorize(sources)
-        host = manager(tmp_path, [sources], log)
-        await host.load_all()
-        caller_checks = []
-
-        async def caller_authorize(binding, arguments):
-            caller_checks.append((binding, arguments))
-            return {"permission": "caller"}
-
-        async with lease_runtime_snapshot(host.snapshot_store) as snapshot:
-            assert snapshot.composition_root is not None
-            ctx = snapshot.composition_root.context
-            catalog = ctx.require(TOOLS)
-            bindings = Bindings(log, host._archive, snapshot.composition_root)
-            new_binding = catalog.bind(
-                ctx.require(ALL_TOOLS)().select("example"), bindings
-            )
-            execution = catalog.execution(caller_authorize)
-            with pytest.raises(ValueError, match="归档工具限制与 binding 不一致"):
-                await execution.execute("old", old_binding, {"value": "blocked"})
-            denied = await execution.execute("denied", new_binding, {"value": "blocked"})
-            safe = await execution.execute("safe", new_binding, {"value": "ok"})
-
-        assert denied.outcome == "denied"
-        assert denied.parts[0].value == "blocked by fixed policy"
-        assert safe.outcome == "success"
-        assert caller_checks == [(new_binding, {"value": "restore:ok"})]
-        effects = sorted(
-            line
-            for path in (tmp_path / "workspace").rglob("effects.txt")
-            for line in path.read_text().splitlines()
-        )
-        assert effects == ["program:safe"]
-
-        malformed = dict(bindings.describe(new_binding, TOOLS))
-        malformed["authorize"] = None
-        with pytest.raises(ValueError, match="限制字段无效") as error:
-            async with catalog.open(malformed):
-                raise AssertionError("损坏 binding 不应打开工具")
-        assert type(error.value) is ValueError
-    finally:
-        await host.terminate_all()
-        log.close()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("replacement", ["removed", "renamed"])
-async def test_binding_authorize_presence_and_name_must_match_current_registration(
-    tmp_path, replacement
-):
-    sources = tmp_path / "plugins"
-    write_plugins(sources)
-    add_authorize(sources)
-    log = MessageLog(tmp_path / "sessions.db")
-    initialize_plugin_workspace(tmp_path / "workspace")
-    host = manager(tmp_path, [sources], log)
-    try:
-        await host.load_all()
-        async with lease_runtime_snapshot(host.snapshot_store) as snapshot:
-            assert snapshot.composition_root is not None
-            ctx = snapshot.composition_root.context
-            bindings = Bindings(log, host._archive, snapshot.composition_root)
-            catalog = ctx.require(TOOLS)
-            old_binding = catalog.bind(
-                ctx.require(ALL_TOOLS)().select("example"), bindings
-            )
-        await host.terminate_all()
-
-        if replacement == "removed":
-            shutil.rmtree(sources / "authorize")
-        else:
-            path = sources / "authorize" / "plugin.py"
-            path.write_text(path.read_text().replace("fixed-policy", "renamed-policy"))
-
-        host = manager(tmp_path, [sources], log)
-        await host.load_all()
-        async with lease_runtime_snapshot(host.snapshot_store) as snapshot:
-            assert snapshot.composition_root is not None
-            ctx = snapshot.composition_root.context
-            bindings = Bindings(log, host._archive, snapshot.composition_root)
-            catalog = ctx.require(TOOLS)
-            metadata = bindings.describe(old_binding, TOOLS)
-            with pytest.raises(ValueError, match="归档工具限制与 binding 不一致") as error:
-                async with catalog.open(metadata):
-                    raise AssertionError("不兼容 binding 不应打开工具")
-            assert type(error.value) is ValueError
-
-            async def _allow(binding: str, arguments: Mapping[str, object]) -> Mapping[str, object]:
-                return {"permission": "caller"}
-
-            execution = catalog.execution(_allow)
-            with pytest.raises(ValueError, match="归档工具限制与 binding 不一致"):
-                await execution.execute("incompatible", old_binding, {"value": "ok"})
-        assert not list((tmp_path / "workspace").rglob("effects.txt"))
-    finally:
-        await host.terminate_all()
-        log.close()
+    missing = await tool.invoke("load", {"plugin": "calendar"})
+    assert missing.outcome == "error"
+    missing_value = missing.parts[0].value
+    assert isinstance(missing_value, str)
+    assert "calendar_events" not in missing_value

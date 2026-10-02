@@ -4,13 +4,15 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from uuid import uuid4
 
+from core.common.file_io import run_file_io
+
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent.plugin_composition import CHAT_MODELS, RUNTIME_STARTED, RUNTIME_STOPPING, Context
 from agent.plugin_composition.models import BoundChatModel, ModelRequest
 from agent.plugin_composition.bindings import BINDINGS
 from agent.plugin_composition.messages import MESSAGE_CATALOG, OWNER_STATE
-from agent.plugin_contracts import Message
+from agent.plugin_contracts import Input, Message
 
 from .records import StoredSummary, SummaryLookup, SummaryRecord, SummaryRecords
 from .message_summary import SummaryError, closed_groups, source_text, summarize, summary_groups, window_starts
@@ -59,11 +61,14 @@ async def apply(ctx: Context) -> None:
     def records() -> SummaryRecords:
         return SummaryRecords(ctx.require(OWNER_STATE).open(ctx))
 
-    def read(reference: str) -> StoredSummary | None:
-        return records().read(reference)
-
     # 状态查询在线程执行；启动时取得窄读取口，不在线程中重新申请 owner 写权限。
+    read_record: Callable[[str], StoredSummary | None] | None = None
     read_current: Callable[[str], StoredSummary | None] | None = None
+
+    def read(reference: str) -> StoredSummary | None:
+        if read_record is None:
+            raise RuntimeError("摘要状态读取口尚未启动")
+        return read_record(reference)
 
     def head(session_id: str) -> StoredSummary | None:
         if read_current is None:
@@ -71,11 +76,14 @@ async def apply(ctx: Context) -> None:
         return read_current(session_id)
 
     async def start(_event: object) -> None:
-        nonlocal read_current
-        read_current = records().head
+        nonlocal read_current, read_record
+        state = records()
+        read_record = state.read
+        read_current = state.head
 
     async def stop(_event: object) -> None:
-        nonlocal read_current
+        nonlocal read_current, read_record
+        read_record = None
         read_current = None
 
     _ = await ctx.on(RUNTIME_STARTED, start)
@@ -99,7 +107,8 @@ async def apply(ctx: Context) -> None:
     async def prepare(snapshot: tuple[Message, ...], source: str) -> MaterialData:
         if not snapshot:
             return {}
-        record = records().head(snapshot[0].session_id)
+        state = records()
+        record = await run_file_io(lambda: state.head(snapshot[0].session_id))
         if record is None:
             return {}
         return {"summary": material(record)}
@@ -108,11 +117,25 @@ async def apply(ctx: Context) -> None:
                      model: BoundChatModel, projection: ContextModel, *, source: str, force: bool) -> MaterialData | None:
         """选完整旧前缀、生成摘要，再把不可变记录与 head 一起发布。"""
         # 1. 容量与近期保留均按当前已固定的业务模型判断。
+        reminder = context.reminder_content(materials)
+        reminder_input_id = (
+            next(
+                (
+                    message.message_id
+                    for message in reversed(snapshot)
+                    if message.source == source and isinstance(message.body, Input)
+                ),
+                None,
+            )
+            if reminder is not None
+            else None
+        )
         window = projection.context_window
         before = projection.estimate(request)
         if window is None or not snapshot or (not force and before < int(window * 0.74)):
             return None
-        parent = records().head(snapshot[0].session_id)
+        state = records()
+        parent = await run_file_io(lambda: state.head(snapshot[0].session_id))
         current_summary = materials.get("summary")
         if current_summary is not None and not isinstance(current_summary, Mapping):
             raise TypeError("Context 材料摘要必须是对象")
@@ -120,23 +143,24 @@ async def apply(ctx: Context) -> None:
             raise ValueError("本次已取得摘要与当前 Session head 不一致")
         turns = ctx.require(TURN_PROJECTION)
         if parent is None:
-            origin: int | None = None
-            # 首次窗口从最近完整单元累加；完整业务输入不得越过软水位或硬边界。
-            for index in reversed(window_starts(
+            starts = window_starts(
                 snapshot, turns, settled_prefixes=context.settled_prefixes,
-            )):
+            )
+            # 当前工作不能跳过；即使原文超窗，也先让已闭合工具批次参与摘要。
+            origin = starts[-1]
+            # 只有更早的完整单元受首次窗口预算约束，不为凑窗口丢弃当前任务。
+            for index in reversed(starts):
                 candidate, error = ctx.require(CONTEXT).build_attempt(
                     snapshot, materials=materials, model=projection,
                     tools=request.tools, max_output_tokens=request.max_output_tokens,
                     window_start=snapshot[index].message_id,
+                    current_reminder_input_id=reminder_input_id,
                 )
                 if error is not None:
                     break
                 if projection.estimate(candidate) > int(window * 0.74):
                     break
                 origin = index
-            if origin is None:
-                raise SummaryError("当前完整工作与固定材料超过首次窗口容量")
             start = origin
         else:
             covered = context.summary_range(snapshot, parent.source_message_ids)
@@ -148,7 +172,13 @@ async def apply(ctx: Context) -> None:
         # 原文保留量来自实际 Model 投影，包含尚未闭合的尾部与当前输入。
         for size in range(len(groups), 0, -1):
             after_seq = groups[size - 1][-1].seq
-            tail = projection.render(snapshot, after_seq=after_seq, fresh=True)
+            tail = projection.render(
+                snapshot,
+                after_seq=after_seq,
+                fresh=True,
+                current_reminder=reminder if reminder_input_id is not None else None,
+                current_reminder_input_id=reminder_input_id,
+            )
             if projection.estimate(tail) >= config.keep_recent_tokens:
                 selected = groups[:size]
                 break
@@ -189,6 +219,7 @@ async def apply(ctx: Context) -> None:
         after_request, error = ctx.require(CONTEXT).build_attempt(
             snapshot, materials=after_materials, model=projection,
             tools=request.tools, max_output_tokens=request.max_output_tokens,
+            current_reminder_input_id=reminder_input_id,
         )
         if error is not None:
             raise SummaryError(error)
@@ -200,9 +231,9 @@ async def apply(ctx: Context) -> None:
         record = record.model_copy(update={"tokens_after": after})
         # 3. binding 可以先固定，但读者只有在摘要事务成功后才取得此引用。
         reader = ctx.require(MESSAGE_CATALOG).reader(record.session_id)
-        _ = records().publish(
+        _ = await state.publish(
             record, reader, parent=parent, summary_range=context.summary_range,
         )
         return summary
 
-    _ = await ctx.require(MATERIALS).register(ctx, name="compaction", prepare=prepare, reduce=reduce, priority=500)
+    _ = await ctx.require(MATERIALS).register(ctx, kind="context", name="compaction", prepare=prepare, reduce=reduce, priority=500)

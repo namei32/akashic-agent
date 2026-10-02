@@ -1,6 +1,7 @@
 import { ChevronRight } from "lucide-react";
 import type { ReactNode } from "react";
 import "./conversation-navigation.css";
+import { NavigationRowMenu, type NavigationRowAction } from "./navigation-row-menu";
 
 export interface ConversationDestination {
   id: string;
@@ -39,6 +40,7 @@ export function ConversationNavigation({
   destinations,
   sessions,
   onSessionActivate,
+  onSessionPrefetch,
   pendingSessionId,
   actions,
   closeAction,
@@ -48,10 +50,12 @@ export function ConversationNavigation({
   destinationHeading,
   sessionHeading,
   className = "",
+  sessionActions,
 }: {
   destinations: ConversationDestination[];
   sessions: ConversationSession[];
   onSessionActivate: (sessionId: string) => void;
+  onSessionPrefetch?: (sessionId: string) => void;
   pendingSessionId?: string;
   actions: ConversationAction[];
   closeAction?: ReactNode;
@@ -61,6 +65,7 @@ export function ConversationNavigation({
   destinationHeading?: string | false;
   sessionHeading?: string;
   className?: string;
+  sessionActions?: (session: ConversationSession) => NavigationRowAction[];
 }) {
   const featuredDestinations = destinations.filter((destination) => destination.featured);
   const standardDestinations = destinations.filter((destination) => !destination.featured);
@@ -91,26 +96,14 @@ export function ConversationNavigation({
 
       <section className="conversation-navigation__sessions">
         <nav className="conversation-session-list" aria-label="最近会话">
-          {sessions.map((session) => (
-            <button
-              className={`conversation-session ${session.active ? "active" : ""} ${session.unavailable ? "unavailable" : ""}`}
-              type="button"
-              key={session.id}
-              aria-current={session.active ? "true" : undefined}
-              aria-busy={pendingSessionId === session.id || undefined}
-              title={session.preview ? `${session.title} · ${session.preview}` : session.title}
-              onClick={() => onSessionActivate(session.id)}
-            >
-              <span className="conversation-session__copy">
-                <span className="conversation-session__title">
-                  <strong>{session.title}</strong>
-                  {session.updatedLabel ? <time>{session.updatedLabel}</time> : null}
-                </span>
-                <small>{session.preview}</small>
-              </span>
-              {session.state ? <span className="conversation-session__state">{session.state}</span> : null}
-            </button>
-          ))}
+          {sessions.map((session) => <ConversationSessionRow
+            key={session.id}
+            session={session}
+            pendingSessionId={pendingSessionId}
+            onActivate={onSessionActivate}
+            onPrefetch={onSessionPrefetch}
+            actions={sessionActions?.(session)}
+          />)}
         </nav>
       </section>
 
@@ -136,6 +129,36 @@ export function ConversationNavigation({
       </div>
     </aside>
   );
+}
+
+export function ConversationSessionRow({ session, pendingSessionId, onActivate, onPrefetch, actions }: {
+  session: ConversationSession;
+  pendingSessionId?: string;
+  onActivate: (sessionId: string) => void;
+  onPrefetch?: (sessionId: string) => void;
+  actions?: NavigationRowAction[];
+}) {
+  return <NavigationRowMenu title={session.title} actions={actions}
+    className={`conversation-session-row ${session.active ? "active" : ""}`}>
+    <button
+      className={`conversation-session ${session.active ? "active" : ""} ${session.unavailable ? "unavailable" : ""}`}
+      type="button"
+      aria-current={session.active ? "true" : undefined}
+      aria-busy={pendingSessionId === session.id || undefined}
+      disabled={session.unavailable}
+      title={session.preview ? `${session.title} · ${session.preview}` : session.title}
+      onClick={() => onActivate(session.id)}
+      onPointerEnter={() => { if (!session.unavailable) onPrefetch?.(session.id); }}
+      onFocus={() => { if (!session.unavailable) onPrefetch?.(session.id); }}>
+      <span className="conversation-session__copy">
+        <span className="conversation-session__title">
+          <strong>{session.title}</strong>
+        </span>
+        <small>{session.preview}</small>
+      </span>
+      {session.state ? <span className="conversation-session__state">{session.state}</span> : null}
+    </button>
+  </NavigationRowMenu>;
 }
 
 function DestinationList({ destinations, featured = false }: { destinations: ConversationDestination[]; featured?: boolean }) {

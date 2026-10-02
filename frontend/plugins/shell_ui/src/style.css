@@ -1,0 +1,210 @@
+/* Shell owns the outer page, primary navigation behavior, and theme control.
+   顶栏的几何与视觉由 theme/src/product-band.css 统一拥有。 */
+
+  .unified-shell {
+    display: grid;
+    width: 100%;
+    height: 100dvh;
+    grid-template-rows: calc(var(--band-height) + env(safe-area-inset-top, 0px)) minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
+    overflow: hidden;
+    padding: 0;
+  }
+
+  /* Keep contributed SVGs in the same flex layout as the former inline icons. */
+  .shell-page-icon {
+    display: contents;
+  }
+
+  .shell-view-stack,
+  .shell-view,
+  .shell-view iframe {
+    width: 100%;
+    height: 100%;
+    min-width: 0;
+    min-height: 0;
+  }
+
+  .shell-view-stack {
+    position: relative;
+    overflow: hidden;
+    background: transparent;
+  }
+
+  .shell-view {
+    display: none;
+    overflow: hidden;
+  }
+
+  .shell-view.is-active {
+    display: block;
+    /* 页面内容超出视口时在视图内滚动，顶栏保持固定。 */
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+
+  .product-band__footer .theme-cycle-button {
+    min-height: 34px;
+    padding: 0 10px;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+  }
+
+  .product-band__footer .theme-cycle-button span {
+    display: none;
+  }
+
+  .theme-cycle-button {
+    @apply flex h-11 flex-shrink-0 cursor-pointer items-center justify-center gap-2 rounded-md border border-border bg-transparent px-3 text-fg;
+    transition-property: background-color, border-color, color, scale;
+    transition-duration: var(--ak-sys-duration-short);
+    transition-timing-function: var(--ak-sys-motion-standard);
+  }
+
+  .theme-cycle-button:hover {
+    @apply border-border-strong bg-surface-2;
+  }
+
+  .theme-cycle-button:active {
+    scale: 0.96;
+  }
+
+  .theme-cycle-button:focus-visible {
+    @apply outline outline-2 -outline-offset-2 outline-accent;
+  }
+
+  .theme-cycle-button span {
+    @apply text-[12px] font-medium;
+  }
+
+  /* 功能设置目录：模糊遮罩 + 上浮进入；窄屏贴底成动作面板。 */
+  .shell-settings-dialog {
+    width: min(460px, calc(100vw - 40px));
+    padding: 24px;
+    border: 1px solid var(--ak-rule-default);
+    border-radius: 14px;
+    background: var(--ak-paper-sheet);
+    color: var(--ak-ink-primary);
+  }
+
+  .shell-settings-dialog::backdrop {
+    background: color-mix(in oklch, var(--ak-ink-primary) 22%, transparent);
+    backdrop-filter: blur(3px);
+  }
+
+  .shell-settings-dialog header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .shell-settings-dialog h2 {
+    margin: 0;
+    font-size: 17px;
+  }
+
+  .shell-settings-dialog nav {
+    display: grid;
+    gap: 8px;
+    margin-top: 16px;
+  }
+
+  .shell-settings-dialog button {
+    display: flex;
+    min-height: 44px;
+    align-items: center;
+    gap: 10px;
+    font: inherit;
+    border: 1px solid var(--ak-rule-default);
+    border-radius: 8px;
+    padding: 8px 14px;
+    background: transparent;
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+    transition: background-color var(--ak-sys-duration-short) var(--ak-sys-motion-standard);
+  }
+
+  .shell-settings-dialog button:hover {
+    background: color-mix(in oklch, var(--ak-ink-primary) 5%, transparent);
+  }
+
+  .shell-settings-dialog header button {
+    border: 0;
+    min-height: 36px;
+  }
+
+  .shell-settings-dialog svg {
+    width: 16px;
+    height: 16px;
+    stroke-width: 1.75;
+  }
+
+@media (prefers-reduced-motion: no-preference) {
+  .shell-settings-dialog {
+    opacity: 0;
+    transform: translateY(6px) scale(0.98);
+    transition: opacity 180ms ease, transform 180ms ease,
+      display 180ms allow-discrete, overlay 180ms allow-discrete;
+  }
+
+  .shell-settings-dialog[open] {
+    opacity: 1;
+    transform: none;
+  }
+
+  .shell-settings-dialog::backdrop {
+    opacity: 0;
+    transition: opacity 180ms ease, display 180ms allow-discrete,
+      overlay 180ms allow-discrete;
+  }
+
+  .shell-settings-dialog[open]::backdrop {
+    opacity: 1;
+  }
+
+  @starting-style {
+    .shell-settings-dialog[open] {
+      opacity: 0;
+      transform: translateY(10px) scale(0.98);
+    }
+    .shell-settings-dialog[open]::backdrop {
+      opacity: 0;
+    }
+  }
+}
+
+@media (max-width: 760px) {
+    .unified-shell { --band-height: 96px; }
+    .product-band {
+      --band-inline: 12px;
+      --band-group-gap: 0;
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      grid-template-rows: 48px 48px;
+      gap: 0;
+    }
+    .product-band__brand { margin: 0; }
+    .product-band__footer { grid-column: 2; grid-row: 1; }
+    .product-band__nav { grid-column: 1 / -1; grid-row: 2; }
+    .product-band__item {
+      min-width: max-content;
+      flex: 1;
+      justify-content: center;
+      padding-inline: 0.75rem;
+      border-radius: 0;
+      font-size: 1rem;
+    }
+    .product-band__footer .theme-cycle-button { min-width: 44px; min-height: 44px; }
+    .shell-settings-dialog {
+      width: 100%;
+      max-width: none;
+      margin: auto 0 0;
+      border-radius: 16px 16px 0 0;
+      border-inline: 0;
+      border-block-end: 0;
+      padding-bottom: max(24px, env(safe-area-inset-bottom, 0px));
+    }
+}

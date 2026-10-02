@@ -9,6 +9,7 @@ from typing import cast
 from agent.plugin_composition.tasks import Task, TaskAdmission, TaskSlot
 from agent.plugin_composition.tasks import ExternalRootPermit
 from agent.plugin_composition.messages import (
+    MessageConflict,
     OwnerRecord,
     OwnerStore,
     OwnerTransaction,
@@ -19,6 +20,8 @@ from agent.plugin_contracts import (
     freeze_json,
 )
 from agent.plugin_contracts import json_value
+from agent.plugin_contracts.tools import CommitAfter
+from core.common.file_io import run_file_io
 
 from .api import (
     Authorize, Denied, InvalidArguments, MessageReply, OpenTool, Outcome, Result,
@@ -54,44 +57,16 @@ class ToolExecution:
             raise ValueError("工具调用必须有稳定 key")
         return coerce_result(await self._execute("program:" + key, binding_id, arguments, None))
 
-    async def execute_call(self, reply: MessageReply) -> Result:
+    async def execute_call(
+        self, reply: MessageReply, *, commit_after: CommitAfter | None = None,
+    ) -> Result:
         """同一已提交调用只有一个效果身份，与等待者及结果展示位置无关。"""
         self._state.check_access(reply.reader, reply.writer)
         call = reply.request()
         key = durable_call_key(reply.call_ref)
-        return coerce_result(await self._execute(key, call.binding_id, call.arguments, reply))
-
-    async def deny_call(self, reply: MessageReply, reason: str) -> Result:
-        """结算不再获准启动的调用；已有执行先排空，崩溃后的 start 不能伪称未发生。"""
-        self._state.check_access(reply.reader, reply.writer)
-        call = reply.request()
-        key = durable_call_key(reply.call_ref)
-        fingerprint = _fingerprint(call.binding_id, call.arguments, reply)
-
-        async def deny(task: Task) -> Result:
-            record = self._record(key, fingerprint)
-            if record is not None:
-                if record.value["phase"] == "done":
-                    return reply.read(record.value["result"])
-            reply.check(self._state)
-            if record is None:
-                record = self._save(key, None, {
-                    "version": 1, "request": fingerprint, "binding": call.binding_id,
-                    "reply_id": reply.message_id,
-                    "phase": "prepared", "arguments": call.arguments,
-                })
-            outcome: Outcome = "interrupted" if record.value["phase"] == "started" else "denied"
-            return finish(self._state, key, record, Result(outcome, (ContentPart("text", reason),)), reply)
-
-        def admit(slot: TaskSlot) -> Task:
-            return slot.current if slot.current is not None else slot.start(deny)
-
-        task = await self._tasks.admit((self._task_key, key), admit)
-        # 普通拒绝仍等待已跨过 start 的 owner；明确放弃使用独立的控制消费者。
-        result = coerce_result(await task.join())
-        if self._record(key, fingerprint) is None:
-            raise RuntimeError("工具结算缺少回执")
-        return result
+        return coerce_result(await self._execute(
+            key, call.binding_id, call.arguments, reply, commit_after,
+        ))
 
     async def _execute(
         self,
@@ -99,6 +74,7 @@ class ToolExecution:
         binding_id: str,
         arguments: Mapping[str, object],
         reply: MessageReply | None,
+        commit_after: CommitAfter | None = None,
     ) -> Result:
         if not isinstance(binding_id, str) or not binding_id:
             raise ValueError("工具调用必须固定 binding")
@@ -108,13 +84,24 @@ class ToolExecution:
         fingerprint = _fingerprint(binding_id, arguments, reply)
 
         async def run(task: Task) -> Result:
-            return await self._run(task, key, binding_id, arguments, fingerprint, reply)
+            return await self._run(
+                task, key, binding_id, arguments, fingerprint, reply, commit_after,
+            )
 
         # 1. 不同插件 scope 共用获授的 Task key，热更不能把活调用当成崩溃。
-        def admit(slot: TaskSlot) -> tuple[Task, bool]:
+        async def admit(slot: TaskSlot) -> tuple[Task, bool]:
             current = slot.current
             if current is not None:
                 return current, False
+            record = await run_file_io(lambda: self._record(key, fingerprint))
+            if record is None:
+                if reply is not None:
+                    reply.check(self._state)
+                await self._save(key, None, {
+                    "version": 1, "request": fingerprint, "binding": binding_id,
+                    "reply_id": None if reply is None else reply.message_id,
+                    "phase": "requested", "arguments": arguments,
+                })
             permit = None if self._child_permit is None else self._child_permit()
             try:
                 started = slot.start(run)
@@ -126,7 +113,7 @@ class ToolExecution:
                 started.on_done(permit.release)
             return started, True
 
-        task, owned = await self._tasks.admit((self._task_key, key), admit)
+        task, owned = await self._tasks.admit_async((self._task_key, key), admit)
         try:
             result = (
                 cast(Result, await task.join()) if reply is None
@@ -142,8 +129,14 @@ class ToolExecution:
             raise ValueError("同一工具 key 的 binding 或参数不一致")
         return result
 
+    async def settle_abandoned(self, reply: MessageReply) -> Result:
+        """放弃调用的窄幂等结算入口；ReAct 与后台 watcher 共用同一回执。"""
+        from .abandon import abandon_call
+
+        return await abandon_call(self._state, self._tasks, reply, task_key=self._task_key)
+
     async def _wait_result(self, task: Task, key: str, fingerprint: str, reply: MessageReply) -> Result:
-        """结果可先于物理清理提交；消息订阅只负责唤醒，回执仍是唯一结算事实。"""
+        """持久终态提交即释放等待者；物理清理由原 Task 独立排空。"""
         async def recorded() -> Result:
             call = reply.reader.get(reply.call_ref.message_id)
             if call is None:
@@ -152,24 +145,27 @@ class ToolExecution:
             async for _ in reply.reader.follow(after_seq=call.seq - 1):
                 record = self._record(key, fingerprint)
                 if record is not None and record.value["phase"] == "done":
-                    result = reply.read(record.value["result"])
-                    if reply.abandoned():
-                        return result
+                    return reply.read(record.value["result"])
             raise RuntimeError("工具结果订阅提前结束")
 
         joined = asyncio.create_task(task.join())
         terminal = asyncio.create_task(recorded())
         try:
             done, _ = await asyncio.wait((joined, terminal), return_when=asyncio.FIRST_COMPLETED)
-            if terminal in done:
-                return terminal.result()
-            # 同轮取消与结算竞争时，以已经提交的事实为准。
-            record = self._record(key, fingerprint)
-            if record is not None and record.value["phase"] == "done":
-                result = reply.read(record.value["result"])
-                if reply.abandoned():
-                    return result
-            return cast(Result, joined.result())
+            if joined in done:
+                failure = None if joined.cancelled() else joined.exception()
+                if failure is not None and not isinstance(failure, asyncio.CancelledError):
+                    raise failure
+                # 取消与结算竞争时以已提交的事实为准。
+                record = self._record(key, fingerprint)
+                if record is not None and record.value["phase"] == "done":
+                    return reply.read(record.value["result"])
+                return cast(Result, joined.result())
+            result = terminal.result()
+            if result.outcome == "error":
+                # 异步落盘会先唤醒订阅；错误回执不能抢在原异常之前伪装成正常返回。
+                return cast(Result, await joined)
+            return result
         finally:
             _ = joined.cancel()
             _ = terminal.cancel()
@@ -183,8 +179,15 @@ class ToolExecution:
         arguments: Mapping[str, object],
         fingerprint: str,
         reply: MessageReply | None,
+        commit_after: CommitAfter | None = None,
     ) -> Result:
         """恢复先查回执；最终授权后先落盘 start，再进入真实工具。"""
+        # 同批重叠调用只并发执行；结果提交仍等前驱完成。
+        async def commit(record: OwnerRecord | None, result: Result) -> Result:
+            if commit_after is not None:
+                await commit_after.wait()
+            return await finish(self._state, key, record, result, reply)
+
         record = self._record(key, fingerprint)
         if record is not None:
             if record.value["phase"] == "done":
@@ -198,11 +201,7 @@ class ToolExecution:
             if reply is not None:
                 reply.check(self._state)
             if record is None:
-                record = self._save(key, None, {
-                    "version": 1, "request": fingerprint, "binding": binding_id,
-                    "reply_id": None if reply is None else reply.message_id,
-                    "phase": "requested", "arguments": arguments,
-                })
+                raise RuntimeError("已接纳工具缺少 requested 回执")
             async with self._open_tool(binding_id) as tool:
                 if not task.active:
                     raise asyncio.CancelledError
@@ -212,12 +211,13 @@ class ToolExecution:
                     try:
                         prepared = await tool.prepare(arguments, source)
                         if isinstance(prepared, str):
-                            return finish(self._state, key, record,
-                                Result("error", (ContentPart("text", prepared),)), reply)
+                            return await commit(
+                                record, Result("error", (ContentPart("text", prepared),)),
+                            )
                         final = freeze_json(prepared)
                     except InvalidArguments as error:
-                        return finish(self._state,
-                            key, record, Result("error", (ContentPart("text", str(error)),)), reply,
+                        return await commit(
+                            record, Result("error", (ContentPart("text", str(error)),)),
                         )
                     if not isinstance(final, Mapping):
                         raise TypeError("工具 prepare 必须返回参数对象")
@@ -231,81 +231,96 @@ class ToolExecution:
                         "phase": "prepared",
                         "arguments": final,
                     }
-                    record = self._save(key, record, value)
+                    record = await self._save(key, record, value)
                 final_arguments = cast(Mapping[str, object], record.value["arguments"])
                 started = record.value["phase"] == "started"
                 # 3. 已跨过 start 的调用先 query；只有同 key 幂等协议才允许重发。
                 if started:
                     found = await tool.query(key)
                     if found is not None:
-                        return finish(self._state, key, record, found, reply)
+                        return await commit(record, found)
                     if not tool.idempotent:
-                        return finish(self._state,
-                            key,
+                        return await commit(
                             record,
                             Result(
                                 "error", (ContentPart("text", "原工具调用中断且没有可查询结果；先检查当前状态，不要直接重复执行原操作。"),)
                             ),
-                            reply,
                         )
                 # 4. 只为即将发生的调用授权；撤权不能抹掉可查询的历史结果。
                 try:
                     permission = await self._authorize(binding_id, final_arguments)
                     if isinstance(permission, str):
-                        return finish(self._state, key, record, Result(
+                        return await commit(record, Result(
                             "interrupted" if started else "denied",
-                            (ContentPart("text", permission),)), reply)
-                    if reply is not None:
-                        reply.check_start()
+                            (ContentPart("text", permission),)))
                 except Denied as error:
-                    return finish(self._state,
-                        key,
+                    return await commit(
                         record,
                         Result(
                             "interrupted" if started else "denied",
                             (ContentPart("text", str(error)),),
                         ),
-                        reply,
                     )
                 if not task.active:
                     raise asyncio.CancelledError
                 if reply is not None:
-                    reply.check(self._state)
-                record = self._save(
-                    key,
-                    record,
-                    {**record.value, "phase": "started", "permission": permission},
-                )
+                    with reply.reader.read_snapshot():
+                        reply.check(self._state)
+                previous = record
+
+                def start(transaction: OwnerTransaction) -> OwnerRecord:
+                    if reply is not None:
+                        reply.check_start(transaction)
+                    return transaction.save(
+                        key, {**previous.value, "phase": "started", "permission": permission},
+                        expected_version=previous.version,
+                    )
+
+                def committed(value: OwnerRecord) -> None:
+                    nonlocal record
+                    record = value
+
+                # Source 前提和 started 共同提交；取消也先取回已提交版本。
+                try:
+                    record = await self._state.transact_async(start, on_commit=committed)
+                except Denied as error:
+                    return await commit(record, Result(
+                        "interrupted" if started else "denied",
+                        (ContentPart("text", str(error)),),
+                    ))
                 try:
                     result = await tool.invoke(key, final_arguments)
                 except BaseException as failure:
                     # start intent 已耐久；内部异常或取消都不能证明远端没有效果。
                     try:
-                        _ = finish(self._state,
-                            key,
+                        _ = await commit(
                             record,
                             Result(
                                 "interrupted" if isinstance(failure, asyncio.CancelledError) else "error",
                                 (ContentPart("text", "工具调用取消，已执行的效果不会撤销。" if isinstance(failure, asyncio.CancelledError) else f"工具执行失败: {type(failure).__name__}；已执行的效果不会撤销。"),),
                             ),
-                            reply,
                         )
                     except Exception as record_failure:
                         raise failure from record_failure
                     raise
-                return finish(self._state, key, record, result, reply)
+                return await commit(record, result)
+        except MessageConflict:
+            # requested/prepared 等待期间，放弃可能先提交终态。
+            current = await run_file_io(lambda: self._record(key, fingerprint))
+            if current is None or current.value["phase"] != "done":
+                raise
+            return (_read_result(current.value["result"]) if reply is None
+                    else await run_file_io(lambda: reply.read(current.value["result"])))
         except asyncio.CancelledError as failure:
             # 恢复期间取消也终结原 started intent，不能稍后借重试重新发起效果。
             try:
                 current = self._state.read(key)
                 if current is not None and current.value["phase"] == "started":
-                    _ = finish(self._state,
-                        key,
+                    _ = await commit(
                         current,
                         Result(
                             "interrupted", (ContentPart("text", "原工具调用在恢复时取消；已执行的效果不会撤销。"),)
                         ),
-                        reply,
                     )
             except Exception as record_failure:
                 raise failure from record_failure
@@ -321,10 +336,10 @@ class ToolExecution:
                 raise ValueError("同一工具 key 的 binding 或参数不一致")
         return record
 
-    def _save(
+    async def _save(
         self, key: str, previous: OwnerRecord | None, value: Mapping[str, object]
     ) -> OwnerRecord:
-        return self._state.transact(
+        return await self._state.transact_async(
             lambda transaction: transaction.save(
                 key,
                 value,
@@ -332,14 +347,44 @@ class ToolExecution:
             )
         )
 
-def finish(
+async def finish(
     state: OwnerStore, key: str, record: OwnerRecord | None, result: Result,
     reply: MessageReply | None, *, initial: Mapping[str, object] | None = None,
+    on_commit: Callable[[Result], None] | None = None,
 ) -> Result:
     """正文与回执同事务提交；放弃或真实结果先提交者胜出，迟到结果只读。"""
     value = initial if record is None else record.value
     if value is None:
         raise RuntimeError("工具结果缺少原请求身份")
+
+    def completed() -> Result | None:
+        current = state.read(key)
+        if current is None or current.value["phase"] != "done":
+            return None
+        if current.value["request"] != value["request"]:
+            raise ValueError("同一工具 key 的 binding 或参数不一致")
+        return (_read_result(current.value["result"]) if reply is None
+                else reply.read(current.value["result"]))
+
+    previous = await run_file_io(lambda: state.snapshot(completed))
+    if previous is not None:
+        if on_commit is not None:
+            on_commit(previous)
+        return previous
+    prepared = None
+    if reply is not None:
+        try:
+            prepared = await reply.writer.prepare_async(
+                reply.message_id, ToolResult(reply.call_ref, result.outcome, result.parts),
+            )
+        except MessageConflict:
+            # 放弃与真实结果竞争同一身份；只采用已经完成的权威回执。
+            previous = await run_file_io(lambda: state.snapshot(completed))
+            if previous is None:
+                raise
+            if on_commit is not None:
+                on_commit(previous)
+            return previous
 
     def commit(transaction: OwnerTransaction) -> Result:
         current = transaction.read(key)
@@ -352,18 +397,18 @@ def finish(
         if reply is None:
             saved = _result_value(result)
         else:
-            message = transaction.append(
-                reply.writer, reply.message_id,
-                ToolResult(reply.call_ref, result.outcome, result.parts),
-            )
+            assert prepared is not None
+            message = transaction.append_prepared(prepared)
             saved = {"message_id": message.message_id, "seq": message.seq}
+        if current is not None and current.value["request"] != value["request"]:
+            raise ValueError("同一工具 key 的 binding 或参数不一致")
         _ = transaction.save(
-            key, {**value, "phase": "done", "result": saved},
-            expected_version=None if record is None else record.version,
+            key, {**(value if current is None else current.value), "phase": "done", "result": saved},
+            expected_version=None if current is None else current.version,
         )
         return result
 
-    return state.transact(commit)
+    return await state.transact_async(commit, on_commit=on_commit)
 
 
 async def _drain(task: Task) -> None:

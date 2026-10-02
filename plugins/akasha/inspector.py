@@ -1,1113 +1,225 @@
-"""Read Akasha V2 retrieval evidence without mutating learned state."""
+"""查询事实与原始 Message 的只读投影；不重算实际召回。"""
 
 from __future__ import annotations
 
 import json
-import math
-import sqlite3
-import threading
-from collections.abc import Callable
-from contextlib import closing
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
+from threading import Lock
 from typing import cast
-from zoneinfo import ZoneInfo
 
-import numpy as np
-
-from agent.plugin_composition import MobileUiRpcInvalidRequest
+from agent.plugin_composition import PluginUiRpcInvalidRequest
 from agent.plugin_composition.messages import MessageCatalog
-from agent.plugin_contracts import ContentPart, Input, Output
+from agent.plugin_contracts import CallRef, ContentPart, Input, Message, Output, ToolCall, ToolResult, json_value
+from agent.plugin_contracts.tools import durable_call_key
 from ._boundaries import Turn, TurnProjection
-from .recalls import ContextSource, ProgramSource, Recall, ToolSource
-from .config import AkashaConfig, resolve_memory_path
-from .infrastructure.sparse_index.schema import (
-    INDEX_VERSION,
-    TOOL_CHAIN_PROJECTION_VERSION,
-)
-
-_LOCAL_TZ = ZoneInfo("Asia/Shanghai")
-
-
-@dataclass(frozen=True)
-class InspectorPaths:
-    """Locate the two read-only Akasha sidecars."""
-
-    memory: Path
-    index: Path
-
-
-@dataclass(frozen=True)
-class _DenseSnapshot:
-    """Keep normalized turn vectors and their display metadata in memory."""
-
-    signature: tuple[int, int]
-    turns: tuple[dict[str, object], ...]
-    user: np.ndarray
-    assistant: np.ndarray
-    user_present: np.ndarray
-    assistant_present: np.ndarray
-
-
-def resolve_inspector_paths(
-    *,
-    memory_root: Path,
-    config: AkashaConfig,
-) -> InspectorPaths:
-    """Resolve immutable Akasha sidecars from explicit roots and config."""
-
-    config.validate()
-    return InspectorPaths(
-        memory=resolve_memory_path(memory_root, config.db_path),
-        index=resolve_memory_path(memory_root, config.index_path),
-    )
-
-
-class AkashaInspectorReader:
-    """Expose historical cue, activation, completion, and prompt evidence."""
-
-    def __init__(
-        self,
-        *,
-        memory_root: Path,
-        config: AkashaConfig,
-    ) -> None:
-        self.config = config
-        self.paths = resolve_inspector_paths(
-            memory_root=memory_root,
-            config=config,
-        )
-        self.memory_root = memory_root.resolve(strict=False)
-        self._dense_lock = threading.RLock()
-        self._dense_snapshot: _DenseSnapshot | None = None
-
-    def _is_fresh_empty(self) -> bool:
-        """Return whether no learned state exists yet, allowing a valid empty index."""
-
-        if self.paths.memory.exists():
-            return False
-        if not self.paths.index.exists():
-            return True
-
-        # 1. Recognize the empty sparse projection emitted for a fresh session DB.
-        with closing(
-            sqlite3.connect(
-                f"file:{self.paths.index}?mode=ro",
-                uri=True,
-            )
-        ) as connection:
-            row = connection.execute(
-                "SELECT value FROM metadata WHERE key='index_version'"
-            ).fetchone()
-            if row is None or str(row[0]) != INDEX_VERSION:
-                return False
-            projection = connection.execute(
-                "SELECT value FROM metadata "
-                "WHERE key='tool_chain_projection_version'"
-            ).fetchone()
-            if projection is None or str(projection[0]) != (
-                TOOL_CHAIN_PROJECTION_VERSION
-            ):
-                return False
-            columns = {
-                str(item[1])
-                for item in connection.execute("PRAGMA table_info(sparse_turns)")
-            }
-            if "assistant_tool_chain_json" not in columns:
-                return False
-            count = connection.execute(
-                "SELECT COUNT(*) FROM sparse_turns"
-            ).fetchone()
-            return count is not None and int(count[0]) == 0
-
-    def get_overview(self) -> dict[str, object]:
-        """Return the number and time range of committed retrieval events."""
-
-        if self._is_fresh_empty():
-            return {
-                "available": True,
-                "total": 0,
-                "latest_at": None,
-                "earliest_at": None,
-            }
-        with closing(self._connect()) as connection:
-            row = connection.execute("""
-                SELECT
-                    COUNT(*) AS total,
-                    MAX(turn.started_at) AS latest_at,
-                    MIN(turn.started_at) AS earliest_at
-                FROM memory_events AS event
-                JOIN turn_nodes AS turn
-                  ON turn.node_id = event.current_turn_node_id
-                """).fetchone()
-        return {
-            "available": True,
-            "total": int(row["total"]),
-            "latest_at": row["latest_at"],
-            "earliest_at": row["earliest_at"],
-        }
-
-    def list_turns(
-        self,
-        *,
-        session_key: str = "",
-        q: str = "",
-        page: int = 1,
-        page_size: int = 50,
-    ) -> tuple[list[dict[str, object]], int]:
-        """List committed retrievals in reverse causal order."""
-
-        if self._is_fresh_empty():
-            return [], 0
-
-        # 1. Build filters only from validated HTTP or mobile inputs.
-        where: list[str] = []
-        values: list[object] = []
-        if session_key:
-            where.append("turn.session_key = ?")
-            values.append(session_key)
-        if q:
-            where.append(
-                "instr(lower(turn.session_key || char(10) || "
-                "sparse_turn.user_text || char(10) || "
-                "sparse_turn.assistant_text), lower(?)) > 0"
-            )
-            values.append(q)
-        predicate = f"WHERE {' AND '.join(where)}" if where else ""
-
-        # 2. Count and page one stable read-only snapshot.
-        with closing(self._connect()) as connection:
-            total = int(
-                connection.execute(
-                    f"""
-                    SELECT COUNT(*)
-                    FROM memory_events AS event
-                    JOIN turn_nodes AS turn
-                      ON turn.node_id = event.current_turn_node_id
-                    JOIN sparse.sparse_turns AS sparse_turn
-                      ON sparse_turn.turn_id = turn.turn_id
-                    {predicate}
-                    """,
-                    values,
-                ).fetchone()[0]
-            )
-            rows = connection.execute(
-                f"""
-                SELECT
-                    turn.turn_id AS query_id,
-                    turn.session_key,
-                    turn.user_seq AS seq,
-                    turn.started_at AS ts,
-                    sparse_turn.user_text AS query_text,
-                    event.seed_support AS seed_count,
-                    COALESCE(
-                        activation.completion_support,
-                        (
-                            SELECT COUNT(*)
-                            FROM recall_items AS item
-                            WHERE item.query_turn_node_id = turn.node_id
-                        )
-                    ) AS activation_count,
-                    COALESCE(
-                        activation.graph_only_support,
-                        (
-                            SELECT COUNT(*)
-                            FROM recall_items AS item
-                            WHERE item.query_turn_node_id = turn.node_id
-                              AND item.is_pattern_only = 1
-                        )
-                    ) AS graph_only_count,
-                    COALESCE(activation.pushes, event.pushes) AS pushes,
-                    COALESCE(activation.residual_l1, event.residual_l1)
-                        AS residual_l1,
-                    COALESCE(recall.active_basin_count, 0)
-                        AS basin_count,
-                    recall.query_turn_node_id IS NOT NULL
-                        AS recall_capture_available,
-                    (
-                        SELECT COUNT(*)
-                        FROM recall_items AS item
-                        WHERE item.query_turn_node_id = turn.node_id
-                    ) AS completion_count
-                FROM memory_events AS event
-                JOIN turn_nodes AS turn
-                  ON turn.node_id = event.current_turn_node_id
-                JOIN sparse.sparse_turns AS sparse_turn
-                  ON sparse_turn.turn_id = turn.turn_id
-                LEFT JOIN activation_runs AS activation
-                  ON activation.query_turn_node_id = turn.node_id
-                LEFT JOIN recall_runs AS recall
-                  ON recall.query_turn_node_id = turn.node_id
-                {predicate}
-                ORDER BY turn.node_id DESC
-                LIMIT ? OFFSET ?
-                """,
-                [*values, page_size, (page - 1) * page_size],
-            ).fetchall()
-        items = [dict(row) for row in rows]
-        for item in items:
-            item["recall_capture_available"] = bool(item["recall_capture_available"])
-        return items, total
-
-    def get_turn(self, query_id: str) -> dict[str, object] | None:
-        """Return one retrieval with seeds, paths, prompt lanes, and learning."""
-
-        if self._is_fresh_empty():
-            return None
-
-        # 1. Read the persisted causal evidence for this query turn.
-        with closing(self._connect()) as connection:
-            run = self._load_run(connection, query_id)
-            if run is None:
-                return None
-            node_id = cast(int, run["node_id"])
-            seeds = self._load_seeds(connection, node_id)
-            activations = self._load_activations(connection, node_id)
-            completions = self._load_completions(connection, node_id)
-        tool_left, tool_right = _tool_recall_lanes(run.pop("tool_chain_json"))
-
-        # 2. Reconstruct the host-visible lanes from frozen prior turns.
-        dense = self._dense_items(node_id)
-        dense_ids = {str(item["query_id"]) for item in dense}
-        right = [
-            item for item in completions if str(item["query_id"]) not in dense_ids
-        ][: self.config.context_recall_limit]
-        dense = _sort_by_time(dense)
-        right = _sort_by_time(right)
-        text_block = _render_context_block(
-            dense,
-            right,
-            str(run["ts"]),
-        )
-        if len(text_block) > self.config.inject_max_chars:
-            omitted = len(text_block) - self.config.inject_max_chars
-            text_block = (
-                text_block[: self.config.inject_max_chars].rstrip()
-                + f"\n...[Akasha 已截断 {omitted} 字]"
-            )
-        return {
-            **run,
-            "seeds": seeds,
-            "activation_items": activations,
-            "left": dense,
-            "right": right,
-            "left_count": len(dense),
-            "right_count": len(right),
-            "tool_left": tool_left,
-            "tool_right": tool_right,
-            "tool_left_count": len(tool_left),
-            "tool_right_count": len(tool_right),
-            "inject_chars": len(text_block),
-            "text_block_preview": text_block,
-        }
-
-    def latest_for_session(
-        self,
-        session_key: str,
-    ) -> dict[str, object] | None:
-        """Return the latest committed retrieval for one session."""
-
-        if self._is_fresh_empty():
-            return None
-
-        with closing(self._connect()) as connection:
-            row = connection.execute(
-                """
-                SELECT turn.turn_id
-                FROM memory_events AS event
-                JOIN turn_nodes AS turn
-                  ON turn.node_id = event.current_turn_node_id
-                WHERE turn.session_key = ?
-                ORDER BY turn.node_id DESC
-                LIMIT 1
-                """,
-                (session_key,),
-            ).fetchone()
-        return None if row is None else self.get_turn(str(row["turn_id"]))
-
-    def for_assistant_message(
-        self,
-        session_key: str,
-        message_id: str,
-    ) -> dict[str, object] | None:
-        """Resolve one persisted assistant message to its retrieval event."""
-
-        if self._is_fresh_empty():
-            return None
-
-        with closing(self._connect()) as connection:
-            row = connection.execute(
-                """
-                SELECT turn.turn_id
-                FROM memory_events AS event
-                JOIN turn_nodes AS turn
-                  ON turn.node_id = event.current_turn_node_id
-                WHERE turn.session_key = ?
-                  AND turn.assistant_message_id = ?
-                """,
-                (session_key, message_id),
-            ).fetchone()
-        return None if row is None else self.get_turn(str(row["turn_id"]))
-
-    def _connect(self) -> sqlite3.Connection:
-        """Open both sidecars read-only for one coherent inspection query."""
-
-        # 1. Open the learned-state sidecar before attaching the sparse projection.
-        connection = sqlite3.connect(
-            f"file:{self.paths.memory}?mode=ro",
-            uri=True,
-        )
-        try:
-            # 2. Validate the exact projection before returning an owned handle.
-            connection.row_factory = sqlite3.Row
-            _ = connection.execute(
-                "ATTACH DATABASE ? AS sparse",
-                (f"file:{self.paths.index}?mode=ro",),
-            )
-            self._validate_sidecar_schema(connection)
-            _ = connection.execute("PRAGMA query_only = ON")
-        except BaseException:
-            connection.close()
-            raise
-        return connection
-
-    @staticmethod
-    def _validate_sidecar_schema(connection: sqlite3.Connection) -> None:
-        """Reject sidecars that cannot reproduce the Inspector tool lane."""
-
-        row = connection.execute(
-            "SELECT value FROM sparse.metadata WHERE key='index_version'"
-        ).fetchone()
-        actual_version = None if row is None else str(row[0])
-        if actual_version != INDEX_VERSION:
-            raise ValueError(
-                f"unsupported sparse index version: {actual_version}; "
-                "explicit rebuild is required"
-            )
-        columns = {
-            str(item[1])
-            for item in connection.execute("PRAGMA sparse.table_info(sparse_turns)")
-        }
-        if "assistant_tool_chain_json" not in columns:
-            raise ValueError(
-                "sparse index lacks assistant tool-chain projection; "
-                "explicit rebuild is required"
-            )
-        projection = connection.execute(
-            "SELECT value FROM sparse.metadata "
-            "WHERE key='tool_chain_projection_version'"
-        ).fetchone()
-        actual_projection = None if projection is None else str(projection[0])
-        if actual_projection != TOOL_CHAIN_PROJECTION_VERSION:
-            raise ValueError(
-                "unsupported assistant tool-chain projection version: "
-                f"{actual_projection}; explicit rebuild is required"
-            )
-
-    @staticmethod
-    def _load_run(
-        connection: sqlite3.Connection,
-        query_id: str,
-    ) -> dict[str, object] | None:
-        row = connection.execute(
-            """
-            SELECT
-                turn.node_id,
-                turn.turn_id AS query_id,
-                turn.session_key,
-                turn.user_seq AS seq,
-                turn.user_message_id,
-                turn.assistant_message_id,
-                turn.started_at AS ts,
-                sparse_turn.user_text AS query_text,
-                sparse_turn.assistant_text,
-                sparse_turn.assistant_tool_chain_json AS tool_chain_json,
-                event.time_prior,
-                event.continuation,
-                COALESCE(activation.pushes, event.pushes) AS pushes,
-                COALESCE(activation.residual_l1, event.residual_l1)
-                    AS residual_l1,
-                event.seed_support AS seed_count,
-                activation.query_turn_node_id IS NOT NULL
-                    AS activation_capture_available,
-                recall.query_turn_node_id IS NOT NULL
-                    AS recall_capture_available,
-                EXISTS (
-                    SELECT 1
-                    FROM sparse.turn_dense AS query_dense
-                    WHERE query_dense.turn_id = turn.turn_id
-                      AND query_dense.field = 'user'
-                ) AS projection_ready,
-                COALESCE(
-                    activation.completion_support,
-                    (
-                        SELECT COUNT(*)
-                        FROM recall_items AS item
-                        WHERE item.query_turn_node_id = turn.node_id
-                    )
-                ) AS activation_count,
-                activation.completion_effective_support,
-                activation.completion_mass,
-                COALESCE(
-                    activation.graph_only_support,
-                    (
-                        SELECT COUNT(*)
-                        FROM recall_items AS item
-                        WHERE item.query_turn_node_id = turn.node_id
-                          AND item.is_pattern_only = 1
-                    )
-                ) AS graph_only_count,
-                activation.graph_only_effective_support,
-                activation.graph_only_mass,
-                COALESCE(recall.active_basin_count, 0)
-                    AS basin_count,
-                COALESCE(recall.sharp_completion_count, 0)
-                    AS sharp_completion_count,
-                COALESCE(recall.basin_direct_count, 0)
-                    AS basin_direct_count,
-                COALESCE(recall.basin_completion_count, 0)
-                    AS basin_completion_count,
-                COALESCE(recall.relative_tail_count, 0)
-                    AS relative_tail_count,
-                event.surprise,
-                event.modification_threshold,
-                event.observed_mass,
-                event.recurrent_mass,
-                event.reactivated_mass,
-                event.potentiated_mass,
-                event.inhibited_mass
-            FROM memory_events AS event
-            JOIN turn_nodes AS turn
-              ON turn.node_id = event.current_turn_node_id
-            JOIN sparse.sparse_turns AS sparse_turn
-              ON sparse_turn.turn_id = turn.turn_id
-            LEFT JOIN activation_runs AS activation
-              ON activation.query_turn_node_id = turn.node_id
-            LEFT JOIN recall_runs AS recall
-              ON recall.query_turn_node_id = turn.node_id
-            WHERE turn.turn_id = ?
-            """,
-            (query_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        item = dict(row)
-        item["activation_capture_available"] = bool(
-            item["activation_capture_available"]
-        )
-        item["recall_capture_available"] = bool(item["recall_capture_available"])
-        item["projection_ready"] = bool(item["projection_ready"])
-        return item
-
-    @staticmethod
-    def _load_seeds(
-        connection: sqlite3.Connection,
-        node_id: int,
-    ) -> list[dict[str, object]]:
-        rows = connection.execute(
-            """
-            SELECT
-                candidate.turn_id AS query_id,
-                candidate.session_key,
-                candidate.started_at AS ts,
-                sparse_turn.user_text,
-                sparse_turn.assistant_text,
-                seed.value,
-                seed.channels_json
-            FROM memory_events AS event
-            JOIN event_seeds AS seed
-              ON seed.event_id = event.event_id
-            JOIN turn_nodes AS candidate
-              ON candidate.node_id = seed.candidate_turn_node_id
-            JOIN sparse.sparse_turns AS sparse_turn
-              ON sparse_turn.turn_id = candidate.turn_id
-            WHERE event.current_turn_node_id = ?
-            ORDER BY seed.value DESC, candidate.node_id
-            """,
-            (node_id,),
-        ).fetchall()
-        return [
-            {
-                **dict(row),
-                "assistant_preview": _assistant_preview(str(row["assistant_text"])),
-                "channels": _json_list(
-                    row["channels_json"],
-                    "event_seeds.channels_json",
-                ),
-            }
-            for row in rows
-        ]
-
-    @staticmethod
-    def _load_activations(
-        connection: sqlite3.Connection,
-        node_id: int,
-    ) -> list[dict[str, object]]:
-        rows = connection.execute(
-            """
-            SELECT
-                candidate.turn_id AS query_id,
-                candidate.session_key,
-                candidate.started_at AS ts,
-                sparse_turn.user_text,
-                sparse_turn.assistant_text,
-                item.rank,
-                item.seed_score,
-                item.direct_mass,
-                item.settled_mass,
-                item.completion_mass,
-                item.is_graph_only,
-                item.first_relation,
-                item.dominant_path_json,
-                item.relation_path_json
-            FROM activation_items AS item
-            JOIN turn_nodes AS candidate
-              ON candidate.node_id = item.candidate_turn_node_id
-            JOIN sparse.sparse_turns AS sparse_turn
-              ON sparse_turn.turn_id = candidate.turn_id
-            WHERE item.query_turn_node_id = ?
-            ORDER BY item.rank
-            """,
-            (node_id,),
-        ).fetchall()
-        return [
-            {
-                **dict(row),
-                "assistant_preview": _assistant_preview(str(row["assistant_text"])),
-                "graph_only": bool(row["is_graph_only"]),
-                "dominant_path": _json_list(
-                    row["dominant_path_json"],
-                    "activation_items.dominant_path_json",
-                ),
-                "relation_path": _json_list(
-                    row["relation_path_json"],
-                    "activation_items.relation_path_json",
-                ),
-            }
-            for row in rows
-        ]
-
-    @staticmethod
-    def _load_completions(
-        connection: sqlite3.Connection,
-        node_id: int,
-    ) -> list[dict[str, object]]:
-        rows = connection.execute(
-            """
-            SELECT
-                candidate.turn_id AS query_id,
-                candidate.session_key,
-                candidate.user_message_id,
-                candidate.assistant_message_id,
-                candidate.started_at AS ts,
-                sparse_turn.user_text,
-                sparse_turn.assistant_text,
-                item.rank,
-                item.score,
-                item.sources_json,
-                item.basin_ids_json,
-                item.is_pattern_only
-            FROM recall_items AS item
-            JOIN turn_nodes AS candidate
-              ON candidate.node_id = item.candidate_turn_node_id
-            JOIN sparse.sparse_turns AS sparse_turn
-              ON sparse_turn.turn_id = candidate.turn_id
-            WHERE item.query_turn_node_id = ?
-            ORDER BY item.rank
-            """,
-            (node_id,),
-        ).fetchall()
-        return [
-            {
-                **dict(row),
-                "assistant_preview": _assistant_preview(str(row["assistant_text"])),
-                "sources": _json_list(
-                    row["sources_json"],
-                    "recall_items.sources_json",
-                ),
-                "basin_ids": _json_list(
-                    row["basin_ids_json"],
-                    "recall_items.basin_ids_json",
-                ),
-                "pattern_only": bool(row["is_pattern_only"]),
-            }
-            for row in rows
-        ]
-
-    def _dense_items(self, query_node_id: int) -> list[dict[str, object]]:
-        """Compute the exact prior-only dense top five with vectorized dots."""
-
-        snapshot = self._load_dense_snapshot()
-        if query_node_id <= 0 or query_node_id >= len(snapshot.turns):
-            return []
-        if not snapshot.user_present[query_node_id]:
-            return []
-
-        # 1. Score both message fields for every causally prior turn.
-        query = snapshot.user[query_node_id]
-        user_scores = snapshot.user[:query_node_id] @ query
-        assistant_scores = snapshot.assistant[:query_node_id] @ query
-        user_scores[~snapshot.user_present[:query_node_id]] = -np.inf
-        assistant_scores[~snapshot.assistant_present[:query_node_id]] = -np.inf
-        scores = np.maximum(user_scores, assistant_scores)
-
-        # 2. Apply the engine's score-desc, node-id-asc tie break.
-        nodes = np.arange(query_node_id)
-        ranked = np.lexsort((nodes, -scores))
-        selected = [int(node) for node in ranked if math.isfinite(float(scores[node]))][
-            :5
-        ]
-        return [
-            {
-                **snapshot.turns[node],
-                "score": float(scores[node]),
-                "sources": ["direct_dense"],
-                "lane": "dense",
-            }
-            for node in selected
-        ]
-
-    def _load_dense_snapshot(self) -> _DenseSnapshot:
-        """Reload the vector matrix only after an atomic index replacement."""
-
-        signature = _file_signature(self.paths.index)
-        with self._dense_lock:
-            current = self._dense_snapshot
-            if current is not None and current.signature == signature:
-                return current
-            loaded = self._read_dense_snapshot(signature)
-            self._dense_snapshot = loaded
-            return loaded
-
-    def _read_dense_snapshot(
-        self,
-        signature: tuple[int, int],
-    ) -> _DenseSnapshot:
-        """Read and normalize all indexed turn vectors once."""
-
-        # 1. Read stable graph order and both indexed message vectors.
-        with closing(self._connect()) as connection:
-            rows = connection.execute("""
-                SELECT
-                    turn.node_id,
-                    turn.turn_id AS query_id,
-                    turn.session_key,
-                    turn.user_message_id,
-                    turn.assistant_message_id,
-                    turn.started_at AS ts,
-                    sparse_turn.user_text,
-                    sparse_turn.assistant_text,
-                    user_dense.embedding AS user_embedding,
-                    user_dense.dim AS user_dim,
-                    assistant_dense.embedding AS assistant_embedding,
-                    assistant_dense.dim AS assistant_dim
-                FROM turn_nodes AS turn
-                JOIN sparse.sparse_turns AS sparse_turn
-                  ON sparse_turn.turn_id = turn.turn_id
-                LEFT JOIN sparse.turn_dense AS user_dense
-                  ON user_dense.turn_id = turn.turn_id
-                 AND user_dense.field = 'user'
-                LEFT JOIN sparse.turn_dense AS assistant_dense
-                  ON assistant_dense.turn_id = turn.turn_id
-                 AND assistant_dense.field = 'assistant'
-                ORDER BY turn.node_id
-                """).fetchall()
-        _require_contiguous_nodes(rows)
-        dimension = _dense_dimension(rows)
-
-        # 2. Materialize normalized matrices and immutable display rows.
-        user, user_present = _dense_matrix(
-            rows,
-            blob_key="user_embedding",
-            dim_key="user_dim",
-            dimension=dimension,
-        )
-        assistant, assistant_present = _dense_matrix(
-            rows,
-            blob_key="assistant_embedding",
-            dim_key="assistant_dim",
-            dimension=dimension,
-        )
-        turns: tuple[dict[str, object], ...] = tuple(
-            {
-                "query_id": row["query_id"],
-                "session_key": row["session_key"],
-                "user_message_id": row["user_message_id"],
-                "assistant_message_id": row["assistant_message_id"],
-                "ts": row["ts"],
-                "user_text": row["user_text"],
-                "assistant_text": row["assistant_text"],
-                "assistant_preview": _assistant_preview(str(row["assistant_text"])),
-            }
-            for row in rows
-        )
-        return _DenseSnapshot(
-            signature=signature,
-            turns=turns,
-            user=user,
-            assistant=assistant,
-            user_present=user_present,
-            assistant_present=assistant_present,
-        )
-
-
-def mobile_summary(item: dict[str, object]) -> dict[str, object]:
-    """Project one inspector detail into the mobile read-only contract."""
-
-    return {
-        "query_id": item["query_id"],
-        "query_text": item["query_text"],
-        "query_preview": _clip(str(item["query_text"]), 180),
-        "ts": item["ts"],
-        "seed_count": item["seed_count"],
-        "activation_capture_available": item["activation_capture_available"],
-        "recall_capture_available": item["recall_capture_available"],
-        "activation_count": item["activation_count"],
-        "left_count": item["left_count"],
-        "right_count": item["right_count"],
-        "pushes": item["pushes"],
-        "residual_l1": item["residual_l1"],
-        "left": _mobile_detail_lane(item["left"]),
-        "right": _mobile_detail_lane(item["right"]),
-        "tool_left_count": item["tool_left_count"],
-        "tool_right_count": item["tool_right_count"],
-        "tool_left": _mobile_detail_lane(item["tool_left"]),
-        "tool_right": _mobile_detail_lane(item["tool_right"]),
-    }
-
-
-def _mobile_detail_lane(value: object) -> list[dict[str, object]]:
-    """Project one Inspector lane into the bounded Mobile card shape."""
-
-    # 1. Keep only fields rendered by the mobile detail view.
-    rows = cast(list[dict[str, object]], value)
-    projected: list[dict[str, object]] = []
-    for row in rows:
-        visible = {
-            "user_preview": _clip(str(row["user_text"]), 100),
-            "assistant_preview": _clip(str(row["assistant_preview"]), 50),
-            "ts": row["ts"],
-        }
-        score = row.get("score")
-        if score is not None:
-            visible["score"] = score
-        projected.append(visible)
-    return projected
-
-
-def _tool_recall_lanes(
-    raw_tool_chain: object,
-) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    """Project persisted recall_memory results without changing graph state."""
-
-    # 1. Decode only successful recall_memory tool results.
-    if raw_tool_chain is None:
-        return [], []
-    chain = json.loads(str(raw_tool_chain))
-    if not isinstance(chain, list):
-        raise ValueError("assistant tool_chain must encode a JSON array")
-    items: list[dict[str, object]] = []
-    for step in chain:
-        if not isinstance(step, dict):
-            raise ValueError("assistant tool_chain step must be an object")
-        calls = step.get("calls", [])
-        if not isinstance(calls, list):
-            raise ValueError("assistant tool_chain calls must be an array")
-        for call in calls:
-            if not isinstance(call, dict):
-                raise ValueError("assistant tool call must be an object")
-            if call.get("name") != "recall_memory":
-                continue
-            if call.get("status") != "success":
-                continue
-            result = call.get("result")
-            if not isinstance(result, str):
-                raise ValueError("recall_memory result must be JSON text")
-            payload = json.loads(result)
-            if not isinstance(payload, dict):
-                raise ValueError("recall_memory result must encode an object")
-            recalled = payload.get("items")
-            if not isinstance(recalled, list):
-                raise ValueError("recall_memory items must be an array")
-            items.extend(_tool_recall_item(item) for item in recalled)
-
-    # 2. Keep the first stable occurrence in each visible lane.
-    left = _dedupe_tool_lane(items, "dense")
-    right = _dedupe_tool_lane(items, "completion")
-    return left, right
-
-
-def _tool_recall_item(raw: object) -> dict[str, object]:
-    if not isinstance(raw, dict):
-        raise ValueError("recall_memory item must be an object")
-    signals = raw.get("signals")
-    if not isinstance(signals, dict):
-        raise ValueError("recall_memory item signals must be an object")
-    lane = signals.get("lane")
-    if lane not in {"dense", "completion"}:
-        raise ValueError(f"recall_memory item lane is invalid: {lane}")
-    item_id = raw.get("id")
-    if not isinstance(item_id, str) or not item_id:
-        raise ValueError("recall_memory item id must be non-empty")
-    sources = signals.get("sources", [])
-    if not isinstance(sources, list):
-        raise ValueError("recall_memory item sources must be an array")
-    return {
-        "query_id": item_id,
-        "session_key": raw.get("source_ref", ""),
-        "ts": signals.get("started_at", ""),
-        "user_text": signals.get("user_text", ""),
-        "assistant_preview": signals.get("assistant_preview", ""),
-        "score": raw.get("score"),
-        "sources": sources,
-        "lane": lane,
-    }
-
-
-def _dedupe_tool_lane(
-    items: list[dict[str, object]],
-    lane: str,
-) -> list[dict[str, object]]:
-    seen: set[str] = set()
-    result: list[dict[str, object]] = []
-    for item in items:
-        if item["lane"] != lane:
-            continue
-        item_id = str(item["query_id"])
-        if item_id in seen:
-            continue
-        seen.add(item_id)
-        result.append(item)
-    return result
-
-
-def _dense_matrix(
-    rows: list[sqlite3.Row],
-    *,
-    blob_key: str,
-    dim_key: str,
-    dimension: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    matrix = np.zeros((len(rows), dimension), dtype=np.float32)
-    present = np.zeros(len(rows), dtype=bool)
-    for index, row in enumerate(rows):
-        blob = row[blob_key]
-        if blob is None:
-            continue
-        if int(row[dim_key]) != dimension:
-            raise ValueError(f"Akasha inspector dense dimension mismatch: {blob_key}")
-        vector = np.frombuffer(blob, dtype=np.float32)
-        norm = float(np.linalg.norm(vector))
-        if vector.size != dimension or not math.isfinite(norm) or norm == 0.0:
-            raise ValueError(f"Akasha inspector dense vector is invalid: {blob_key}")
-        matrix[index] = vector / norm
-        present[index] = True
-    return matrix, present
-
-
-def _dense_dimension(rows: list[sqlite3.Row]) -> int:
-    dimensions = {
-        int(row[key])
-        for row in rows
-        for key in ("user_dim", "assistant_dim")
-        if row[key] is not None
-    }
-    if len(dimensions) != 1:
-        raise ValueError(
-            f"Akasha inspector expected one dense dimension: {sorted(dimensions)}"
-        )
-    return dimensions.pop()
-
-
-def _require_contiguous_nodes(rows: list[sqlite3.Row]) -> None:
-    nodes = [int(row["node_id"]) for row in rows]
-    if nodes != list(range(len(rows))):
-        raise ValueError("Akasha inspector turn node IDs are not contiguous")
-
-
-def _file_signature(path: Path) -> tuple[int, int]:
-    stat = path.stat()
-    return stat.st_mtime_ns, stat.st_size
-
-
-def _json_list(value: object, field: str) -> list[object]:
-    if not isinstance(value, str):
-        raise ValueError(f"{field} is not JSON text")
-    loaded = json.loads(value)
-    if not isinstance(loaded, list):
-        raise ValueError(f"{field} is not a JSON list")
-    return cast(list[object], loaded)
-
-
-def _assistant_preview(text: str) -> str:
-    normalized = " ".join(text.split())
-    return normalized if len(normalized) <= 50 else normalized[:50] + "..."
-
-
-def _clip(text: str, limit: int) -> str:
-    normalized = " ".join(text.split())
-    return normalized if len(normalized) <= limit else normalized[:limit] + "..."
-
-
-def _sort_by_time(
-    items: list[dict[str, object]],
-) -> list[dict[str, object]]:
-    return sorted(
-        items,
-        key=lambda item: (
-            _parse_time(str(item["ts"])),
-            str(item["query_id"]).encode("utf-8"),
-        ),
-        reverse=True,
-    )
-
-
-def _render_context_block(
-    dense: list[dict[str, object]],
-    completion: list[dict[str, object]],
-    timestamp: str,
-) -> str:
-    parts = [
-        f"# Akasha memory now={_parse_time(timestamp).astimezone(_LOCAL_TZ):%m-%d}"
-    ]
-    if dense:
-        parts.append(_render_lane("## 左脑记忆：精确回忆", dense))
-    if completion:
-        parts.append(
-            _render_lane(
-                "## 右脑联想：潜意识第一反应",
-                completion,
-            )
-        )
-    return "\n\n".join(parts) if len(parts) > 1 else ""
-
-
-def _render_lane(
-    title: str,
-    items: list[dict[str, object]],
-) -> str:
-    lines = [title]
-    for item in items:
-        refs = [
-            str(item["user_message_id"]),
-            str(item["assistant_message_id"]),
-        ]
-        timestamp = _parse_time(str(item["ts"])).astimezone(_LOCAL_TZ)
-        lines.append(
-            f"- user={json.dumps(item['user_text'], ensure_ascii=False)} "
-            f"assistant={json.dumps(item['assistant_preview'], ensure_ascii=False)} "
-            f"t={timestamp:%m-%d} "
-            f"source_ref={json.dumps(refs, ensure_ascii=False)}"
-        )
-    return "\n".join(lines)
-
-
-def _parse_time(value: str) -> datetime:
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    return parsed.replace(tzinfo=_LOCAL_TZ) if parsed.tzinfo is None else parsed
+from .recalls import ContextSource, ProgramSource, Recall, ToolSource, context_identity
+from .recall_tool import RecallReference
+
+
+@dataclass(frozen=True, slots=True)
+class _MessageRef:
+    identity: str
+    seq: int
+    user_input: bool
+    calls: tuple[CallRef, ...]
+    result: CallRef | None
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceTurns:
+    key: tuple[str, str, int]
+    turns: tuple[Turn, ...]
+    messages: tuple[_MessageRef, ...]
 
 
 class RecallInspector:
     """只读查询事实与原消息，不把学习读出重算成实际召回。"""
 
     def __init__(self, *, read: Callable[[str], Recall | None],
-                 list_records: Callable[[], tuple[tuple[str, Recall], ...]], catalog: MessageCatalog):
+                 list_records: Callable[[], tuple[tuple[str, Recall], ...]],
+                 legacy_page: Callable[[str], tuple[tuple[tuple[str, Recall], ...], str | None]],
+                 catalog: MessageCatalog):
         self._read = read
         self._list = list_records
+        self._legacy_page = legacy_page
         self._catalog = catalog
-        self._turns: tuple[tuple[str, str, int], tuple[Turn, ...], tuple[tuple[str, int, bool], ...]] | None = None
+        self._turns: _SourceTurns | None = None
+        self._lock = Lock()
+        self._legacy_before: str | None = "g"
+        self._legacy: dict[tuple[str, str], list[tuple[datetime, str, int]]] = {}
+
+    def _source_turns(self, session_id: str, source: str, projection: TurnProjection) -> _SourceTurns:
+        """Reuse closed references; only the open tail needs another projection."""
+        reader = self._catalog.reader(session_id)
+        with self._lock:
+            head = reader.head(source=source)
+            key = (session_id, source, head)
+            cached = self._turns
+            if cached is not None and cached.key == key:
+                return cached
+            closed: tuple[Turn, ...] = ()
+            prefix: tuple[_MessageRef, ...] = ()
+            if cached is not None and cached.key[:2] == key[:2] and cached.key[2] < head:
+                closed = tuple(turn for turn in cached.turns if turn.status != "open")
+                if closed:
+                    prefix = tuple(item for item in cached.messages if item.seq <= closed[-1].through_seq)
+            boundary = closed[-1].through_seq if closed else -1
+            def project(messages: Iterable[Message]) -> _SourceTurns:
+                refs: list[_MessageRef] = []
+                def observed() -> Iterator[Message]:
+                    for message in messages:
+                        body = message.body
+                        refs.append(_MessageRef(
+                            message.message_id, message.seq,
+                            isinstance(body, Input) and message.author == "user",
+                            tuple(CallRef(message.message_id, index) for index, part in enumerate(body.parts)
+                                  if isinstance(part, ToolCall)) if isinstance(body, Output) else (),
+                            body.call_ref if isinstance(body, ToolResult) else None,
+                        ))
+                        yield message
+                turns = projection.project(observed(), source, after_seq=boundary)
+                return _SourceTurns(key, closed + turns, prefix + tuple(refs))
+            self._turns = reader.scan(project, after_seq=boundary, through_seq=head, source=source)
+            return self._turns
+
+    def _legacy_automatic(self, session_id: str, source: str, after: int, through: int) -> tuple[str | None, bool]:
+        """Advance at most 64 retired rows per RPC, retaining references only.
+
+        Random IDs were written only by the retired context producer. Local
+        replacement drains its calls before starting this Inspector; Bindings
+        opens current providers, not archived execution graphs. This directory
+        is discarded with the Inspector on restart/replacement, never persisted.
+        """
+        with self._lock:
+            if self._legacy_before is not None:
+                page, before = self._legacy_page(self._legacy_before)
+                for identity, recall in page:
+                    origin = recall.source
+                    if isinstance(origin, ContextSource):
+                        self._legacy.setdefault((origin.session_id, origin.source), []).append(
+                            (recall.timestamp, identity, origin.through_seq))
+                self._legacy_before = before
+            if self._legacy_before is not None:
+                return None, True
+            earliest = min((item for item in self._legacy.get((session_id, source), ())
+                            if after <= item[2] <= through), default=None)
+            return (None if earliest is None else earliest[1]), False
 
     def recent(self, *, page: int = 1, page_size: int = 30, session_id: str = "") -> dict[str, object]:
         rows = tuple((identity, recall) for identity, recall in self._list()
                      if not session_id or (not isinstance(recall.source, ProgramSource)
                                            and recall.source.session_id == session_id))
         start = (page - 1) * page_size
-        return self._mobile_result({"items": [self._summary(identity, recall) for identity, recall in rows[start:start + page_size]],
+        return self._ui_result({"items": [self._summary(identity, recall) for identity, recall in rows[start:start + page_size]],
                                     "total": len(rows), "page": page, "page_size": page_size})
 
     def for_turn(self, session_id: str, message_id: str, source: str,
                  projection: TurnProjection, *, offset: int = 0) -> dict[str, object]:
-        """按真实用户输入展示首次自动召回和主动查询，并分批返回完整记录。"""
-        # 1. 已提交消息从日志取得来源；草稿只能读取该来源仍未闭合的 Turn。
+        """Read immutable identities belonging to the actual user Input/calls."""
         reader = self._catalog.reader(session_id)
         message = reader.get(message_id)
         if message is not None:
             source = message.source
         if not source:
             return {"items": [], "pending": False}
-        # 只缓存最近一个来源的 Turn 引用；同一前缀轮询不再读取消息正文。
-        source_head = reader.head(source=source)
-        key = (session_id, source, source_head)
-        cached = self._turns
-        if cached is None or cached[0] != key:
-            messages = []
-            cursor = -1
-            while cursor < source_head:
-                page = reader.read(after_seq=cursor, through_seq=source_head, source=source)
-                messages.extend(page)
-                cursor = page[-1].seq
-            cached = (key, projection.project(messages, source),
-                      tuple((item.message_id, item.seq, isinstance(item.body, Input) and item.author == "user")
-                            for item in messages))
-            self._turns = cached
-        turns = cached[1]
-        turn = next((item for item in turns if message_id in item.message_ids), None)
+        cached = self._source_turns(session_id, source, projection)
+        turn = next((item for item in cached.turns if message_id in item.message_ids), None)
         if message is None:
-            turn = next((item for item in reversed(turns) if item.status == "open"), None)
+            turn = next((item for item in reversed(cached.turns) if item.status == "open"), None)
         if turn is None:
             return {"items": [], "pending": message is None}
-        # 2. 回复归属它之前最近的真实输入；下一条输入划开同 Turn 的卡片。
-        member_ids = set(turn.message_ids)
-        inputs = [(identity, seq) for identity, seq, user_input in cached[2]
-                  if identity in member_ids and user_input]
-        anchor_seq = message.seq if message is not None else source_head
-        target = next((item for item in reversed(inputs) if item[1] <= anchor_seq), None)
+        members = set(turn.message_ids)
+        inputs = [item for item in cached.messages if item.identity in members and item.user_input]
+        anchor_seq = message.seq if message is not None else cached.key[2]
+        target = next((item for item in reversed(inputs) if item.seq <= anchor_seq), None)
         if target is None:
             return {"items": [], "pending": False}
-        following = next((item for item in inputs if item[1] > target[1]), None)
+        following = next((item for item in inputs if item.seq > target.seq), None)
         through_seq = reader.head() if turn.status == "open" else turn.through_seq
         if turn.status in {"complete", "quiet"}:
             through_seq -= 1
         if following is not None:
-            through_seq = following[1] - 1
-        call_ids = {identity for identity, seq, _ in cached[2]
-                    if identity in member_ids and target[1] <= seq <= through_seq}
-        identities: list[str] = []
-        automatic_found = False
-        for identity, recall in reversed(self._list()):
+            through_seq = following.seq - 1
+        calls = {ref for item in cached.messages
+                 if item.identity in members and target.seq <= item.seq <= through_seq for ref in item.calls}
+        # Results may arrive after another Input or even after an abandon boundary.
+        # Their original CallRef, rather than arrival position, owns the card.
+        results = {item.result: item.identity for item in cached.messages if item.result in calls}
+        # Earlier Inputs remain live until the Turn closes. Closure ends event
+        # following; it does not claim that canceled tool effects have drained.
+        pending = turn.status == "open"
+        legacy, legacy_pending = self._legacy_automatic(session_id, source, target.seq, through_seq)
+        if legacy_pending:
+            # An unfinished compatibility page cannot prove absence or earliest.
+            return {"items": [], "pending": pending, "legacy_pending": True,
+                    "input_message_id": target.identity, "next_offset": None}
+
+        records: dict[str, Recall] = {}
+        automatic: list[tuple[str, Recall]] = []
+        for identity in dict.fromkeys((context_identity(session_id, source, target.identity), legacy)):
+            if identity is None:
+                continue
+            recall = self._read(identity)
+            if recall is None:
+                if identity == legacy:
+                    raise ValueError(f"召回记录缺失: {identity}")
+                continue
             origin = recall.source
-            if isinstance(origin, ContextSource):
-                matches = (not automatic_found and origin.session_id == session_id
-                           and origin.source == source and target[1] <= origin.through_seq <= through_seq)
-                automatic_found = automatic_found or matches
-            elif isinstance(origin, ToolSource):
-                matches = (origin.session_id == session_id and origin.call_ref.message_id in call_ids)
-            else:
-                matches = False
-            if matches:
-                identities.append(identity)
-        # 3. 历史重复自动查询留在 Inspector；主动查询分页，不突破 RPC 字节边界。
+            if (not isinstance(origin, ContextSource) or origin.session_id != session_id
+                or origin.source != source or not target.seq <= origin.through_seq <= through_seq):
+                raise ValueError("自动召回记录不属于实际用户输入")
+            automatic.append((identity, recall))
+        if automatic:
+            identity, recall = min(automatic, key=lambda item: (item[1].timestamp, item[0]))
+            records[identity] = recall
+
+        for ref in calls:
+            identity = "tool:" + durable_call_key(ref)
+            markers: set[str] = set()
+            result_id = results.get(ref)
+            if result_id is not None:
+                result_message = reader.get(result_id)
+                if result_message is None or not isinstance(result_message.body, ToolResult):
+                    raise ValueError("工具结果消息缺失")
+                result = result_message.body
+                if result.call_ref != ref or result_message.source != source:
+                    raise ValueError("工具结果不属于实际调用")
+                if result.outcome == "success":
+                    for part in result.parts:
+                        if part.kind == "akasha.recall":
+                            marker = RecallReference.model_validate_json(json.dumps(json_value(part.value)))
+                            markers.add(marker.retrieval_ref)
+            for identity in {identity} | markers:
+                recall = self._read(identity)
+                if recall is None:
+                    if identity in markers:
+                        raise ValueError(f"召回记录缺失: {identity}")
+                    continue
+                origin = recall.source
+                if (not isinstance(origin, ToolSource) or origin.session_id != session_id
+                    or origin.call_ref != ref):
+                    raise ValueError("召回记录不属于实际工具调用")
+                records[identity] = recall
+
+        ordered = sorted(records.items(), key=lambda item: (item[1].timestamp, item[0]))
         items: list[dict[str, object]] = []
-        pending = turn.status == "open" and following is None
-        size = len(json.dumps({"items": [], "pending": pending,
-            "input_message_id": target[0], "next_offset": len(identities)},
-            ensure_ascii=False, separators=(",", ":")).encode()) + 4
-        for identity in identities[offset:]:
-            detail = self.mobile_detail(identity)
-            if detail is None:
-                raise ValueError(f"召回记录缺失: {identity}")
+        payload = {"items": items, "pending": pending, "legacy_pending": False,
+                   "input_message_id": target.identity, "next_offset": len(ordered)}
+        size = len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()) + 4
+        for identity, recall in ordered[offset:]:
+            detail = self._detail(identity, recall)
             encoded_size = len(json.dumps(detail, ensure_ascii=False, separators=(",", ":")).encode())
             if size + encoded_size > 192 * 1024:
                 if not items:
-                    raise MobileUiRpcInvalidRequest("本条检索出处过多，超出移动页面容量；查询记录仍完整保留")
+                    raise PluginUiRpcInvalidRequest("本条检索出处过多，超出插件界面容量；查询记录仍完整保留")
                 break
             items.append(detail)
             size += encoded_size + 1
         end = offset + len(items)
-        return {"items": items, "pending": pending,
-                "input_message_id": target[0],
-                "next_offset": end if end < len(identities) else None}
+        payload["next_offset"] = end if end < len(ordered) else None
+        return payload
 
     @staticmethod
     def _summary(identity: str, recall: Recall) -> dict[str, object]:
@@ -1123,11 +235,14 @@ class RecallInspector:
                 "ts": recall.timestamp.isoformat(), "source": origin, "graph_version": recall.graph_version,
                 "hit_count": len(recall.hits), "presented_count": len(recall.presented_message_ids)}
 
-    def mobile_detail(self, identity: str) -> dict[str, object] | None:
+    def plugin_detail(self, identity: str) -> dict[str, object] | None:
         """命中和实际呈现分开显示；正文只从查询记录指向的原消息读取。"""
         recall = self._read(identity)
         if recall is None:
             return None
+        return self._detail(identity, recall)
+
+    def _detail(self, identity: str, recall: Recall) -> dict[str, object]:
         hits: list[dict[str, object]] = []
         for hit in recall.hits:
             messages: list[dict[str, object]] = []
@@ -1143,13 +258,13 @@ class RecallInspector:
                                  "truncated": len(text) > 240,
                                  "presented": message_id in recall.presented_message_ids})
             hits.append({"score": hit.score, "lane": hit.lane, "sources": list(hit.sources), "messages": messages})
-        return self._mobile_result({**self._summary(identity, recall), "hits": hits, "pushes": recall.pushes,
+        return self._ui_result({**self._summary(identity, recall), "hits": hits, "pushes": recall.pushes,
                                     "residual_l1": recall.residual_l1})
 
     @staticmethod
-    def _mobile_result(payload: dict[str, object]) -> dict[str, object]:
-        """移动投影保留全部成员；完整编码超限时明确失败，不裁掉尾部。"""
+    def _ui_result(payload: dict[str, object]) -> dict[str, object]:
+        """插件界面投影保留全部成员；完整编码超限时明确失败，不裁掉尾部。"""
         result: dict[str, object] = {"schema": "akasha.queries.v1", **payload}
         if len(json.dumps(result, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()) > 192 * 1024:
-            raise MobileUiRpcInvalidRequest("本条检索出处过多，超出移动页面容量；查询记录仍完整保留")
+            raise PluginUiRpcInvalidRequest("本条检索出处过多，超出插件界面容量；查询记录仍完整保留")
         return result

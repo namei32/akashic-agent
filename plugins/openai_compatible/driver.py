@@ -10,13 +10,13 @@ import zlib
 import math
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, cast
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
-from core.net.http import HttpClient, finish_response
+from core.net.http import HttpClient, StreamProgress, finish_response
 
 from agent.plugin_composition import (
     AuthenticationError,
@@ -79,6 +79,8 @@ class _ConnectionConfig:
     read_timeout: float
     max_retries: int
     allow_unverified_manual: bool
+    thinking_format: str = "none"
+    progress_timeout: float = 300.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,13 +112,18 @@ class _BoundChat:
         """Send one exact bound model request through Chat Completions."""
 
         if request.continuation is not None:
-            raise InvalidRequestError(
+            # 发送前本地校验失败：可证明请求未发出。
+            raise _unsent(InvalidRequestError(
                 "OpenAI-compatible Chat Completions does not support continuation state"
-            )
-        body = _chat_body(self._descriptor, self._connection, self._config, request)
-        if request.on_delta is None and not _is_deepseek_v4(self._descriptor.model):
+            ))
+        # 生成调用恒为一次物理 attempt：重试预算唯一 owner 是 Models；
+        # 未带 request_key 的直调同样不得隐式重发（§6.3）。max_retries
+        # 连接配置只留给 embeddings/discovery 等非生成路径。
+        connection = replace(self._connection, max_retries=0)
+        body = _chat_body(self._descriptor, connection, self._config, request)
+        if request.on_delta is None and connection.thinking_format != "deepseek":
             payload = await _request_json(
-                self._connection,
+                connection,
                 self._credential,
                 "POST",
                 "/chat/completions",
@@ -128,7 +135,7 @@ class _BoundChat:
         body["stream"] = True
         body["stream_options"] = {"include_usage": True}
         return await _stream_chat(
-            self._connection,
+            connection,
             self._credential,
             body,
             request.on_delta,
@@ -196,6 +203,7 @@ def definition() -> ModelDriverDefinition:
         open=_open,
         discover=_discover,
         probe=_probe,
+        probe_embedding=_probe_embedding,
     )
 
 
@@ -238,6 +246,30 @@ async def _open(
         )
 
     return DriverConnection(bind_chat=bind_chat, bind_embedding=bind_embedding, close=http.aclose)
+
+
+async def _probe_embedding(
+    descriptor: DriverConnectionDescriptor, credential: CredentialHandle, model: str,
+) -> DiscoveredModel:
+    """用两段固定文本测量实际维度，不创建虚假的绑定空间。"""
+    _check_credential_scope(descriptor, credential)
+    connection = replace(_connection_config(descriptor), max_retries=0)
+    try:
+        async with asyncio.timeout(30):
+            payload = await _request_limited_json(
+                connection, credential, "POST", "/embeddings",
+                body={"model": model, "input": ["Akashic embedding setup check", "Akashic embedding order check"]},
+                max_bytes=4 * 1024 * 1024,
+            )
+    except TimeoutError as error:
+        raise ModelTimeoutError("向量试算超时，请检查服务地址或稍后重试；配置未保存。") from error
+    result = _parse_embedding_response(payload, expected_count=2)
+    return DiscoveredModel(
+        kind=ModelKind.EMBEDDING, model=model,
+        capabilities=ModelCapabilities(embedding_dimensions=len(result.vectors[0]), embedding_normalization="none"),
+        capability_sources=CapabilitySources(embedding_dimensions="probe", embedding_normalization="driver"),
+        driver_config={"format_version": 1},
+    )
 
 
 async def _probe(
@@ -313,7 +345,7 @@ async def _discover(
         seen_models.add(model)
         result.append(
             DiscoveredModel(
-                kind=ModelKind.CHAT,
+                kind=None,
                 model=model,
                 default_reasoning_effort=None,
                 capabilities=ModelCapabilities(),
@@ -331,9 +363,12 @@ def _connection_config(descriptor: DriverConnectionDescriptor) -> _ConnectionCon
         "format_version",
         "connect_timeout",
         "read_timeout",
+        "progress_timeout",
         "max_retries",
+        "max_attempts",
         "allow_unverified_manual",
         "catalog_provider_id",
+        "thinking_format",
     }
     unknown = sorted(set(config) - allowed)
     if unknown:
@@ -352,13 +387,27 @@ def _connection_config(descriptor: DriverConnectionDescriptor) -> _ConnectionCon
         or max_retries < 0
     ):
         raise ValueError("max_retries must be a non-negative integer")
+    # max_attempts 是 Models 独占的重试预算字段，driver 只校验不消费；
+    # accounted 调用的 driver 重试恒为 0。
+    max_attempts = config.get("max_attempts")
+    if max_attempts is not None and (
+        not isinstance(max_attempts, int)
+        or isinstance(max_attempts, bool)
+        or max_attempts < 1
+    ):
+        raise ValueError("max_attempts must be a positive integer")
     allow_unverified_manual = config.get("allow_unverified_manual", False)
     if not isinstance(allow_unverified_manual, bool):
         raise ValueError("allow_unverified_manual must be boolean")
+    thinking_format = config.get("thinking_format", "none")
+    if not isinstance(thinking_format, str) or thinking_format not in {"none", "deepseek"}:
+        raise ValueError("thinking_format must be none or deepseek")
     return _ConnectionConfig(
+        thinking_format=thinking_format,
         base_url=_normalize_base_url(descriptor.endpoint),
         connect_timeout=connect_timeout,
         read_timeout=read_timeout,
+        progress_timeout=_positive_float(config.get("progress_timeout", 300.0), "progress_timeout"),
         max_retries=max_retries,
         allow_unverified_manual=allow_unverified_manual,
     )
@@ -402,10 +451,6 @@ def _model_config(config: Mapping[str, Any]) -> _ModelConfig:
     )
 
 
-def _is_deepseek_v4(model: str) -> bool:
-    return model.rsplit("/", 1)[-1].lower().startswith("deepseek-v4-")
-
-
 def _chat_body(
     descriptor: BoundModelDescriptor,
     connection: _ConnectionConfig,
@@ -430,7 +475,7 @@ def _chat_body(
     if request.disable_reasoning:
         for key in ("enable_thinking", "thinking", "reasoning_effort"):
             body.pop(key, None)
-        if _is_deepseek_v4(descriptor.model):
+        if connection.thinking_format == "deepseek":
             body["thinking"] = {"type": "disabled"}
     return body
 
@@ -476,6 +521,7 @@ async def _request_limited_json(
     path: str,
     *,
     max_bytes: int,
+    body: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Read one discovery response with a hard byte limit and no retries."""
 
@@ -486,6 +532,7 @@ async def _request_limited_json(
                 method,
                 path,
                 headers={"Accept-Encoding": "gzip, identity"},
+                json=body,
             ) as response:
                 content = await _read_limited_response(response, max_bytes=max_bytes)
         bounded = httpx.Response(
@@ -588,7 +635,7 @@ async def _stream_chat(
                 if response.status_code >= 400:
                     _ = await response.aread()
                 _raise_status(response, secret=token)
-                return await _consume_stream(response, on_delta)
+                return await _consume_stream(response, on_delta, progress_timeout=connection.progress_timeout)
         except asyncio.CancelledError:
             raise
         except _CallbackError as error:
@@ -597,10 +644,11 @@ async def _stream_chat(
             mapped = _map_error(error)
             if mapped is error and not isinstance(error, ModelError):
                 raise
-            # 无观察者时尚未交付任何结果，断流仍可从原请求重试。
-            response_delta_seen = on_delta is not None and bool(getattr(error, "response_delta_seen", False))
-            if on_delta is None and isinstance(error, _StreamReadError) and isinstance(mapped, TransportError):
-                setattr(mapped, "retry_safe", True)
+            # 证据以协议层观察为准：on_delta 回调缺席时 provider 仍可能
+            # 已吐出部分输出，不能凭"没有预览观察者"主张安全。已进入
+            # HTTP 200 流的任何失败都不携带 send_evidence，_retryable
+            # 不会授予重发——无论是否观察到 delta。
+            response_delta_seen = bool(getattr(error, "response_delta_seen", False))
             if response_delta_seen:
                 setattr(mapped, "retryable", False)
             if (
@@ -630,6 +678,8 @@ class _CallbackError(RuntimeError):
 async def _consume_stream(
     response: httpx.Response,
     on_delta: Callable[[dict[str, str]], Awaitable[None]] | None,
+    *,
+    progress_timeout: float = 300.0,
 ) -> LLMResponse:
     content: list[str] = []
     thinking: list[str] = []
@@ -642,9 +692,10 @@ async def _consume_stream(
     native_reasoning_seen = False
     pending_content = ""
     legacy_candidate: str | None = None
+    progress = StreamProgress(progress_timeout)
     try:
         lines = response.aiter_lines()
-        async for line in lines:
+        async for line in progress.read(lines):
             if not line.startswith("data:"):
                 continue
             data = line[5:].strip()
@@ -679,11 +730,13 @@ async def _consume_stream(
             if isinstance(raw_calls, list) and raw_calls:
                 response_delta_seen = True
                 tool_seen = True
-                _merge_tool_deltas(calls, raw_calls)
+                if _merge_tool_deltas(calls, raw_calls):
+                    progress.advance()
             reasoning = delta.get("reasoning_content")
             if reasoning is None:
                 reasoning = delta.get("reasoning")
             if isinstance(reasoning, str) and reasoning:
+                progress.advance()
                 response_delta_seen = True
                 if not native_reasoning_seen:
                     native_reasoning_seen = True
@@ -700,6 +753,7 @@ async def _consume_stream(
                     await _emit_delta(on_delta, {"thinking_delta": reasoning})
             piece = delta.get("content")
             if isinstance(piece, str) and piece:
+                progress.advance()
                 response_delta_seen = True
                 content.append(piece)
                 if native_reasoning_seen:
@@ -713,10 +767,15 @@ async def _consume_stream(
                     )
                     if ready and not tool_seen:
                         await _emit_delta(on_delta, {"content_delta": ready})
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as error:
+        if response_delta_seen:
+            setattr(error, "response_delta_seen", True)
         raise
     except _CallbackError:
         raise
+    except TimeoutError as error:
+        failure = ModelTimeoutError(f"模型流超过 {progress_timeout:g} 秒没有有效进展")
+        raise _StreamReadError(failure, response_delta_seen=response_delta_seen) from error
     except Exception as error:
         raise _StreamReadError(
             error, response_delta_seen=response_delta_seen
@@ -873,10 +932,10 @@ def _parse_embedding_response(
     if not isinstance(raw_data, list) or len(raw_data) != expected_count:
         raise TransportError("embedding response count does not match input")
     ordered: list[tuple[int, tuple[float, ...]]] = []
-    for position, raw in enumerate(raw_data):
+    for raw in raw_data:
         if not isinstance(raw, Mapping):
             raise TransportError("embedding item must be an object")
-        index = raw.get("index", position)
+        index = raw.get("index")
         vector = raw.get("embedding")
         if not isinstance(index, int) or isinstance(index, bool):
             raise TransportError("embedding index must be an integer")
@@ -894,6 +953,8 @@ def _parse_embedding_response(
     if sorted(index for index, _vector in ordered) != list(range(expected_count)):
         raise TransportError("embedding indexes must cover the input batch exactly")
     ordered.sort(key=lambda item: item[0])
+    if len({len(vector) for _index, vector in ordered}) != 1:
+        raise TransportError("服务返回了不一致的向量维度；请联系服务提供方，配置未保存。")
     raw_usage = payload.get("usage")
     return EmbeddingResult(
         vectors=tuple(vector for _index, vector in ordered),
@@ -901,7 +962,9 @@ def _parse_embedding_response(
     )
 
 
-def _merge_tool_deltas(calls: dict[int, dict[str, str]], raw_calls: list[Any]) -> None:
+def _merge_tool_deltas(calls: dict[int, dict[str, str]], raw_calls: list[Any]) -> bool:
+    """合并合法工具片段，并报告是否增加了调用内容。"""
+    advanced = False
     for raw in raw_calls:
         if not isinstance(raw, Mapping):
             raise TransportError("stream tool call delta must be an object")
@@ -912,14 +975,19 @@ def _merge_tool_deltas(calls: dict[int, dict[str, str]], raw_calls: list[Any]) -
         raw_id = raw.get("id")
         if isinstance(raw_id, str):
             slot["id"] += raw_id
+            advanced = advanced or bool(raw_id)
         function = raw.get("function")
         if isinstance(function, Mapping):
             name = function.get("name")
             arguments = function.get("arguments")
             if isinstance(name, str):
                 slot["name"] += name
+                advanced = advanced or bool(name)
             if isinstance(arguments, str):
                 slot["arguments"] += arguments
+                advanced = advanced or bool(arguments)
+
+    return advanced
 
 
 def _tool_calls(calls: Mapping[int, Mapping[str, str]]) -> list[ToolCall]:
@@ -965,6 +1033,9 @@ def _usage(raw: Mapping[str, Any]) -> ModelUsage:
             input_tokens = (cache_hit or 0) + (cache_miss or 0)
         if cached is None:
             cached = cache_hit or 0
+    if cached is None:
+        # Kimi 使用顶层命中字段；不覆盖既有字段中的明确零值。
+        cached = _optional_int(raw.get("cached_tokens"))
     cache_write = (
         _optional_int(prompt_details.get("cache_write_tokens"))
         if isinstance(prompt_details, Mapping)
@@ -1033,32 +1104,62 @@ def _merge_usage(items: Sequence[ModelUsage | None]) -> ModelUsage | None:
     )
 
 
+def _unsent(error: ModelError) -> ModelError:
+    """发送前本地校验失败：请求可证明未到达 provider，标记为允许重试的证据。"""
+    error.send_evidence = "unsent"
+    return error
+
+
 def _raise_status(response: httpx.Response, *, secret: str) -> None:
-    if response.status_code < 400:
+    error = _status_error(response, secret=secret)
+    if error is None:
         return
+    # 4xx 是对本请求的明确拒绝应答——正面证据。5xx 只说明服务端/网关
+    # 未能给出结论，不能证明后端未接收或未处理：不授证据，fail-closed。
+    if response.status_code < 500:
+        error.send_evidence = "rejected"
+    raise error
+
+
+def _status_error(response: httpx.Response, *, secret: str) -> ModelError | None:
+    if response.status_code < 400:
+        return None
     message = _redact_secret(_response_error_message(response), secret)
     lowered = message.lower()
     if response.status_code in {401, 403}:
-        raise AuthenticationError(message)
+        return AuthenticationError(
+            f"模型连接授权未通过（HTTP {response.status_code}）。"
+            f"请在模型设置中核对 API Key 或账号权限后重试。服务返回：{message}"
+        )
+    if response.status_code >= 500:
+        # status-first：5xx 只说明服务端/网关未给出结论，正文诊断文案
+        # （context_length 等）不得把错误提升为可证明的容量拒绝。
+        return TransportError(f"模型服务暂不可用（HTTP {response.status_code}），请稍后重试。服务返回：{message}")
     if any(code in lowered for code in _CONTEXT_CODES):
-        raise ContextLengthError(message)
+        return ContextLengthError(message)
     if any(code in lowered for code in _SAFETY_CODES):
-        raise ContentSafetyError(message)
+        return ContentSafetyError(message)
     if response.status_code == 402 or (
         response.status_code == 429
         and any(value in lowered for value in ("quota", "usage limit", "credit"))
     ):
-        raise QuotaError(message)
+        return QuotaError(message)
     if response.status_code == 429:
-        raise RateLimitError(message)
+        error = RateLimitError(message)
+        # Retry-After 必须随错误传给 Models，由独占重试预算决定何时再付。
+        retry_after = response.headers.get("retry-after")
+        if retry_after is not None:
+            try:
+                setattr(error, "retry_after", max(0.0, float(retry_after)))
+            except ValueError:
+                pass
+        return error
     if 400 <= response.status_code < 500:
-        raise InvalidRequestError(
+        return InvalidRequestError(
             f"provider rejected the request with HTTP {response.status_code}: {message}"
         )
     error = TransportError(f"provider returned HTTP {response.status_code}: {message}")
-    if response.status_code in {500, 502, 503, 504}:
-        setattr(error, "retry_safe", True)
-    raise error
+    return error
 
 
 def _response_error_message(response: httpx.Response) -> str:
@@ -1098,13 +1199,19 @@ def _map_error(error: Exception) -> Exception:
         ),
     ):
         return error
+    if isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout)):
+        # 连接建立失败可证明请求未发出：这是允许重试的正面证据。
+        mapped = TransportError(f"model transport failed: {type(error).__name__}")
+        mapped.send_evidence = "unsent"
+        setattr(mapped, "retry_safe", True)
+        return mapped
     if isinstance(error, (httpx.TimeoutException, TimeoutError)):
         return ModelTimeoutError("model request timed out")
     if isinstance(error, httpx.TransportError):
-        mapped = TransportError(f"model transport failed: {type(error).__name__}")
-        setattr(mapped, "retry_safe", True)
-        return mapped
+        # 请求发出后的读/写失败不携带任何安全证据。
+        return TransportError(f"model transport failed: {type(error).__name__}")
     if isinstance(error, _StreamReadError):
+        # 已进入 HTTP 200 流：无论是否观察到 delta，远端效果都不可证。
         mapped = _map_error(error.error)
         setattr(mapped, "response_delta_seen", error.response_delta_seen)
         return mapped
@@ -1112,8 +1219,9 @@ def _map_error(error: Exception) -> Exception:
 
 
 def _retryable(error: Exception) -> bool:
-    return isinstance(error, (ModelTimeoutError, RateLimitError)) or bool(
-        getattr(error, "retry_safe", False)
+    return getattr(error, "send_evidence", None) in ("rejected", "unsent") and (
+        isinstance(error, (ModelTimeoutError, RateLimitError))
+        or bool(getattr(error, "retry_safe", False))
     )
 
 

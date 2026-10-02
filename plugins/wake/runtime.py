@@ -1,46 +1,46 @@
 from __future__ import annotations
 
+from agent.plugin_composition.models import MODEL_CATALOG, ModelAvailability
+
 import asyncio
 import hashlib
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
-from typing import Protocol, cast
+from typing import cast
 
-from agent.plugin_composition.timers import TimerReceipt, TimerStatus
-from agent.plugin_composition import Context, ServiceKey
+from core.common.file_io import run_file_io
+
+from agent.plugin_composition import Context
 from agent.plugin_composition.bindings import BINDINGS
-from agent.plugin_composition.messages import MESSAGE_CATALOG
-from agent.plugin_composition.models import ChatModelSelection
-from agent.plugin_composition.timers import TIMERS
-from agent.plugin_composition.messages import MessageReader, OwnerRecord
-from agent.plugin_contracts import Message
-from agent.plugin_contracts import body_to_dict
+from agent.plugin_composition.messages import (
+    MESSAGE_CATALOG,
+    MessageReader,
+    OwnerRecord,
+)
+from agent.plugin_composition.timers import TIMERS, TimerReceipt, TimerStatus
+from agent.plugin_contracts import Message, body_to_dict
+from agent.plugin_contracts.models import (
+    MODEL_SELECTION as MODEL_SELECTION,
+    ModelSelection as ModelSelection,
+)
 
-from .admission import Admission, Duties
 from ._boundary import (
-    AKASHA_TOOLS,
+    ALL_TOOLS,
     DELIVERY_READ,
     DELIVERY_SENDERS,
     SEMANTIC_INTEREST,
-    STANDARD_WEB_TOOLS,
-    SinkValue,
     TOOLS,
-    ToolView,
     WAKE_TOOLS_VIEW,
+    SinkValue,
+    ToolView,
 )
-from .api import Config, DeliveryTarget, DRIFT_WAKE, EVENTMAIL_WAKE
+from .admission import Admission, Duties
+from .api import DRIFT_WAKE, EVENTMAIL_WAKE, Config, DeliveryTarget
 from .legacy_rules import read_archived_rules
 from .messages import recent_context
-from .request import Request, TOOLS as WAKE_TOOLS, WAKE_PROGRAM
+from .request import TOOLS as WAKE_TOOLS, WAKE_PROGRAM, Request
 from .source import Pointer, Source
 from .state import WakeState, WakeStateReader
-
-
-class ModelSelection(Protocol):
-    def read_saved(self, metadata: Mapping[str, object]) -> ChatModelSelection: ...
-
-
-MODEL_SELECTION = ServiceKey[ModelSelection]("models.selection.v1")
 
 
 class DashboardView:
@@ -145,9 +145,7 @@ class Runtime:
     def __init__(self, ctx: Context, config: Config, *, now: Callable[[], datetime] = lambda: datetime.now(UTC)):
         self.ctx, self.config, self.now = ctx, self._current_config(config), now
         self.state = WakeState(ctx.data_root / "wake.sqlite3")
-        # Runtime owns creation and schema validation. Dashboard readers only
-        # open this already-initialized file read-only.
-        self.state.initialize()
+        # apply/follow 拥有异步初始化；构造函数不在共享 loop 执行 SQL。
         self.source = Source(ctx, self.state, now=now)
         self.duties = Duties(ctx.require(EVENTMAIL_WAKE), ctx.require(DRIFT_WAKE), self.state, ctx.require(SEMANTIC_INTEREST))
         self.changed = asyncio.Event()
@@ -172,7 +170,7 @@ class Runtime:
             self.state.read_only(), self.source.read, read_message, history.status,
         )
 
-    def capture(self, flow_id: str, admission: Admission, now: datetime) -> Request | None:
+    async def capture(self, flow_id: str, admission: Admission, now: datetime) -> Request | None:
         """先固定归档程序、工具、出站目标与上下文，随后才允许领取领域条目。"""
         owner = admission.owner
         if owner is None:
@@ -180,7 +178,7 @@ class Runtime:
         ctx, target = self.ctx, self.config.delivery
         if target is None:
             return None
-        alert = ctx.require(EVENTMAIL_WAKE).peek_alert(now) if owner == "alert" else None
+        alert = await ctx.require(EVENTMAIL_WAKE).peek_alert(now) if owner == "alert" else None
         if owner == "alert" and alert is None:
             return None
         bindings = ctx.require(BINDINGS)
@@ -192,15 +190,13 @@ class Runtime:
         metadata = ctx.require(MESSAGE_CATALOG).reader(target.session_id).metadata()
         model = ctx.require(MODEL_SELECTION).read_saved(metadata if metadata is not None else {})
         catalog = ctx.require(TOOLS)
-        view: ToolView = catalog.view(*(
-            ref
-            for source_view in (
-                ctx.require(WAKE_TOOLS_VIEW),
-                ctx.require(AKASHA_TOOLS),
-                ctx.require(STANDARD_WEB_TOOLS),
-            )
-            for ref in source_view.refs
-        ))
+        allowed = set(self.config.investigation_tools) if owner == "content" else set()
+        view: ToolView = catalog.view(
+            *ctx.require(WAKE_TOOLS_VIEW).refs,
+            *(ref for ref in ctx.require(ALL_TOOLS)().refs if ref.name in allowed),
+        )
+        names = (*WAKE_TOOLS[owner], *(ref.name for ref in view.refs
+                 if ref.name in allowed and ref.name not in WAKE_TOOLS[owner]))
         return Request(
             flow_id=flow_id,
             owner=owner,
@@ -210,8 +206,8 @@ class Runtime:
             sink=sink,
             program_binding=bindings.bind(WAKE_PROGRAM, {}),
             tools={
-                name: catalog.bind(view.select(name), bindings)
-                for name in WAKE_TOOLS[owner]
+                name: await catalog.bind_scoped(view.select(name), bindings)
+                for name in names
             },
             snapshot_seq=admission.pool.snapshot_seq,
             items=tuple(dict(item) for item in admission.pool.items),
@@ -221,13 +217,13 @@ class Runtime:
             rules=read_archived_rules(ctx.data_root) or "",
             history=recent_context(ctx.require(MESSAGE_CATALOG), ctx.require(DELIVERY_READ),
                                    target=target.session_id, now=now),
-            events=tuple(dict(item) for item in ctx.require(EVENTMAIL_WAKE).active_context(now)))
+            events=tuple(dict(item) for item in (await ctx.require(EVENTMAIL_WAKE).active_context(now))))
 
     async def follow(self) -> None:
         """先恢复原请求，再独立运行到期检查与五分钟池维护。"""
         async with self.ctx.runtime_scope():
-            self.state.initialize()
-            _ = self.state.close_interrupted_attempts(self.now())
+            recovered_at = self.now()
+            await run_file_io(lambda: self.state.close_interrupted_attempts(recovered_at))
             for flow_id in self.source.pending():
                 _ = await self._run(flow_id)
         # 两条循环共用 Duties 的维护锁，维护不因模型或目标发送排队而停顿。
@@ -236,45 +232,68 @@ class Runtime:
                 _ = group.create_task(self._due(), name="wake:due")
             _ = group.create_task(self._maintenance(), name="wake:maintenance")
 
+    def _blocked(self, *, require_interest: bool = True) -> str | None:
+        if require_interest:
+            reason = self.ctx.require(SEMANTIC_INTEREST).status()
+            if reason is not None:
+                return reason
+        catalog = self.ctx.require(MODEL_CATALOG).snapshot()
+        model_id = catalog.role_bindings.get("default")
+        if model_id is None or catalog.model(model_id).availability != ModelAvailability.AVAILABLE:
+            return "默认聊天模型不可用"
+        return None
+
     async def _due(self) -> None:
         while True:
             self.changed.clear()
             async with self.ctx.runtime_scope():
-                deadline = self.duties.deadline(self.now())
+                now = self.now()
+                alert = await self.ctx.require(EVENTMAIL_WAKE).alert_deadline(now)
+                blocked = self._blocked(require_interest=alert is None or alert > now)
+            if blocked is not None:
+                retry = now + timedelta(seconds=30)
+                if alert is not None and alert > now:
+                    retry = min(retry, alert)
+                receipt = await self._wait(retry, changed=True)
+                if receipt.status == TimerStatus.FIRED:
+                    identity = self._attempt_id(receipt)
+                    try:
+                        await self._finish(identity, "admission_rejected", None,
+                                           f"职责检查未开始：{blocked}")
+                    except BaseException as error:
+                        await self._close_error(identity, None, error)
+                        raise
+                continue
+            async with self.ctx.runtime_scope():
+                deadline = await self.duties.deadline(self.now())
             if deadline is None:
                 _ = await self.changed.wait()
                 continue
             receipt = await self._wait(deadline, changed=True)
             if receipt.status == TimerStatus.CANCELLED:
                 continue
-            flow_id = self._begin(receipt)
+            flow_id = self._attempt_id(receipt)
             owner = None
             try:
                 async with self.ctx.runtime_scope():
                     now = self.now()
-                    self.state.set_attempt_mail_watermark(attempt_id=flow_id,
-                        mail_watermark=self.ctx.require(EVENTMAIL_WAKE).mail_watermark())
+                    watermark = await self.ctx.require(EVENTMAIL_WAKE).mail_watermark()
+                    await run_file_io(lambda: self.state.set_attempt_mail_watermark(
+                        attempt_id=flow_id, mail_watermark=watermark))
                     admission = await self.duties.check(now)
                     owner = admission.owner
-                    original = self.capture(flow_id, admission, now)
+                    original = await self.capture(flow_id, admission, now)
                     if original is None:
                         outcome = "admission_rejected" if owner is not None else (
                             "content_insufficient" if admission.pool.due_count or admission.pool.expired_count else "no_due")
                     else:
-                        self.source.accept(original)
+                        await self.source.accept(original)
                         result = await self._run(flow_id)
                         assert result is not None
                         outcome = result
-                    self.state.finish_attempt(attempt_id=flow_id, outcome=outcome, owner=owner,
-                        detail=admission.detail, completed_at=self.now())
-            except asyncio.CancelledError:
-                self.state.finish_attempt(attempt_id=flow_id, outcome="cancelled_after_fire", owner=owner,
-                    detail="Timer 已触发，原消息与领域回执留待恢复", completed_at=self.now())
-                raise
-            except Exception as error:
-                # 本层只闭合本次 Timer 诊断；原错误继续上抛，未完成来源仍由原记录恢复。
-                self.state.finish_attempt(attempt_id=flow_id, outcome="failed", owner=owner,
-                    detail=f"{type(error).__name__}: {error}", completed_at=self.now())
+                    await self._finish(flow_id, outcome, owner, admission.detail)
+            except BaseException as error:
+                await self._close_error(flow_id, owner, error)
                 raise
 
     async def _run(self, flow_id: str) -> str | None:
@@ -295,35 +314,70 @@ class Runtime:
 
     async def _maintenance(self) -> None:
         while True:
-            deadline = self.state.next_maintenance_deadline(self.now(), interval=timedelta(minutes=5))
+            now = self.now()
+            deadline = await run_file_io(lambda: self.state.next_maintenance_deadline(
+                now, interval=timedelta(minutes=5)))
             receipt = await self._wait(deadline, changed=False)
             if receipt.status == TimerStatus.CANCELLED:
                 continue
-            flow_id = self._begin(receipt)
+            flow_id = self._attempt_id(receipt)
             try:
                 async with self.ctx.runtime_scope():
-                    self.state.set_attempt_mail_watermark(attempt_id=flow_id,
-                        mail_watermark=self.ctx.require(EVENTMAIL_WAKE).mail_watermark())
+                    blocked = self._blocked()
+                    if blocked is not None:
+                        await self._finish(flow_id, "admission_rejected", None,
+                                           f"池维护未开始：{blocked}")
+                        continue
+                    watermark = await self.ctx.require(EVENTMAIL_WAKE).mail_watermark()
+                    await run_file_io(lambda: self.state.set_attempt_mail_watermark(
+                        attempt_id=flow_id, mail_watermark=watermark))
                     pool = await self.duties.maintain(self.now())
-                    self.state.finish_attempt(attempt_id=flow_id,
-                        outcome="content_insufficient" if pool.due_count or pool.expired_count else "no_due",
-                        owner="content" if pool.due_count or pool.expired_count else None,
-                        detail=pool.detail + "；maintenance_only=1", completed_at=self.now())
-            except asyncio.CancelledError:
-                self.state.finish_attempt(attempt_id=flow_id, outcome="cancelled_after_fire", owner=None,
-                    detail="Timer 已触发，池维护被取消", completed_at=self.now())
-                raise
-            except Exception as error:
-                self.state.finish_attempt(attempt_id=flow_id, outcome="failed", owner=None,
-                    detail=f"{type(error).__name__}: {error}", completed_at=self.now())
+                    await self._finish(flow_id,
+                        "content_insufficient" if pool.due_count or pool.expired_count else "no_due",
+                        "content" if pool.due_count or pool.expired_count else None,
+                        pool.detail + "；maintenance_only=1")
+            except BaseException as error:
+                await self._close_error(flow_id, None, error)
                 raise
 
+    @staticmethod
+    def _attempt_id(receipt: TimerReceipt) -> str:
+        return hashlib.sha256((receipt.timer_id + "\n" + receipt.deadline.isoformat() + "\n" +
+                               receipt.settled_at.isoformat()).encode()).hexdigest()[:32]
+
     def _begin(self, receipt: TimerReceipt) -> str:
-        identity = hashlib.sha256((receipt.timer_id + "\n" + receipt.deadline.isoformat() + "\n" +
-                                   receipt.settled_at.isoformat()).encode()).hexdigest()[:32]
+        identity = self._attempt_id(receipt)
         self.state.begin_attempt(attempt_id=identity, timer_id=receipt.timer_id,
             scheduled_for=receipt.deadline, fired_at=receipt.settled_at)
         return identity
+
+    async def _finish(self, identity: str, outcome: str, owner: str | None, detail: str) -> None:
+        """终态提交和连接关闭完成后才返回；时间在 loop 固定。"""
+        completed_at = self.now()
+        await run_file_io(lambda: self.state.finish_attempt(
+            attempt_id=identity, outcome=outcome, owner=owner, detail=detail, completed_at=completed_at))
+
+    async def _close_error(self, identity: str, owner: str | None, error: BaseException) -> None:
+        """只闭合尚在检查的 attempt，保留已提交终态和原始失败。"""
+        completed_at = self.now()
+        outcome = "cancelled_after_fire" if isinstance(error, asyncio.CancelledError) else "failed"
+        detail = ("Timer 已触发，原消息与领域回执留待恢复" if outcome == "cancelled_after_fire"
+                  else f"{type(error).__name__}: {error}")
+
+        def close() -> None:
+            attempt = self.state.get_attempt(identity)
+            if attempt is None:
+                raise RuntimeError("实际触发的 Wake attempt 不存在")
+            if attempt["outcome"] == "checking":
+                self.state.finish_attempt(attempt_id=identity, outcome=outcome, owner=owner,
+                                          detail=detail, completed_at=completed_at)
+
+        try:
+            await run_file_io(close)
+        except BaseException as recovery_error:
+            if isinstance(error, asyncio.CancelledError) and isinstance(recovery_error, asyncio.CancelledError):
+                raise error  # 两次取消均已排空，不能把纯取消升级为程序失败。
+            raise BaseExceptionGroup("Wake 检查与诊断结算均失败", [error, recovery_error]) from None
 
     async def _wait(self, deadline: datetime, *, changed: bool) -> TimerReceipt:
         """提示只撤回尚未触发的 Timer；取消时已触发回执仍留下耐久诊断。"""
@@ -331,6 +385,8 @@ class Runtime:
         timer = asyncio.create_task(handle.result())
         hint = asyncio.create_task(self.changed.wait()) if changed else None
         receipt: TimerReceipt | None = None
+        error: BaseException | None = None
+        # 1. 实际 fire 先落盘；取消可能发生在物理提交完成而 await 尚未返回时。
         try:
             if hint is not None:
                 done, _ = await asyncio.wait((timer, hint), return_when=asyncio.FIRST_COMPLETED)
@@ -338,47 +394,69 @@ class Runtime:
             else:
                 receipt = await timer
             if receipt.status == TimerStatus.FIRED:
-                _ = self._begin(receipt)
-            return receipt
-        except asyncio.CancelledError:
-            receipt = await handle.cancel()
-            if receipt.status == TimerStatus.FIRED:
-                identity = self._begin(receipt)
-                self.state.finish_attempt(attempt_id=identity, outcome="cancelled_after_fire", owner=None,
-                    detail="Timer 已触发，职责检查尚未开始", completed_at=self.now())
-            raise
-        finally:
-            async def close() -> None:
-                waiters = tuple(waiter for waiter in (timer, hint) if waiter is not None)
-                for waiter in waiters:
-                    _ = waiter.cancel()
-                for waiter in waiters:
-                    _ = await asyncio.gather(waiter, return_exceptions=True)
-                await handle.cleanup()
-
-            closing = asyncio.create_task(close())
-            cancelled = False
+                fired = receipt
+                _ = await run_file_io(lambda: self._begin(fired))
+        except asyncio.CancelledError as cancelled:
+            error = cancelled
             try:
-                while not closing.done():
-                    try:
-                        await asyncio.shield(closing)
-                    except asyncio.CancelledError:
-                        cancelled = True
+                receipt = await handle.cancel()
+            except asyncio.CancelledError:
+                pass  # close 会在独立排空任务中取回同一 Timer 的实际回执。
+            except BaseException as cancel_error:
+                error = BaseExceptionGroup("Wake 取消与 Timer 回执均失败", [error, cancel_error])
+        except BaseException as failure:
+            error = failure
+
+        # 2. 排空原 Timer 和所有等待者；清理失败不遮盖 SQL/取消的原始错误。
+        async def close() -> None:
+            nonlocal receipt
+            waiters = tuple(waiter for waiter in (timer, hint) if waiter is not None)
+            for waiter in waiters:
+                _ = waiter.cancel()
+            for waiter in waiters:
+                _ = await asyncio.gather(waiter, return_exceptions=True)
+            if receipt is None:
+                receipt = await handle.cancel()
+            await handle.cleanup()
+
+        closing = asyncio.create_task(close())
+        while not closing.done():
+            try:
+                await asyncio.shield(closing)
+            except asyncio.CancelledError as cancelled:
+                if error is None:
+                    error = cancelled
+                elif not isinstance(error, asyncio.CancelledError):
+                    error = BaseExceptionGroup("Wake 检查失败后取消", [error, cancelled])
+            except Exception:
+                break  # 从 closing.result 取回实际 cleanup 错误。
+        try:
+            closing.result()
+        except BaseException as cleanup_error:
+            if not (isinstance(error, asyncio.CancelledError) and isinstance(cleanup_error, asyncio.CancelledError)):
+                error = (cleanup_error if error is None else
+                         BaseExceptionGroup("Wake 检查与 Timer 清理均失败", [error, cleanup_error]))
+
+        # 3. 本阶段尚未读领域水位；实际 fire 必须留下耐久诊断后才退出。
+        if error is not None:
+            if receipt is not None and receipt.status == TimerStatus.FIRED:
+                fired = receipt
+                completed_at = self.now()
+                outcome = "cancelled_after_fire" if isinstance(error, asyncio.CancelledError) else "failed"
+                detail = ("Timer 已触发，职责检查尚未开始" if outcome == "cancelled_after_fire"
+                          else f"{type(error).__name__}: {error}")
+
+                def settle() -> None:
+                    identity = self._begin(fired)
+                    self.state.finish_attempt(attempt_id=identity, outcome=outcome, owner=None,
+                                              detail=detail, completed_at=completed_at)
+
                 try:
-                    closing.result()
-                except asyncio.CancelledError:
-                    cancelled = True
-            except Exception as error:
-                if receipt is not None and receipt.status == TimerStatus.FIRED:
-                    identity = self._begin(receipt)
-                    attempt = self.state.get_attempt(identity)
-                    assert attempt is not None
-                    if attempt["outcome"] == "checking":
-                        self.state.finish_attempt(attempt_id=identity, outcome="failed", owner=None,
-                            detail=f"Timer cleanup failed: {error}", completed_at=self.now())
-                raise
-            if cancelled:
-                if receipt is not None and receipt.status == TimerStatus.FIRED:
-                    self.state.finish_attempt(attempt_id=self._begin(receipt), outcome="cancelled_after_fire", owner=None,
-                        detail="Timer 已触发，职责检查尚未开始", completed_at=self.now())
-                raise asyncio.CancelledError
+                    await run_file_io(settle)
+                except BaseException as recovery_error:
+                    if isinstance(error, asyncio.CancelledError) and isinstance(recovery_error, asyncio.CancelledError):
+                        raise error
+                    raise BaseExceptionGroup("Wake Timer 与诊断结算均失败", [error, recovery_error]) from None
+            raise error
+        assert receipt is not None
+        return receipt

@@ -221,22 +221,6 @@
       "title": "PluginIdParams",
       "type": "object"
     },
-    "plugin/discard": {
-      "additionalProperties": false,
-      "properties": {
-        "update_id": {
-          "maxLength": 256,
-          "minLength": 1,
-          "title": "Update Id",
-          "type": "string"
-        }
-      },
-      "required": [
-        "update_id"
-      ],
-      "title": "UpdateIdParams",
-      "type": "object"
-    },
     "plugin/install": {
       "additionalProperties": false,
       "properties": {
@@ -279,22 +263,6 @@
         "source"
       ],
       "title": "InstallParams",
-      "type": "object"
-    },
-    "plugin/promote": {
-      "additionalProperties": false,
-      "properties": {
-        "update_id": {
-          "maxLength": 256,
-          "minLength": 1,
-          "title": "Update Id",
-          "type": "string"
-        }
-      },
-      "required": [
-        "update_id"
-      ],
-      "title": "UpdateIdParams",
       "type": "object"
     },
     "plugin/status": {
@@ -419,6 +387,34 @@
           "minLength": 1,
           "title": "Message Id",
           "type": "string"
+        },
+        "model_id": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model Id"
+        },
+        "reasoning_effort": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reasoning Effort"
         },
         "session_id": {
           "maxLength": 512,

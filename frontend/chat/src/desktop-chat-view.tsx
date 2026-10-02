@@ -1,5 +1,5 @@
-import { timelineReplyGroups, timelineToolResults } from "./message-timeline";
-import React, { lazy, Suspense, useMemo } from "react";
+import { timelineReplyGroups, timelineToolResults, timelineInputStarts, timelineSourceKey, timelineSourceRefreshTokens } from "./message-timeline";
+import React, { useMemo } from "react";
 import { useStickToBottomContext } from "use-stick-to-bottom";
 import { cycleTheme, useTheme } from "../../theme/src/theme-runtime";
 import { MaterialButton } from "../../theme/src/material-react";
@@ -9,6 +9,7 @@ import {
   ConversationEmptyState,
   ConversationScrollButton,
 } from "@/components/ai-elements/conversation";
+import { HostBridgeNotice } from "./host-bridge-notice";
 import { ChatProductBand } from "./chat-product-band";
 import { DesktopAutoScroll } from "./desktop-auto-scroll";
 import { ComposerStatsLine } from "./composer-stats-line";
@@ -16,85 +17,81 @@ import { ThinkingPlaceholder } from "./thinking-placeholder";
 import { DesktopComposer } from "./desktop-composer";
 import { DesktopConversationMessages, DesktopTimelineMessages } from "./desktop-conversation";
 import { ReplyActivityView } from "./message-view";
-import { DesktopMobileNavigation } from "./desktop-mobile-navigation";
+import { CompactNavigation } from "./compact-navigation";
 import { DesktopSidebar } from "./desktop-sidebar";
 import type { DesktopChatController } from "./use-desktop-chat-controller";
 
-const LazyMobilePairingDialog = lazy(() =>
-  import("./mobile-pairing-dialog").then(({ MobilePairingDialog }) => ({ default: MobilePairingDialog })),
-);
-const LazyRuntimeDashboard = lazy(() =>
-  import("./runtime-dashboard").then(({ RuntimeDashboard }) => ({ default: RuntimeDashboard })),
-);
-
 interface DesktopChatViewProps {
   embeddedShell: boolean;
-  embeddedRuntime: boolean;
   controller: DesktopChatController;
 }
 
-export function DesktopChatView({ embeddedShell, embeddedRuntime, controller }: DesktopChatViewProps) {
+export function DesktopChatView({ embeddedShell, controller }: DesktopChatViewProps) {
   const theme = useTheme();
   const replyGroups = useMemo(() => timelineReplyGroups(controller.timelineMessages, controller.replyActivities), [controller.timelineMessages, controller.replyActivities]);
+  const inputStarts = useMemo(() => timelineInputStarts(controller.timelineMessages), [controller.timelineMessages]);
+  const refreshTokens = timelineSourceRefreshTokens(controller.timelineMessages, controller.replyActivities, controller.timelineRefresh);
   const toolResults = useMemo(() => timelineToolResults(controller.timelineMessages), [controller.timelineMessages]);
   const {
     surface, sidebarSessions, activeSessionId, pendingSessionId, chatReady, messages, timelineMessages, replyActivities, replyAvailable, status,
     streamStore, messageElementsRef, copiedMessageId, shellState, stopPending, modelState,
-    selectedRuntimeId, selectedReasoningEffort, replyTarget, error, mobilePairingOpen,
+    selectedRuntimeId, selectedReasoningEffort, replyTarget, error,
+    canSend, modelProblem, modelsError, retryModels, draftKey,
     historyHasMore, historyLoading, historyLoadingOlder, loadOlderMessages,
-    activateSession, openRuntime, startNewChat, handleReplyMessage, handleCopiedMessage,
+    activateSession, prefetchSessionTail, startNewChat, handleReplyMessage, handleCopiedMessage,
     reportError, handleModelChange, cancelReply, sendMessage, stopTurn, retry,
-    setMobilePairingOpen,
+    projects, pendingProjects, pendingProjectsError, projectsInstalled, memoryInstalled, activeProject,
+    startProjectChat, createProject, continueProject, stopProject,
   } = controller;
-  const openPairing = () => setMobilePairingOpen(true);
+  const sidebarProjects = useMemo(() => projectsInstalled ? {
+    items: projects, pending: pendingProjects, pendingError: pendingProjectsError,
+    activeProjectId: activeProject?.id ?? "", memoryInstalled,
+    onNewChat: startProjectChat, onCreate: createProject, onContinue: continueProject, onStop: stopProject,
+  } : undefined, [activeProject?.id, createProject, continueProject, memoryInstalled, pendingProjects,
+    pendingProjectsError, projects, projectsInstalled, startProjectChat, stopProject]);
+  const activeTitle = sidebarSessions.find((session) => session.active)?.title || "新会话";
+  const headingTitle = activeProject ? `${activeProject.name} / ${activeTitle}` : activeTitle;
   const committed = new Set(timelineMessages.map((message) => message.id));
   const hasMessages = messages.length + timelineMessages.length + replyActivities.length > 0;
 
   const shellClass = [
     "chat-shell",
     embeddedShell ? "is-embedded" : "is-standalone-l",
-    embeddedRuntime ? "embedded-runtime" : "",
   ].filter(Boolean).join(" ");
 
   return (
     <main className={shellClass}>
-      {!embeddedShell && !embeddedRuntime ? (
+      {!embeddedShell ? (
         <ChatProductBand
-          surface={surface}
           chatReady={chatReady}
           themeLabel={theme.label}
-          onOpenRuntime={openRuntime}
           onCycleTheme={cycleTheme}
         />
       ) : null}
 
       <div className="chat-shell-body">
-        {!embeddedRuntime ? <>
-          <DesktopSidebar
+        <DesktopSidebar
             embeddedShell={embeddedShell} surface={surface} sessions={sidebarSessions}
             activeSessionId={activeSessionId} pendingSessionId={pendingSessionId} chatReady={chatReady}
-            themeLabel={theme.label} onSelectSession={activateSession} onOpenRuntime={openRuntime}
-            onCycleTheme={cycleTheme} onOpenPairing={openPairing} onNewChat={startNewChat}
+            themeLabel={theme.label} projects={sidebarProjects} navigationPins={controller.navigationPins} onSelectSession={activateSession}
+            onPrefetchSession={prefetchSessionTail}
+            onCycleTheme={cycleTheme} onNewChat={startNewChat}
           />
-          <DesktopMobileNavigation
-            embeddedShell={embeddedShell} surface={surface} sessions={sidebarSessions}
-            activeSessionId={activeSessionId} pendingSessionId={pendingSessionId} chatReady={chatReady}
-            themeLabel={theme.label} onSelectSession={activateSession} onOpenRuntime={openRuntime}
-            onCycleTheme={cycleTheme} onOpenPairing={openPairing} onNewChat={startNewChat}
-          />
-        </> : null}
 
-        {surface === "runtime" ? (
-          <Suspense fallback={<section className="runtime-dashboard" aria-busy="true">正在加载知识与运行…</section>}>
-            <LazyRuntimeDashboard />
-          </Suspense>
-        ) : <section className="chat-main">
+        <section className="chat-main">
         <header className="conversation-heading">
-          <h1 title={sidebarSessions.find((s) => s.active)?.title || "新会话"}>{sidebarSessions.find((session) => session.active)?.title || "新会话"}</h1>
+          <CompactNavigation
+            embeddedShell={embeddedShell} surface={surface} sessions={sidebarSessions}
+            activeSessionId={activeSessionId} pendingSessionId={pendingSessionId} chatReady={chatReady}
+            themeLabel={theme.label} projects={sidebarProjects} navigationPins={controller.navigationPins} onSelectSession={activateSession}
+            onPrefetchSession={prefetchSessionTail}
+            onCycleTheme={cycleTheme} onNewChat={startNewChat}
+          />
+          <h1 title={headingTitle}>{headingTitle}</h1>
         </header>
         <Conversation className="conversation" resize="instant">
           <ConversationContent className={hasMessages ? "conversation-content" : "conversation-content empty"}>
-            {!hasMessages ? <DesktopEmptyState shellStatus={shellState?.status ?? null} loadingSession={historyLoading} /> : (
+            {!hasMessages ? <DesktopEmptyState shellStatus={shellState?.status ?? null} loadingSession={historyLoading} modelProblem={modelProblem} /> : (
               <MessageRendererErrorBoundary>
                 <DesktopHistoryLoader
                   firstMessageId={timelineMessages[0]?.id ?? messages[0]?.id}
@@ -102,7 +99,7 @@ export function DesktopChatView({ embeddedShell, embeddedRuntime, controller }: 
                   loading={historyLoadingOlder}
                   onLoadOlder={() => loadOlderMessages().catch(reportError)}
                 />
-                <DesktopTimelineMessages messages={timelineMessages} activities={replyActivities} status={status}
+                <DesktopTimelineMessages messages={timelineMessages} activities={replyActivities} refresh={controller.timelineRefresh} status={status}
                   messageElementsRef={messageElementsRef} copiedMessageId={copiedMessageId}
                   onReply={handleReplyMessage} onCopied={handleCopiedMessage} onError={reportError} />
                 <DesktopConversationMessages
@@ -112,10 +109,10 @@ export function DesktopChatView({ embeddedShell, embeddedRuntime, controller }: 
                   onCopied={handleCopiedMessage} onError={reportError}
                 />
                 {replyActivities.map((activity) => <ReplyActivityView key={activity.handle}
-                  activity={activity} committed={committed} processMessages={replyGroups.active.get(activity.handle)} toolResults={toolResults} onError={reportError} />)}
+                  activity={activity} committed={committed} inputStarts={inputStarts} refreshToken={refreshTokens.get(timelineSourceKey(activity))} processMessages={replyGroups.active.get(activity.handle)} toolResults={toolResults} onError={reportError} />)}
               </MessageRendererErrorBoundary>
             )}
-            {status === "submitted" ? <ThinkingPlaceholder /> : null}
+            {status === "submitted" && !replyActivities.some((activity) => activity.active) ? <ThinkingPlaceholder /> : null}
           </ConversationContent>
           <DesktopAutoScroll messages={messages} status={status} streamStore={streamStore}
             timelineMessages={timelineMessages} replyActivities={replyActivities} />
@@ -123,23 +120,30 @@ export function DesktopChatView({ embeddedShell, embeddedRuntime, controller }: 
         </Conversation>
 
         <div className={`composer-wrap ${!hasMessages ? "home" : ""}`}>
+          {status === "uploading" ? <p className="reply-unavailable" role="status">正在上传附件…</p> : null}
+          {chatReady && (modelProblem || modelsError) ? <div className="chat-model-notice" role="status">
+            {modelProblem ? <p id="chat-model-reason">{modelProblem}</p> : null}
+            {modelsError ? <p>{modelsError}</p> : null}
+            <div>
+              {modelProblem ? <a href="/#models" target="_blank" rel="noopener">打开模型设置</a> : null}
+              {modelsError ? <button type="button" onClick={retryModels}>重试加载模型列表</button> : null}
+            </div>
+          </div> : null}
           <DesktopComposer
-            chatReady={chatReady} status={status} stopPending={stopPending} modelState={modelState}
+            chatReady={chatReady} canSend={canSend} modelProblem={modelProblem} draftKey={draftKey} status={status} stopPending={stopPending} modelState={modelState}
             selectedRuntimeId={selectedRuntimeId} selectedEffort={selectedReasoningEffort}
             replyTarget={replyTarget} onModelChange={handleModelChange} onCancelReply={cancelReply}
             onSend={sendMessage} onStop={stopTurn}
           />
           <ComposerStatsLine messages={timelineMessages} activities={replyActivities} connected={replyAvailable !== null} />
           {replyAvailable === false ? <p className="reply-unavailable" role="status">当前未加载回复插件</p> : null}
+          <HostBridgeNotice />
           {error ? <div className="error-line" role="alert"><span>{error}</span>
             <MaterialButton variant="danger" onClick={retry}>重试</MaterialButton>
           </div> : null}
         </div>
-      </section>}
+      </section>
       </div>
-      {mobilePairingOpen ? <Suspense fallback={null}>
-        <LazyMobilePairingDialog open onOpenChange={setMobilePairingOpen} />
-      </Suspense> : null}
     </main>
   );
 }
@@ -180,14 +184,18 @@ function DesktopHistoryLoader({
   >{loading ? "正在加载更早消息…" : "加载更早消息"}</button>;
 }
 
-function DesktopEmptyState({ shellStatus, loadingSession }: { shellStatus: string | null; loadingSession: boolean }) {
+function DesktopEmptyState({ shellStatus, loadingSession, modelProblem }: { shellStatus: string | null; loadingSession: boolean; modelProblem: string }) {
   return <ConversationEmptyState className="home-state">
     {loadingSession ? <div className="home-state__ready" role="status"><strong>正在读取消息</strong></div> : shellStatus === "needs_setup" ? <div className="model-connection-state">
-      <span>首次使用</span><h1>先连接一个模型</h1>
+      <span>对话尚未就绪</span><h1>请完成所需配置</h1>
       <p>绑定 Codex、OpenCode 或自己的 API Key 后，就可以在这里直接对话。</p>
       <a href="/#models">连接模型</a>
+    </div> : shellStatus === "unavailable" ? <div className="model-connection-state">
+      <span>对话暂不可用</span><h1>尚未连接到聊天服务</h1>
+      <p>服务可能正在启动、已停用或启动失败。连接恢复后，这个页面会自动更新。</p>
+      <a href="/">查看管理面板</a>
     </div> : shellStatus === "starting" ? <div className="model-connection-state">
-      <span>正在启动</span><h1>模型已保存，Akashic 正在准备对话</h1>
+      <span>正在启动</span><h1>Akashic 正在准备对话</h1>
       <p>这个页面会自动恢复，不需要切换端口或刷新浏览器。</p>
       <a href="/#models">查看模型设置</a>
     </div> : shellStatus === null ? (
@@ -195,6 +203,8 @@ function DesktopEmptyState({ shellStatus, loadingSession }: { shellStatus: strin
         <strong>正在连接</strong>
         <span>稍等，工作区马上就绪</span>
       </div>
+    ) : modelProblem ? (
+      <div className="home-state__ready"><strong>准备对话</strong><span>下方会说明模型状态；你可以先写下想说的话</span></div>
     ) : (
       <div className="home-state__ready">
         <strong>布置下一件事</strong>

@@ -1,15 +1,22 @@
 """固定配置的 Telegram 出站；不创建 Bot 收件实例。"""
-from collections.abc import AsyncGenerator, Callable
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from typing import Protocol, Self
 from urllib.parse import urlsplit
 
 import aiohttp
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from agent.plugin_composition import CREDENTIALS, Context, CredentialRef, Effect, ServiceKey
+from agent.plugin_composition import (
+    CREDENTIALS,
+    Context,
+    CredentialRef,
+)
 from agent.plugin_composition.artifacts import ARTIFACT_READ
 from agent.plugin_composition.messages import MESSAGE_CATALOG
+from agent.plugin_contracts.delivery import (
+    DELIVERY_SENDERS as DELIVERY_SENDERS,
+)
 
 from .sender import TelegramSender
 
@@ -23,24 +30,12 @@ class SenderTarget(Protocol):
     idempotent: bool
 
 
-class SenderRegistry(Protocol):
-    async def register(
-        self,
-        ctx: Context,
-        *,
-        name: str,
-        idempotent: bool,
-        open: Callable[[], AbstractAsyncContextManager[SenderTarget]],
-    ) -> Effect: ...
-
-
-DELIVERY_SENDERS = ServiceKey[SenderRegistry]("delivery.senders.v1")
-inject = (DELIVERY_SENDERS, CREDENTIALS, MESSAGE_CATALOG, ARTIFACT_READ)
+function_inject = (DELIVERY_SENDERS, CREDENTIALS, MESSAGE_CATALOG, ARTIFACT_READ)
 
 
 class Config(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
-    enabled: bool = False
+    enabled: bool | None = False
     token: CredentialRef | None = None
     channel: str = Field(default="telegram", pattern=r"^[a-z][a-z0-9_-]{0,63}$")
     api_base: str = "https://api.telegram.org"
@@ -56,7 +51,7 @@ class Config(BaseModel):
         return self
 
 
-async def apply(ctx: Context) -> None:
+async def run(ctx: Context) -> None:
     config = Config.model_validate(ctx.config)
     if not config.enabled:
         return
@@ -71,3 +66,16 @@ async def apply(ctx: Context) -> None:
                                      ctx.require(MESSAGE_CATALOG), ctx.require(ARTIFACT_READ))
 
     _ = await ctx.require(DELIVERY_SENDERS).register(ctx, name=config.channel, idempotent=False, open=open_sender)
+
+
+from agent.plugin_composition.plugin_config import PLUGIN_CONFIG
+from agent.plugin_composition.runtime_catalog import RUNTIME_CATALOG
+
+inject = (PLUGIN_CONFIG, RUNTIME_CATALOG, CREDENTIALS)
+
+
+async def apply(ctx: Context) -> None:
+    """设置入口常驻，业务依赖只影响功能分支。"""
+    from .settings import mount
+    function = await ctx.inject(function_inject, run, name="function")
+    await mount(ctx, Config, function)

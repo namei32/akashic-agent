@@ -1,15 +1,18 @@
-from collections.abc import AsyncGenerator, Callable
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
-from agent.plugin_composition import Context, Effect, ServiceKey
+from agent.plugin_composition import Context
 from agent.plugin_contracts import Message
+from agent.plugin_contracts.delivery import (
+    DELIVERY_SENDERS as DELIVERY_SENDERS,
+)
 
 api_version = 3
 name = "akashic_sender"
 version = "1.0.0"
-desc = "确认目标会话已保存的消息，Web 和 Mobile 从日志订阅"
+desc = "确认目标会话已保存的消息，Web 和 Android Shell 从日志订阅"
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,18 +32,6 @@ class SenderTarget(Protocol):
     async def query(self, key: str, address: str) -> SendResult | None: ...
 
 
-class SenderRegistry(Protocol):
-    async def register(
-        self,
-        ctx: Context,
-        *,
-        name: str,
-        idempotent: bool,
-        open: Callable[[], AbstractAsyncContextManager[SenderTarget]],
-    ) -> Effect: ...
-
-
-DELIVERY_SENDERS = ServiceKey[SenderRegistry]("delivery.senders.v1")
 inject = (DELIVERY_SENDERS,)
 
 

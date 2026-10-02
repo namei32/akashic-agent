@@ -1,5 +1,10 @@
 # Android 手机连接（Cloudflare）
 
+> 历史部署记录：上游已按 [决策 0076](docs/decisions/0076-android-shell-retires-legacy-mobile-stack.md)
+> 退役下述 Akashic Mobile 配对与 WebSocket 协议。当前版本使用
+> [Android Shell](https://github.com/kachofugetsu09/akashic-android-shell) 加载服务端 Web 聊天页；
+> 下述二维码、旧 APK 和移动网关步骤不适用于更新后的源码。旧配置和数据仍需单独核对。
+
 当前手机入口为 **`wss://mobile.roxyagent.org/ws`**，由现有 `roxy-mobile` Cloudflare Tunnel
 转发到这台 Mac 的 `https://127.0.0.1:6323`。Android 手机无需安装或连接 Tailscale。
 

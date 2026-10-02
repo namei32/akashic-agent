@@ -7,6 +7,8 @@ export interface SessionRow {
   updated_at?: string;
   message_count?: number;
   first_message_content?: string;
+  /** Session 接纳时固定的宽键；缺失维度即 default。 */
+  scope?: Record<string, string>;
 }
 
 export interface ChatHistoryPage {
@@ -22,10 +24,11 @@ export interface ChatModelState {
   sessionOverride: string;
   sessionSelection: { modelRef: string; reasoningEffort: string };
   runtimes: ChatModelRuntime[];
+  unavailableRuntimes: { id: string; model: string; sourceName: string; availability: "disabled" | "driver_unavailable" }[];
 }
 
 export interface WebShellState {
-  status: "needs_setup" | "starting" | "ready";
+  status: "needs_setup" | "starting" | "unavailable" | "ready";
   configured: boolean;
   chatReady: boolean;
 }
@@ -51,6 +54,11 @@ export function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** HTTP 认证/权限错误与目录内容、远端模型调用失败分开。 */
+export class ChatRequestError extends Error {
+  constructor(readonly status: number, message: string) { super(message); }
+}
+
 export async function fetchChatJson<T>(url: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(url, options);
   const text = await response.text();
@@ -59,13 +67,14 @@ export async function fetchChatJson<T>(url: string, options: RequestInit = {}): 
     try {
       payload = JSON.parse(text);
     } catch {
-      throw new Error(response.ok ? "服务器返回了无效 JSON" : `请求失败: ${response.status}`);
+      if (!response.ok) throw new ChatRequestError(response.status, `请求失败: ${response.status}`);
+      throw new Error("服务器返回了无效 JSON");
     }
   }
   if (!response.ok) {
     const body = recordValue(payload);
     const detail = typeof body?.detail === "string" ? body.detail : typeof body?.message === "string" ? body.message : "";
-    throw new Error(detail || `请求失败: ${response.status}`);
+    throw new ChatRequestError(response.status, detail || `请求失败: ${response.status}`);
   }
   if (payload === null) throw new Error("服务器返回空响应");
   return payload as T;
@@ -79,6 +88,7 @@ export function sessionPage(payload: unknown): { items: SessionRow[]; nextCursor
     || (item.first_message_content !== undefined && typeof item.first_message_content !== "string")
     || (item.updated_at !== undefined && typeof item.updated_at !== "string")
     || (item.message_count !== undefined && (typeof item.message_count !== "number" || !Number.isFinite(item.message_count)))
+    || (item.scope !== undefined && !isStringRecord(item.scope))
   ))) {
     throw new Error("/api/chat/sessions 返回了无效 session 行");
   }
@@ -115,7 +125,7 @@ export function chatHistoryPage(payload: unknown, endpoint: string): ChatHistory
 export function webShellState(payload: unknown): WebShellState {
   const body = recordValue(payload);
   if (!body
-    || (body.status !== "needs_setup" && body.status !== "starting" && body.status !== "ready")
+    || (body.status !== "needs_setup" && body.status !== "starting" && body.status !== "unavailable" && body.status !== "ready")
     || typeof body.configured !== "boolean"
     || typeof body.chatReady !== "boolean") {
     throw new Error("/api/shell/state 返回了无效状态");
@@ -129,7 +139,7 @@ export function chatModelState(payload: unknown): ChatModelState {
     || typeof body.defaultRuntime !== "string"
     || typeof body.sessionOverride !== "string"
     || !recordValue(body.sessionSelection)
-    || !Array.isArray(body.runtimes)) {
+    || !Array.isArray(body.runtimes) || !Array.isArray(body.unavailableRuntimes)) {
     throw new Error("/api/chat/models 返回了无效模型注册表");
   }
   const runtimes = body.runtimes.map((value) => {
@@ -154,6 +164,15 @@ export function chatModelState(payload: unknown): ChatModelState {
       roles: item.roles as string[],
     };
   });
+  const unavailableRuntimes = body.unavailableRuntimes.map<ChatModelState["unavailableRuntimes"][number]>((value) => {
+    const item = recordValue(value);
+    if (!item || typeof item.id !== "string" || typeof item.model !== "string"
+      || typeof item.sourceName !== "string"
+      || (item.availability !== "disabled" && item.availability !== "driver_unavailable")) {
+      throw new Error("/api/chat/models 返回了无效不可用模型");
+    }
+    return { id: item.id, model: item.model, sourceName: item.sourceName, availability: item.availability };
+  });
   const selection = recordValue(body.sessionSelection);
   if (!selection || typeof selection.modelRef !== "string" || typeof selection.reasoningEffort !== "string") {
     throw new Error("/api/chat/models 返回了无效会话模型选择");
@@ -164,6 +183,7 @@ export function chatModelState(payload: unknown): ChatModelState {
     sessionOverride: body.sessionOverride,
     sessionSelection: { modelRef: selection.modelRef, reasoningEffort: selection.reasoningEffort },
     runtimes,
+    unavailableRuntimes,
   };
 }
 
@@ -226,4 +246,9 @@ function recordValue(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? value as Record<string, unknown>
     : null;
+}
+
+function isStringRecord(value: unknown): value is Record<string, string> {
+  const record = recordValue(value);
+  return record !== null && Object.values(record).every((item) => typeof item === "string");
 }

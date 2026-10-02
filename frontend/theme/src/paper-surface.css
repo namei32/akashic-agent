@@ -6,29 +6,26 @@
 
 .ak-paper-stage,
 .chat-shell,
-.settings-page,
-.runtime-dashboard {
+.settings-page {
   background-color: var(--ak-paper-canvas);
   background-image: none;
 }
 
 /* Nested panes stay on the same solid plane; side rails lift one warm step. */
 .chat-shell .chat-shell-body,
-.chat-shell .chat-main,
-.chat-shell .runtime-dashboard {
+.chat-shell .chat-main {
   background-color: transparent;
   background-image: none;
 }
 
-.chat-product-band {
+.product-band {
   background-color: var(--ak-paper-canvas);
   background-image: none;
 }
 
 .chat-sidebar,
 .sessions-pane,
-.detail-pane.is-open,
-.runtime-dashboard__topbar {
+.detail-pane.is-open {
   background-color: var(--ak-paper-quiet);
   background-image: none;
 }

@@ -23,8 +23,12 @@ from agent.migrations.bundles import (
     validate_bundle_dependencies,
     validate_pending_requirements,
 )
+from agent.plugins.source_resolver import ResolvedPluginSource
 from agent.plugins.manifest import plugins_root, workspace_plugin_data_dir
-from bootstrap.workspace_lock import WorkspaceInstanceLock
+from agent.plugins.distribution_sources import distribution_migration_sources
+from agent.plugins.reload_journal import check_pending_publication
+from agent.plugins.selection import PluginSelection
+from bootstrap.workspace_lock import WorkspaceInstanceLock, WorkspaceMaintenanceLock
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -38,7 +42,7 @@ class MigrationOutcome:
 
 
 class MigrationRunner:
-    """在 runtime 启动前执行缺失的 Yoyo 迁移。"""
+    """在启动前推进 Core 和内置插件的 Yoyo 账本。"""
 
     def __init__(
         self,
@@ -47,8 +51,9 @@ class MigrationRunner:
         config_path: Path,
         workspace: Path,
         plugin_dirs: Sequence[Path] = (),
-        installed_cache_root: Path | None = None,
         migration_catalog: Path | None = None,
+        fixed_sources: Sequence[ResolvedPluginSource] | None = None,
+        startup_selection: bool = False,
     ) -> None:
         self.repo_root = repo_root.resolve()
         self.config_path = config_path.expanduser().resolve()
@@ -61,10 +66,8 @@ class MigrationRunner:
         # 保留路径上的 symlink 形状，让 source resolver 能够拒绝它，而不是
         # 先 resolve 后把越界路径伪装成普通 cache 根。
         self.plugin_dirs = tuple(path.expanduser() for path in plugin_dirs)
-        self.installed_cache_root = (
-            (installed_cache_root or (plugins_root() / "cache"))
-            .expanduser()
-        )
+        self.fixed_sources = None if fixed_sources is None else tuple(fixed_sources)
+        self.startup_selection = startup_selection
         self.migration_catalog = (
             migration_catalog
             if migration_catalog is not None
@@ -72,28 +75,55 @@ class MigrationRunner:
         ).expanduser()
 
     def run(self) -> MigrationOutcome:
-        """执行当前目录并返回本次落账的迁移 ID。"""
+        """先迁移 Core 和当前发行版内置数据，再允许 runtime 启动。"""
 
         # 1. 复用 workspace 锁串行化迁移与 runtime 启动
         workspace_lock = WorkspaceInstanceLock(self.workspace)
         workspace_lock.acquire()
         try:
+            if self.startup_selection:
+                self.fixed_sources = distribution_migration_sources(self.workspace, plugins_root())
+                # Core 先升级自己拥有的账本结构，才能读取完整的配置恢复事实。
+                core = self._apply_pending(core_only=True)
+                selection = PluginSelection(self.workspace)
+                if self.check() and selection.path.exists() and selection.read() is not None:
+                    check_pending_publication(self.workspace)
+                plugins = self._apply_pending()
+                migrations = core.migrations + plugins.migrations
+                return MigrationOutcome(state="migrated" if migrations else "current", migrations=migrations)
             return self._apply_pending()
         finally:
             workspace_lock.release()
 
-    def _apply_pending(self) -> MigrationOutcome:
+    def run_under_maintenance(
+        self, maintenance: WorkspaceMaintenanceLock, *, core_only: bool = False,
+    ) -> MigrationOutcome:
+        """Apply migrations while the release owns the workspace maintenance lock."""
+
+        if (maintenance.paths != (
+            self.workspace / ".supervisor.lock", self.workspace / ".instance.lock",
+        ) or len(maintenance._streams) != 2):
+            raise RuntimeError("release migration 缺少当前 workspace maintenance owner")
+        return self._apply_pending(core_only=core_only)
+
+    def check(self) -> tuple[str, ...]:
+        """只读核对目标代码的待迁移集合，不创建账本或运行 step。"""
+        return self._apply_pending(check_only=True).migrations
+
+    def _apply_pending(
+        self, *, core_only: bool = False,
+        check_only: bool = False,
+    ) -> MigrationOutcome:
         """加载不可变目录并提交全部缺失迁移。"""
 
         # 1. 初始化由 workspace 持有的迁移账本
         fresh = _workspace_is_empty(self.workspace, self.config_path)
         baseline = _read_baseline(self.ledger_path)
         try:
-            self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
             core_migrations = _read_migrations(str(self.migrations_root))
             bundles = discover_migration_bundles(
                 plugin_dirs=self.plugin_dirs,
-                installed_cache_root=self.installed_cache_root,
+                fixed_sources=self.fixed_sources,
             )
             requirements = load_migration_requirements(self.migration_catalog)
             applied_ids = _read_applied_ids(self.ledger_path)
@@ -121,8 +151,15 @@ class MigrationRunner:
                 applied_ids=applied_ids,
                 bundles=bundles,
             )
+            pending_ids = set(core_ids + bundle_ids) - set(applied_ids) - set(baseline or ())
+            if check_only:
+                return MigrationOutcome(state="current", migrations=tuple(sorted(pending_ids)))
             if fresh and baseline is not None:
+                self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
                 _save_baseline(self.ledger_path, baseline)
+            if not pending_ids:
+                return MigrationOutcome(state="current")
+            self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
             backend = get_backend(self._ledger_uri())
             os.chmod(self.ledger_path, 0o600)
 
@@ -149,7 +186,8 @@ class MigrationRunner:
                     str(self.migrations_root), bundles
                 )
                 selected = type(migrations)(
-                    (item for item in migrations if item.id not in (baseline or ())),
+                    (item for item in migrations if item.id not in (baseline or ())
+                     and (not core_only or item.id in core_ids)),
                     migrations.post_apply,
                 )
                 pending = backend.to_apply(selected)
@@ -187,10 +225,13 @@ def _bind_yoyo_username() -> Iterator[None]:
 
 
 def migrate_installation(config_path: Path, workspace: Path) -> MigrationOutcome:
+    """Run startup migrations from the same durable inputs the runtime loads."""
+
     return MigrationRunner(
         repo_root=_PROJECT_ROOT,
         config_path=config_path,
         workspace=workspace,
+        startup_selection=True,
     ).run()
 
 
@@ -263,7 +304,7 @@ def _read_applied_ids(path: Path) -> tuple[str, ...]:
 
     if not path.exists():
         return ()
-    connection = sqlite3.connect(path)
+    connection = sqlite3.connect(f"file:{quote(path.as_posix(), safe='/')}?mode=ro", uri=True)
     try:
         try:
             rows = connection.execute(

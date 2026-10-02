@@ -19,7 +19,6 @@ export async function startDesktopFixtureServer(root, { port = 0, historyCount =
   const sockets = new Set();
   const receivedFrames = [];
   const receivedRequests = [];
-  let pairingCreateCount = 0;
   let historyDelayMs = 0;
   const websocketServer = new WebSocketServer({ noServer: true });
   websocketServer.on("connection", (socket) => {
@@ -45,21 +44,17 @@ export async function startDesktopFixtureServer(root, { port = 0, historyCount =
     }
     if (request.method === "POST" && url.pathname === "/api/chat/uploads") {
       const filename = url.searchParams.get("filename") || "upload.bin";
-      return sendJson(response, { filename, upload_path: `uploads/${filename}`, upload_url: `/media/uploads/${filename}` });
-    }
-    if (request.method === "POST" && url.pathname === "/api/chat/mobile-pairing") {
-      pairingCreateCount += 1;
-      await delay(300);
-      return sendJson(response, desktopPairingOffer(pairingCreateCount));
-    }
-    if (request.method === "GET" && /^\/api\/chat\/mobile-pairing\/fixture-pairing-/u.test(url.pathname)) {
+      let sizeBytes = 0;
+      for await (const chunk of request) sizeBytes += chunk.length;
       return sendJson(response, {
-        pairing_id: url.pathname.split("/").at(-1), status: "waiting_for_desktop_confirmation",
-        device_name: "Pixel 7", confirmation_code: "358864", capabilities: ["chat"],
+        filename,
+        artifact_id: `fixture-artifact-${filename}`,
+        kind: "file",
+        media_type: "text/plain",
+        size_bytes: sizeBytes,
+        sha256: "a".repeat(64),
+        upload_url: `/api/chat/artifacts/fixture-artifact-${filename}`,
       });
-    }
-    if (request.method === "POST" && /\/approve$/u.test(url.pathname)) {
-      return sendJson(response, { device_id: "pixel-7", display_name: "Pixel 7" });
     }
     const settings = await settingsFixtureResponse(request, url, receivedRequests);
     if (settings !== undefined) return sendJson(response, settings);
@@ -76,8 +71,9 @@ export async function startDesktopFixtureServer(root, { port = 0, historyCount =
       const start = Math.max(0, beforeSeq - pageSize);
       const items = history.items.slice(start, beforeSeq);
       return sendJson(response, {
+        version: 2,
         items,
-        total: history.items.length,
+        through_seq: history.items.at(-1).seq,
         has_more: start > 0,
         before_seq: start > 0 ? start : null,
       });
@@ -85,6 +81,8 @@ export async function startDesktopFixtureServer(root, { port = 0, historyCount =
     if (request.method === "POST" && url.pathname === "/__fixture/stream") {
       if (sockets.size === 0) return sendJson(response, { error: "no_websocket_client" }, 409);
       const sessionId = url.searchParams.get("session_id") || fixtureSessionId;
+      // mode=replay 仍广播旧版 turn.delta 帧：当前桌面前端只消费 v2 reply.status/messages.appended，
+      // 该路径已不被套件使用，保留给 measure-desktop-stream-baseline.mjs 迁移前参考。
       if (url.searchParams.get("mode") === "replay") {
         if (replayTurn === null) return sendJson(response, { error: "replay_turn_not_configured" }, 409);
         let charactersPerSecond;
@@ -117,25 +115,41 @@ export async function startDesktopFixtureServer(root, { port = 0, historyCount =
         return sendJson(response, { error: error.message }, 400);
       }
       const delta = url.searchParams.get("delta") || "片";
-      const turnId = `fixture-${Date.now()}`;
-      broadcast(sockets, {
-        type: "turn.started", session_id: sessionId, turn_id: turnId,
-        control_turn_id: turnId, client_message_id: `${turnId}:user`, content: "",
-      });
+      const draftId = `desktop-stream-${Date.now()}`;
+      const handle = "fixture-stream";
+      // 1. v2 协议下流式正文走 reply.status 草稿预览，旧的 turn.started/answer.delta 帧已被前端忽略。
       for (let index = 0; index < count; index += 1) {
-        broadcast(sockets, { type: "answer.delta", session_id: sessionId, turn_id: turnId, delta });
+        broadcast(sockets, {
+          type: "reply.status", version: 2, session_id: sessionId, available: true,
+          snapshot_id: `${draftId}-snap-${index}`,
+          items: [{
+            session_id: sessionId, handle, source: "akashic", active: true,
+            preview: { message_id: draftId, text: delta.repeat(index + 1), thinking: "" },
+          }],
+        });
         if (intervalMs > 0) await delay(intervalMs);
       }
       if (terminal === 1) {
+        // 2. 草稿按 message_id 落库：messages.appended 携带同 id 的正式行后前端自动收起草稿。
+        const lastSeq = desktopMessagesForSession(sessionId)?.items.at(-1)?.seq ?? -1;
+        const appended = {
+          type: "messages.appended", version: 2, session_id: sessionId,
+          after_seq: lastSeq, through_seq: lastSeq + 1, next_after_seq: lastSeq + 1, has_more: false,
+          items: [{
+            id: draftId, seq: lastSeq + 1, session_id: sessionId,
+            timestamp: new Date().toISOString(), author: "assistant", source: "akashic",
+            attachments: [], metadata: {},
+            body: { kind: "output", parts: [{ kind: "text", value: delta.repeat(count) }], finish: "complete" },
+          }],
+        };
+        broadcast(sockets, appended);
         broadcast(sockets, {
-          type: "message.final",
-          session_id: sessionId,
-          turn_id: turnId,
-          content: delta.repeat(count),
-          duration_ms: 1,
+          type: "reply.status", version: 2, session_id: sessionId, available: true,
+          snapshot_id: `${draftId}-snap-final`,
+          items: [{ session_id: sessionId, handle, source: "akashic", active: false, preview: null }],
         });
       }
-      return sendJson(response, { sessionId, turnId, count, delta, intervalMs, terminal: terminal === 1 });
+      return sendJson(response, { sessionId, draftId, count, delta, intervalMs, terminal: terminal === 1 });
     }
 
     const api = fixtureApiResponse(url, messageCount);
@@ -147,7 +161,7 @@ export async function startDesktopFixtureServer(root, { port = 0, historyCount =
       response.writeHead(404).end("not found");
       return;
     }
-    response.writeHead(200, { "content-type": contentType(file), "cache-control": "no-store" });
+    response.writeHead(200, { "content-type": contentType(file), "cache-control": staticCacheControl(url.pathname) });
     createReadStream(file).pipe(response);
   });
 
@@ -235,27 +249,13 @@ async function readJson(request) {
   return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
 }
 
-function desktopPairingOffer(sequence) {
-  return {
-    protocol_version: 1,
-    server_id: "fixture-server",
-    server_application_key_fingerprint: "fixture-fingerprint",
-    server_application_public_key: "fixture-public-key",
-    lan_endpoints: ["wss://192.0.2.1/ws"],
-    tunnel_endpoints: [],
-    tls_spki_pins: ["fixture-pin"],
-    pairing_id: `fixture-pairing-${sequence}`,
-    one_time_secret: `fixture-secret-${sequence}`,
-    expires_at: new Date(Date.now() + 60_000).toISOString(),
-  };
-}
-
 function fixtureApiResponse(url, messageCount) {
   const { pathname } = url;
   if (pathname === "/api/shell/state") return { status: "ready", configured: true, chatReady: true };
   if (pathname === "/api/chat/sessions") return desktopSessions(messageCount);
   if (pathname === "/api/chat/models") return desktopModels();
   if (pathname === "/api/chat/plugin-ui/catalog") return { catalog_revision: "0".repeat(64), items: [] };
+  if (pathname === "/api/runtime/host-bridge") return { state: "healthy" };
   const runtimeOverview = desktopRuntimeOverview(pathname);
   if (runtimeOverview !== undefined) return runtimeOverview;
   const runtimeDetail = desktopRuntimeDetail(url);
@@ -355,6 +355,13 @@ function sendJson(response, payload, status = 200) {
   }
   response.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" });
   response.end(JSON.stringify(payload));
+}
+
+/** 与 bootstrap/settings_api.py 的缓存合同保持一致，确保实验测到生产行为。 */
+function staticCacheControl(pathname) {
+  if (/\/assets\/[^/]*-[\w-]{8}\.[\w]+$/u.test(pathname)) return "public, max-age=31536000, immutable";
+  if (pathname.endsWith(".html") || pathname === "/") return "no-cache";
+  return "no-store";
 }
 
 function contentType(file) {

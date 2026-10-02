@@ -1,12 +1,12 @@
 import { focusMessagePart } from "./message-actions";
-import { timelineVisibleMessages, timelineToolResults, timelineReplyGroups, timelineAnchorIndexes, type ReplyActivity } from "./message-timeline";
+import { timelineVisibleMessages, timelineToolResults, timelineReplyGroups, timelineAnchorIndexes, timelineInputStarts, timelineSourceKey, timelineSourceRefreshTokens, needsBeforeReasoningFallback, type ReplyActivity } from "./message-timeline";
 import { timelineReply, timelineText, type TimelineMessage, type TimelineReply } from "./message-timeline";
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { useStickToBottomContext } from "use-stick-to-bottom";
 
 import { MessageReplyReference, SharedMessageActions } from "./message-actions";
-import { MobilePluginSlot } from "./mobile-plugin-runtime";
-import type { ChatMessage, ChatRole } from "./chat-message";
+import { PluginUiSlot } from "./plugin-ui-runtime";
+import type { ChatMessage } from "./chat-message";
 import { ChatMessageView, TimelineMessageView } from "./message-view";
 import { StreamProjectionStore } from "./stream-projection";
 import type { ChatStatus } from "./web-chat-status";
@@ -71,7 +71,6 @@ export function DesktopConversationMessages({
           key={message.id}
           message={message}
           initiallyVisible={index >= messages.length - 8}
-          followsSameRole={messages[index - 1]?.role === message.role}
           replySourceUnavailable={Boolean(message.reply && !messageIds.has(message.reply.messageId))}
           canReply={Boolean(onReply && message.canonical) && status === "idle"}
           copied={copiedMessageId === message.id}
@@ -92,7 +91,6 @@ export function DesktopConversationMessages({
 const DesktopMessageRow = React.memo(function DesktopMessageRow({
   message,
   initiallyVisible,
-  followsSameRole,
   replySourceUnavailable,
   canReply,
   copied,
@@ -107,7 +105,6 @@ const DesktopMessageRow = React.memo(function DesktopMessageRow({
 }: {
   message: ChatMessage;
   initiallyVisible: boolean;
-  followsSameRole: boolean;
   replySourceUnavailable: boolean;
   canReply: boolean;
   copied: boolean;
@@ -147,7 +144,6 @@ const DesktopMessageRow = React.memo(function DesktopMessageRow({
   const renderFullMessage = nearViewport || message.streaming === true;
   return (
     <>
-      {followsSameRole ? <RoleDivider role={message.role} /> : null}
       <div
         className={`web-message-anchor ${message.role} ${message.streaming === true ? "streaming" : "history-isolated"}`}
         data-message-id={message.id}
@@ -221,10 +217,6 @@ function DesktopMessagePlaceholder({ message }: { message: ChatMessage }) {
   );
 }
 
-function RoleDivider({ role }: { role: ChatRole }) {
-  return <div aria-hidden="true" className={`role-divider ${role}-divider`} />;
-}
-
 function WebMessageMeta({
   message,
   copied,
@@ -264,9 +256,10 @@ function formatMessageTime(value: string) {
 }
 
 /** 展示完整日志，引用只定位原消息，不给工具结果补造助手身份。 */
-export function DesktopTimelineMessages({ messages, activities, status, messageElementsRef, copiedMessageId, onReply, onCopied, onError }: {
+export const DesktopTimelineMessages = React.memo(function DesktopTimelineMessages({ messages, activities, refresh = 0, status, messageElementsRef, copiedMessageId, onReply, onCopied, onError }: {
   messages: TimelineMessage[];
   activities: ReplyActivity[];
+  refresh?: number;
   status: ChatStatus;
   messageElementsRef: React.RefObject<Map<string, HTMLDivElement>>;
   copiedMessageId: string;
@@ -279,6 +272,8 @@ export function DesktopTimelineMessages({ messages, activities, status, messageE
   const lookupMessage = useCallback((id: string) => byId.get(id), [byId]);
   const toolResults = useMemo(() => timelineToolResults(messages), [messages]);
   const groups = useMemo(() => timelineReplyGroups(messages, activities), [messages, activities]);
+  const inputStarts = useMemo(() => timelineInputStarts(messages), [messages]);
+  const refreshTokens = useMemo(() => timelineSourceRefreshTokens(messages, activities, refresh), [messages, activities, refresh]);
   const visibleMessages = useMemo(() => timelineVisibleMessages(messages, groups), [messages, groups]);
   const anchorIndexes = useMemo(() => timelineAnchorIndexes(messages, groups), [messages, groups]);
   const onNavigate = useCallback((id: string, partIndex?: number) => {
@@ -298,13 +293,12 @@ export function DesktopTimelineMessages({ messages, activities, status, messageE
     }}>
     <TimelineMessageView message={message} hideBody={groups.hiddenBodies.has(message.id) || groups.moved.has(message.id)} processMessages={groups.completed.get(message.id)}
       hideProcess={groups.moved.has(message.id)} lookupMessage={lookupMessage} toolResults={toolResults} onNavigate={onNavigate} onError={onError}
-      beforeReasoning={(origin) => origin.body.kind === "output" ? <MobilePluginSlot name="turn.before_reasoning"
-        sessionId={origin.session_id} messageId={origin.id} /> : null}
-      prefetchReasoning={(origin) => origin.body.kind === "output" ? <MobilePluginSlot name="turn.before_reasoning"
-        sessionId={origin.session_id} messageId={origin.id} prefetch /> : null}
-      beforePart={(part, index, origin) => part.kind === "tool_call" && !("display" in part) ? <MobilePluginSlot
+      beforeReasoning={(origin) => needsBeforeReasoningFallback(origin, inputStarts) ? <PluginUiSlot name="turn.before_reasoning"
+        sessionId={origin.session_id} messageId={origin.id} block={{ source: origin.source }}
+        refreshToken={refreshTokens.get(timelineSourceKey(origin))} /> : null}
+      beforePart={(part, index, origin) => part.kind === "tool_call" && !("display" in part) ? <PluginUiSlot
         name="turn.before_tool" sessionId={origin.session_id} messageId={origin.id} block={{ ...part, message_id: origin.id, part_index: index }} /> : null}
-      afterBody={message.body.kind === "output" && message.body.finish === "complete" ? <MobilePluginSlot
+      afterBody={message.body.kind === "output" && message.body.finish === "complete" ? <PluginUiSlot
         name="turn.after_answer" sessionId={message.session_id} messageId={message.id} /> : undefined} />
     {!groups.hiddenBodies.has(message.id) && !groups.moved.has(message.id) ? <div className={`shared-message-meta timeline-meta ${message.body.kind === "input" ? "user" : "assistant"}`}>
       <time dateTime={message.timestamp}>{formatMessageTime(message.timestamp)}</time>
@@ -314,5 +308,29 @@ export function DesktopTimelineMessages({ messages, activities, status, messageE
         onReply={() => onReply(timelineReply(message))}
         onCopy={() => { void navigator.clipboard.writeText(timelineText(message)).then(() => onCopied(message.id)).catch(onError); }} />
     </div> : null}
+    {message.body.kind === "input" && message.author === "user" ? <div className="message-row agent-row">
+      <div className="agent-content"><PluginUiSlot name="turn.before_reasoning"
+        sessionId={message.session_id} messageId={message.id} block={{ source: message.source }}
+        refreshToken={refreshTokens.get(timelineSourceKey(message))} /></div>
+    </div> : null}
   </div>)}</>;
-}
+}, (previous, next) => {
+  // 草稿正文只更新活动行；身份/活动阶段变化才让稳定输入槽位重新读取事实。
+  return previous.messages === next.messages
+    && previous.status === next.status
+    && previous.refresh === next.refresh
+    && previous.messageElementsRef === next.messageElementsRef
+    && previous.copiedMessageId === next.copiedMessageId
+    && previous.onReply === next.onReply
+    && previous.onCopied === next.onCopied
+    && previous.onError === next.onError
+    && previous.activities.length === next.activities.length
+    && previous.activities.every((activity, index) => {
+      const other = next.activities[index];
+      return activity.handle === other.handle
+        && activity.session_id === other.session_id
+        && activity.source === other.source
+        && activity.active === other.active
+        && activity.preview?.message_id === other.preview?.message_id;
+    });
+});

@@ -1,27 +1,9 @@
 from __future__ import annotations
-from types import SimpleNamespace
-
-from agent.plugin_composition.config_input import load_config
-
-import asyncio
-import json
 import shutil
 import subprocess
 from pathlib import Path
-
 import pytest
-
-import docker.debug.plugin_external_acceptance as external_acceptance
-from agent.plugin_composition import ServiceKey
-from docker.debug.plugin_external_acceptance import (
-    _exercise_core_bootstrap,
-    _exercise_business_composition,
-    _ensure_empty_directory,
-    _invoke_capability,
-    _load_distribution,
-    _write_bootstrap_config,
-)
-
+from docker.debug.plugin_external_acceptance import _exercise_business_composition
 
 def _git_commit(source: Path, message: str = "fixture") -> None:
     subprocess.run(["git", "init", "--quiet", str(source)], check=True)
@@ -45,15 +27,14 @@ def _git_commit(source: Path, message: str = "fixture") -> None:
         check=True,
     )
 
-
 def _write_plugin_source(
     root: Path, *, name: str, version: str, module: str
 ) -> Path:
+    compile(module, str(root / "plugin.py"), "exec")
     root.mkdir(parents=True)
     (root / "plugin.py").write_text(module, encoding="utf-8")
     _git_commit(root, f"{name}-{version}")
     return root
-
 
 def _copy_content_source(root: Path) -> Path:
     shutil.copytree(
@@ -63,7 +44,6 @@ def _copy_content_source(root: Path) -> Path:
     )
     _git_commit(root, "content-business-subset")
     return root
-
 
 _MESSAGE_ROUNDTRIP_PLUGIN = '''
 from agent.plugin_composition import Context, ServiceKey
@@ -118,7 +98,6 @@ async def apply(ctx: Context) -> None:
     await ctx.provide(ROUNDTRIP, roundtrip)
 '''
 
-
 def _provider_plugin(value: str, version: str) -> str:
     return f'''
 from agent.plugin_composition import Context, ServiceKey
@@ -139,7 +118,6 @@ async def apply(ctx: Context) -> None:
 
     await ctx.provide(PROVIDER, provide)
 '''
-
 
 _CONSUMER_PLUGIN = '''
 from agent.plugin_composition import Context, ServiceKey
@@ -197,7 +175,6 @@ async def apply(ctx: Context) -> None:
     await ctx.provide(CONSUMER, consume)
 '''
 
-
 def _roundtrip_spec(
     *, message_id: str, text: str, provider: str | None = None,
     service: str = "acceptance.messages.roundtrip.v1",
@@ -222,179 +199,6 @@ def _roundtrip_spec(
         },
         "expect": {"type": "dict", "value": value},
     }
-
-
-def test_external_acceptance_rejects_nonempty_runtime_directory(tmp_path: Path) -> None:
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    (workspace / "old-state").write_text("must not be reused", encoding="utf-8")
-
-    with pytest.raises(ValueError, match="必须为空"):
-        _ensure_empty_directory(workspace, "workspace")
-
-
-def test_bootstrap_workspace_seeds_legal_context_material_grants(tmp_path: Path) -> None:
-    _write_bootstrap_config(tmp_path, marketplace="acceptance")
-
-    config = load_config(tmp_path / "plugin-data/context-acceptance")[0]
-    assert config == {"prompt_sources": {"default_prompt": "prompt@acceptance",
-                                        "markdown_memory": "markdown_memory@acceptance",
-                                        "skills": "standard_tools@acceptance"},
-                      "summary_source": ["compaction", "compaction@acceptance"]}
-
-
-
-def test_capability_enumeration_does_not_count_as_call() -> None:
-    key = ServiceKey("message.display:model.facts")
-
-    class Root:
-        def provided_services(self, *, plugin_ids):
-            _ = plugin_ids
-            return {key: object()}
-
-    spec = {
-        "service": key.name,
-        "entrypoint": "plugins.models.projection.display_facts",
-        "input": {
-            "kind": "model.facts",
-            "value": {
-                "call_record_id": "acceptance-call",
-                "tool_ids": {},
-                "thinking": None,
-                "continuation": None,
-            },
-        },
-        "expect": {"type": "dict", "value": {}},
-    }
-
-    with pytest.raises(TypeError, match="不可调用"):
-        asyncio.run(_invoke_capability(root=Root(), plugin_id="models@test", spec=spec))
-
-
-def test_capability_oracle_calls_declared_input_and_checks_output() -> None:
-    key = ServiceKey("message.display:model.facts")
-    seen = []
-
-    def display(part):
-        seen.append(part)
-        return {"call_record_id": part.value["call_record_id"], "thinking": part.value["thinking"]}
-
-    class Root:
-        def provided_services(self, *, plugin_ids):
-            _ = plugin_ids
-            return {key: display}
-
-    spec = {
-        "service": key.name,
-        "entrypoint": "plugins.models.projection.display_facts",
-        "input": {
-            "kind": "model.facts",
-            "value": {
-                "call_record_id": "acceptance-call",
-                "tool_ids": {},
-                "thinking": None,
-                "continuation": None,
-            },
-        },
-        "expect": {
-            "type": "dict",
-            "value": {"call_record_id": "acceptance-call", "thinking": None},
-        },
-    }
-
-    evidence = asyncio.run(
-        _invoke_capability(root=Root(), plugin_id="models@test", spec=spec)
-    )
-    assert evidence["call_executed"] is True
-    assert evidence["status"] == "passed"
-    assert len(seen) == 1
-    assert seen[0].kind == "model.facts"
-
-
-def test_distribution_report_requires_external_bundle_files(tmp_path: Path) -> None:
-    path = tmp_path / "distribution.json"
-    path.write_text(
-        json.dumps(
-            {
-                "source_commit": "0" * 40,
-                "core": {"file": "core.tar"},
-                "plugins": [{"name": "example", "file": "example.bundle"}],
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="bundle 缺失"):
-        _load_distribution(path)
-
-
-def test_core_probe_records_real_start_and_stop_contract(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    calls: list[str] = []
-
-    class Manager:
-        current_snapshot = SimpleNamespace(
-            snapshot_id="snapshot", generations={},
-            composition_root=SimpleNamespace(context=SimpleNamespace(get=lambda _key: object())),
-        )
-
-    class Core:
-        plugin_manager = Manager()
-
-    class Runtime:
-        _started = True
-        _shutdown = False
-        core = Core()
-        app_server = object()
-        dashboard_task = None
-        chat_task = None
-        mobile_gateway_task = None
-        plugin_watcher_task = None
-        _primary_task = None
-
-        async def shutdown(self) -> None:
-            calls.append("stop")
-            self._shutdown = True
-            self.core.plugin_manager.current_snapshot = None
-
-    async def start(**kwargs):
-        calls.append("start")
-        return (
-            Runtime(),
-            {
-                "checks": {
-                    "bootstrap_start_returned": True,
-                    "runtime_started": True,
-                    "core_runtime_created": True,
-                    "stable_snapshot_published": True,
-                    "channel_host_started": True,
-                    "app_server_started": True,
-                    "checkout_invisible": True,
-                    "core_modules_from_artifact": True,
-                },
-                "status": "passed",
-            },
-            {"AKASHIC_PLUGIN_HOME": None, "AKASHIC_WORKSPACE": None},
-        )
-
-    monkeypatch.setattr(external_acceptance, "_validate_core_root", lambda root, repo: root)
-    monkeypatch.setattr(external_acceptance, "_prepare_runtime", lambda **kwargs: {})
-    monkeypatch.setattr(external_acceptance, "_start_app_runtime", start)
-
-    result = asyncio.run(
-        _exercise_core_bootstrap(
-            repo_root=tmp_path / "repo",
-            core_root=tmp_path / "core",
-            workspace=tmp_path / "workspace",
-            plugins_home=tmp_path / "plugins-home",
-        )
-    )
-
-    assert result["status"] == "passed"
-    assert calls == ["start", "stop"]
-    assert result["bootstrap"]["checks"]["stable_snapshot_drained"] is True
-
 
 @pytest.mark.asyncio
 async def test_business_composition_writes_reads_and_replaces_provider_from_new_generation(
@@ -477,12 +281,23 @@ async def test_business_composition_writes_reads_and_replaces_provider_from_new_
         },
     )
 
-    assert result["status"] == "passed", result
+    assert result["status"] == "passed", {
+        "failed_checks": [key for key, ok in result["checks"].items() if not ok],
+        "replacement_failed": (
+            None if result["replacement"] is None else [
+                key for key, ok in result["replacement"]["checks"].items() if not ok
+            ]
+        ),
+        "errors": [row.get("error") for row in result["reports"] if row["status"] != "passed"],
+    }
     assert result["checks"] == {
         "composition_loaded": True,
         "all_reports_passed": True,
         "business_calls_executed": True,
         "durable_message_readback": True,
+        "live_root_closed": True,
+        "message_log_closed": True,
+        "event_bus_closed": True,
         "replacement_verified": True,
     }
     assert all(row["status"] == "passed" for row in result["reports"]), [
@@ -499,13 +314,16 @@ async def test_business_composition_writes_reads_and_replaces_provider_from_new_
         "replacement:new-lease",
     )
     assert replacement["old_generation_id"] != replacement["new_generation_id"]
-    assert replacement["checks"]["consumer_read_under_new_snapshot"] is True
+    assert replacement["checks"]["install_waited_for_old_consumer"] is True
+    assert replacement["checks"]["consumer_reactivated_after_provider_change"] is True
+    assert replacement["old_consumer_call"]["live_root_id"] == (
+        replacement["new_consumer_call"]["live_root_id"]
+    )
     assert replacement["checks"]["replacement_module_from_new_artifact"] is True
     assert replacement["checks"]["replacement_module_not_old_artifact"] is True
     assert replacement["checks"]["original_source_not_required"] is True
     assert provider_old.exists()
     assert not list(provider_old.parent.glob(provider_old.name + ".before-acceptance-*"))
-
 
 @pytest.mark.asyncio
 async def test_legal_subsets_run_separately_and_accept_differently_named_provider(tmp_path: Path):

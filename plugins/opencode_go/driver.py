@@ -9,12 +9,12 @@ import json
 import math
 import sqlite3
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlsplit, urlunsplit
 
-from core.net.http import HttpClient, finish_response
+from core.net.http import HttpClient, StreamProgress, finish_response
 
 import httpx
 
@@ -74,6 +74,7 @@ class _ConnectionConfig:
     connect_timeout: float
     read_timeout: float
     max_retries: int
+    progress_timeout: float = 300.0
 
 
 class _BoundChat:
@@ -97,13 +98,18 @@ class _BoundChat:
         """Send one exact bound model request through Chat Completions."""
 
         if request.continuation is not None:
-            raise InvalidRequestError(
+            # 发送前本地校验失败：可证明请求未发出。
+            raise _unsent(InvalidRequestError(
                 "OpenCode Go Chat Completions does not support continuation state"
-            )
+            ))
         body = _chat_body(self._descriptor, request)
+        # 生成调用恒为一次物理 attempt：重试预算唯一 owner 是 Models；
+        # 未带 request_key 的直调同样不得隐式重发（§6.3）。max_retries
+        # 连接配置只留给 /models discovery 等非生成路径。
+        connection = replace(self._connection, max_retries=0)
         if request.on_delta is None:
             payload = await _request_json(
-                self._connection,
+                connection,
                 self._credential,
                 "POST",
                 "/chat/completions",
@@ -114,7 +120,7 @@ class _BoundChat:
         body["stream"] = True
         body["stream_options"] = {"include_usage": True}
         return await _stream_chat(
-            self._connection,
+            connection,
             self._credential,
             body,
             request.on_delta,
@@ -475,7 +481,9 @@ def _connection_config(descriptor: DriverConnectionDescriptor) -> _ConnectionCon
         "format_version",
         "connect_timeout",
         "read_timeout",
+        "progress_timeout",
         "max_retries",
+        "max_attempts",
         "catalog_provider_id",
     }
     unknown = sorted(set(config) - allowed)
@@ -492,10 +500,18 @@ def _connection_config(descriptor: DriverConnectionDescriptor) -> _ConnectionCon
     max_retries = config.get("max_retries", 3)
     if not isinstance(max_retries, int) or isinstance(max_retries, bool) or max_retries < 0:
         raise ValueError("max_retries must be a non-negative integer")
+    # max_attempts 是 Models 独占的重试预算字段，driver 只校验不消费；
+    # accounted 调用的 driver 重试恒为 0。
+    max_attempts = config.get("max_attempts")
+    if max_attempts is not None and (
+        not isinstance(max_attempts, int) or isinstance(max_attempts, bool) or max_attempts < 1
+    ):
+        raise ValueError("max_attempts must be a positive integer")
     return _ConnectionConfig(
         base_url=_normalize_base_url(descriptor.endpoint),
         connect_timeout=connect_timeout,
         read_timeout=read_timeout,
+        progress_timeout=_positive_float(config.get("progress_timeout", 300.0), "progress_timeout"),
         max_retries=max_retries,
     )
 
@@ -717,7 +733,7 @@ async def _stream_chat(
                 if response.status_code >= 400:
                     _ = await response.aread()
                 _raise_status(response, secret=token)
-                return await _consume_stream(response, on_delta)
+                return await _consume_stream(response, on_delta, progress_timeout=connection.progress_timeout)
         except asyncio.CancelledError:
             raise
         except _CallbackError as error:
@@ -752,6 +768,8 @@ class _CallbackError(RuntimeError):
 async def _consume_stream(
     response: httpx.Response,
     on_delta: Callable[[dict[str, str]], Awaitable[None]],
+    *,
+    progress_timeout: float = 300.0,
 ) -> LLMResponse:
     content: list[str] = []
     thinking: list[str] = []
@@ -761,9 +779,10 @@ async def _consume_stream(
     usage: ModelUsage | None = None
     response_delta_seen = False
     completed = False
+    progress = StreamProgress(progress_timeout)
     try:
         lines = response.aiter_lines()
-        async for line in lines:
+        async for line in progress.read(lines):
             if not line.startswith("data:"):
                 continue
             data = line[5:].strip()
@@ -798,25 +817,33 @@ async def _consume_stream(
             if isinstance(raw_calls, list) and raw_calls:
                 response_delta_seen = True
                 tool_seen = True
-                _merge_tool_deltas(calls, raw_calls)
+                if _merge_tool_deltas(calls, raw_calls):
+                    progress.advance()
             reasoning = delta.get("reasoning_content")
             if reasoning is None:
                 reasoning = delta.get("reasoning")
             if isinstance(reasoning, str) and reasoning:
+                progress.advance()
                 response_delta_seen = True
                 thinking.append(reasoning)
                 if not tool_seen:
                     await _emit_delta(on_delta, {"thinking_delta": reasoning})
             piece = delta.get("content")
             if isinstance(piece, str) and piece:
+                progress.advance()
                 response_delta_seen = True
                 content.append(piece)
                 if not tool_seen:
                     await _emit_delta(on_delta, {"content_delta": piece})
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as error:
+        if response_delta_seen:
+            setattr(error, "response_delta_seen", True)
         raise
     except _CallbackError:
         raise
+    except TimeoutError as error:
+        failure = ModelTimeoutError(f"模型流超过 {progress_timeout:g} 秒没有有效进展")
+        raise _StreamReadError(failure, response_delta_seen=response_delta_seen) from error
     except Exception as error:
         raise _StreamReadError(error, response_delta_seen=response_delta_seen) from error
     if not completed:
@@ -910,7 +937,9 @@ def _parse_chat_response(payload: Mapping[str, Any]) -> LLMResponse:
 
 def _merge_tool_deltas(
     calls: dict[int, dict[str, str]], raw_calls: list[Any]
-) -> None:
+) -> bool:
+    """合并合法工具片段，并报告是否增加了调用内容。"""
+    advanced = False
     for raw in raw_calls:
         if not isinstance(raw, Mapping):
             raise TransportError("stream tool call delta must be an object")
@@ -921,14 +950,19 @@ def _merge_tool_deltas(
         raw_id = raw.get("id")
         if isinstance(raw_id, str):
             slot["id"] += raw_id
+            advanced = advanced or bool(raw_id)
         function = raw.get("function")
         if isinstance(function, Mapping):
             name = function.get("name")
             arguments = function.get("arguments")
             if isinstance(name, str):
                 slot["name"] += name
+                advanced = advanced or bool(name)
             if isinstance(arguments, str):
                 slot["arguments"] += arguments
+                advanced = advanced or bool(arguments)
+
+    return advanced
 
 
 def _tool_calls(calls: Mapping[int, Mapping[str, str]]) -> list[ToolCall]:
@@ -974,6 +1008,9 @@ def _usage(raw: Mapping[str, Any]) -> ModelUsage:
             input_tokens = (cache_hit or 0) + (cache_miss or 0)
         if cached is None:
             cached = cache_hit or 0
+    if cached is None:
+        # Kimi 使用顶层命中字段；不覆盖既有字段中的明确零值。
+        cached = _optional_int(raw.get("cached_tokens"))
     cache_write = (
         _optional_int(prompt_details.get("cache_write_tokens"))
         if isinstance(prompt_details, Mapping)
@@ -1005,32 +1042,59 @@ def _usage(raw: Mapping[str, Any]) -> ModelUsage:
     )
 
 
+def _unsent(error: ModelError) -> ModelError:
+    """发送前本地校验失败：请求可证明未到达 provider，标记为允许重试的证据。"""
+    error.send_evidence = "unsent"
+    return error
+
+
 def _raise_status(response: httpx.Response, *, secret: str) -> None:
-    if response.status_code < 400:
+    error = _status_error(response, secret=secret)
+    if error is None:
         return
+    # 4xx 是对本请求的明确拒绝应答——正面证据。5xx 只说明服务端/网关
+    # 未能给出结论，不能证明后端未接收或未处理：不授证据，fail-closed。
+    if response.status_code < 500:
+        error.send_evidence = "rejected"
+    raise error
+
+
+def _status_error(response: httpx.Response, *, secret: str) -> ModelError | None:
+    if response.status_code < 400:
+        return None
     message = _redact_secret(_response_error_message(response), secret)
     lowered = message.lower()
     if response.status_code in {401, 403}:
-        raise AuthenticationError(message)
+        return AuthenticationError(message)
+    if response.status_code >= 500:
+        # status-first：5xx 只说明服务端/网关未给出结论，正文诊断文案
+        # （context_length 等）不得把错误提升为可证明的容量拒绝。
+        return TransportError(f"provider returned HTTP {response.status_code}: {message}")
     if any(code in lowered for code in _CONTEXT_CODES):
-        raise ContextLengthError(message)
+        return ContextLengthError(message)
     if any(code in lowered for code in _SAFETY_CODES):
-        raise ContentSafetyError(message)
+        return ContentSafetyError(message)
     if response.status_code == 402 or (
         response.status_code == 429
         and any(value in lowered for value in ("quota", "usage limit", "credit"))
     ):
-        raise QuotaError(message)
+        return QuotaError(message)
     if response.status_code == 429:
-        raise RateLimitError(message)
+        error = RateLimitError(message)
+        # Retry-After 必须随错误传给 Models，由独占重试预算决定何时再付。
+        retry_after = response.headers.get("retry-after")
+        if retry_after is not None:
+            try:
+                setattr(error, "retry_after", max(0.0, float(retry_after)))
+            except ValueError:
+                pass
+        return error
     if 400 <= response.status_code < 500:
-        raise InvalidRequestError(
+        return InvalidRequestError(
             f"provider rejected the request with HTTP {response.status_code}: {message}"
         )
     error = TransportError(f"provider returned HTTP {response.status_code}: {message}")
-    if response.status_code in {500, 502, 503, 504}:
-        setattr(error, "retry_safe", True)
-    raise error
+    return error
 
 
 def _response_error_message(response: httpx.Response) -> str:
@@ -1070,13 +1134,19 @@ def _map_error(error: Exception) -> Exception:
         ),
     ):
         return error
+    if isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout)):
+        # 连接建立失败可证明请求未发出：这是允许重试的正面证据。
+        mapped = TransportError(f"model transport failed: {type(error).__name__}")
+        mapped.send_evidence = "unsent"
+        setattr(mapped, "retry_safe", True)
+        return mapped
     if isinstance(error, (httpx.TimeoutException, TimeoutError)):
         return ModelTimeoutError("model request timed out")
     if isinstance(error, httpx.TransportError):
-        mapped = TransportError(f"model transport failed: {type(error).__name__}")
-        setattr(mapped, "retry_safe", True)
-        return mapped
+        # 请求发出后的读/写失败不携带任何安全证据。
+        return TransportError(f"model transport failed: {type(error).__name__}")
     if isinstance(error, _StreamReadError):
+        # 已进入 HTTP 200 流：无论是否观察到 delta，远端效果都不可证。
         mapped = _map_error(error.error)
         setattr(mapped, "response_delta_seen", error.response_delta_seen)
         return mapped
@@ -1084,8 +1154,9 @@ def _map_error(error: Exception) -> Exception:
 
 
 def _retryable(error: Exception) -> bool:
-    return isinstance(error, (ModelTimeoutError, RateLimitError)) or bool(
-        getattr(error, "retry_safe", False)
+    return getattr(error, "send_evidence", None) in ("rejected", "unsent") and (
+        isinstance(error, (ModelTimeoutError, RateLimitError))
+        or bool(getattr(error, "retry_safe", False))
     )
 
 

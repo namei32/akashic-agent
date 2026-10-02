@@ -7,51 +7,45 @@ host resolves these keys inside each request scope.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from typing import Any, Protocol
+from typing import TYPE_CHECKING
 
-from agent.plugin_composition import MODEL_CALL_STATS, MODEL_CATALOG, ServiceKey
-from agent.plugin_composition.commands import COMMANDS
+from agent.plugin_composition import MODEL_CATALOG
 from agent.plugin_composition.messages import MESSAGE_CATALOG
 from agent.plugin_composition.rpc import rpc_method_key
-from agent.plugin_composition.message_view import MessageDisplayReader
+from agent.plugin_composition.runtime_catalog import (
+    RUNTIME_CATALOG as RUNTIME_CATALOG,
+    RUNTIME_MCP_DETAIL as RUNTIME_MCP_DETAIL,
+)
+from agent.plugin_composition.ui import (
+    WEB_UI as WEB_UI,
+)
+from agent.plugin_contracts.models import (
+    MODEL_SELECTION as MODEL_SELECTION,
+    ModelSelection as ModelSelectionReader,
+)
+from agent.plugin_contracts.reply import (
+    REPLY_STATUS as REPLY_STATUS,
+    ReplyStatus as ReplyStatusReader,
+)
+from agent.plugin_contracts.ui import (
+    MESSAGE_DISPLAY as MESSAGE_DISPLAY,
+    PLUGIN_UI as PLUGIN_UI,
+)
 
-from .services import MobileUiProvider, WebUiProvider
-
-
-class ReplyStatusReader(Protocol):
-    """Read-only reply activity for one session."""
-
-    async def follow(self, session_id: str): ...
-
-
-class ModelSelectionReader(Protocol):
-    """Read one saved model selection from session metadata."""
-
-    def read_saved(self, metadata: Mapping[str, object]) -> Any: ...
+if TYPE_CHECKING:
+    pass
 
 
 # These identities belong to the providers that publish the capabilities.  A
 # duplicate local ServiceKey is intentional: ServiceKey connects by its stable
 # name, so this module remains independent from the provider plugin package.
-REPLY_STATUS = ServiceKey[ReplyStatusReader]("reply.status.v2")
-MODEL_SELECTION = ServiceKey[ModelSelectionReader]("models.selection.v1")
-MESSAGE_DISPLAY = ServiceKey[MessageDisplayReader]("core.message_display.v1")
-MOBILE_UI = ServiceKey[MobileUiProvider]("core.mobile_ui.v1")
-WEB_UI = ServiceKey[WebUiProvider]("core.web_ui.v1")
-RuntimeCatalogReader = Callable[[], dict[str, object]]
-RUNTIME_CATALOG = ServiceKey[RuntimeCatalogReader]("core.runtime_catalog.v1")
+
 
 INSPECTION_DOCUMENTS_LIST = rpc_method_key("inspection/documents.list")
 INSPECTION_DOCUMENTS_GET = rpc_method_key("inspection/documents.get")
 INSPECTION_JOBS_LIST = rpc_method_key("inspection/jobs.list")
 INSPECTION_JOBS_GET = rpc_method_key("inspection/jobs.get")
 INSPECTION_SKILLS_LIST = rpc_method_key("inspection/skills.list")
-
-MODEL_CALL = rpc_method_key("models/call_stats")
-MODEL_CATALOG_RPC = rpc_method_key("models/catalog")
-MODEL_DISCOVER = rpc_method_key("models/discover")
-MODEL_COMMAND = rpc_method_key("models/command")
 
 INSPECTION_RPC_KEYS = (
     INSPECTION_DOCUMENTS_LIST,
@@ -60,24 +54,18 @@ INSPECTION_RPC_KEYS = (
     INSPECTION_JOBS_GET,
     INSPECTION_SKILLS_LIST,
 )
-MODEL_RPC_KEYS = (MODEL_CALL, MODEL_CATALOG_RPC, MODEL_DISCOVER, MODEL_COMMAND)
 
-# The required dependency set is deliberately explicit and flat.  It is used
-# by the manifest importer to activate the ordinary channel only when the
-# exact providers are present.
+# 聊天启动只等待基础能力；诊断 RPC 在请求中借用，未接线的旧模型 RPC 不阻塞启动。
 CLIENT_CAPABILITIES = (
     RUNTIME_CATALOG,
+    RUNTIME_MCP_DETAIL,
     MESSAGE_CATALOG,
-    COMMANDS,
     MESSAGE_DISPLAY,
-    MOBILE_UI,
+    PLUGIN_UI,
     WEB_UI,
     MODEL_CATALOG,
-    MODEL_CALL_STATS,
     MODEL_SELECTION,
     REPLY_STATUS,
-    *INSPECTION_RPC_KEYS,
-    *MODEL_RPC_KEYS,
 )
 
 
@@ -89,19 +77,14 @@ __all__ = [
     "INSPECTION_JOBS_LIST",
     "INSPECTION_RPC_KEYS",
     "INSPECTION_SKILLS_LIST",
-    "MODEL_CALL",
-    "MODEL_CALL_STATS",
     "MODEL_CATALOG",
-    "MODEL_CATALOG_RPC",
-    "MODEL_COMMAND",
-    "MODEL_DISCOVER",
-    "MODEL_RPC_KEYS",
     "MODEL_SELECTION",
     "MESSAGE_DISPLAY",
-    "MOBILE_UI",
+    "PLUGIN_UI",
     "WEB_UI",
     "ReplyStatusReader",
     "ModelSelectionReader",
     "REPLY_STATUS",
     "RUNTIME_CATALOG",
+    "RUNTIME_MCP_DETAIL",
 ]
