@@ -23,6 +23,7 @@ Core Web Host
             ├── conversation-ui         普通插件，拥有会话侧栏与对话页
             ├── workbench-ui            普通插件，拥有工作台页
             │   └── workbench.panels    Dashboard 面板迁入
+            ├── runtime-ui              可选只读目录，分别读取各领域 owner
             └── models                  普通插件，拥有模型页
                 └── models.connection-types
                     ├── openai-compatible
@@ -30,7 +31,11 @@ Core Web Host
                     └── opencode-go
 ```
 
-“知识与运行”独立 Web 页面已删除；MCP、Skill、job、runtime inspection、Akasha 和移动端能力仍由各自 owner 提供。
+Chat 内置的“知识与运行”页面已删除。选择普通 `runtime-ui` 插件可显示只读运行目录；
+它通过 `shell.pages.v1` 登记页面，通过 Host HTTP client 访问自身 Dashboard 路由，
+再借用文档、任务和技能检查能力，或调用当前 runtime catalog/MCP detail 合同。
+目录分别处理读取失败；MCP 列表只展示注册目标，点击详情才打开真实 owner 会话。
+MCP、Skill、job、runtime inspection、Akasha 和移动端能力仍由各自 owner 提供。
 
 ## 2. 用六岁小孩能懂的话解释
 
@@ -279,6 +284,7 @@ listener 和临时窗口；Workbench 在重绘、切换或卸载对应 DOM 时�
 | `shell-ui` | `web.root.v1` | 唯一 Shell；声明 `shell.pages.v1` | 品牌顶栏、页面导航、route/history |
 | `conversation-ui` | `shell.pages.v1` | `conversation` page | 会话侧栏、消息、composer、desktop adapter |
 | `workbench-ui` | `shell.pages.v1` | `workbench` page；声明 `workbench.panels.v2` | Session/Plugin 工作台布局、最新读取与 panel adapter |
+| `runtime-ui` | `shell.pages.v1` | `runtime` page | 各目录独立读取；MCP 详情按需查询 |
 | `models` | `shell.pages.v1` | `models` page；声明 `models.connection-types.v1` | catalog、Connection、Binding、默认 chat/embedding 的 UI |
 
 page 合同不包含 readiness、onboarding 或 redirect。首版迁移期间保留现有 `/api/shell/state → models` 跳转 adapter；它必须被标为模型特判删除点，并在硬编码 Shell 退场时一并删除，不等待 Onboarding。没有默认聊天模型时，对话插件显示自己的不可用状态，用户仍可手动进入模型页。将来 Onboarding 另做普通消费者，不能为了它先把“通用恢复目标”塞进所有页面合同。
