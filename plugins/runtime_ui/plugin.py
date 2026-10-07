@@ -1,7 +1,7 @@
 from agent.plugin_composition.ui import UI
 api_version = 3
 name = "runtime-ui"
-version = "1.0.0"
+version = "1.0.1"
 
 inject = (UI,)
 

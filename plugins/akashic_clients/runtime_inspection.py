@@ -17,6 +17,7 @@ from .capabilities import (
     INSPECTION_JOBS_GET,
     INSPECTION_JOBS_LIST,
     INSPECTION_SKILLS_LIST,
+    INSPECTION_MCP_GET,
     RUNTIME_CATALOG,
 )
 from .services import RuntimeInspectionError, RuntimeInspectionService
@@ -93,30 +94,9 @@ class ScopedRpcRuntimeInspection:
             return payload
 
     async def get_mcp(self, owner_id: str, server_name: str) -> dict[str, object]:
-        """Render one MCP detail from the same neutral catalog capability."""
-
-        async with self._open_scope() as scope:
-            payload = scope.require(RUNTIME_CATALOG)()
-            _raise_unavailable(payload)
-        servers = payload.get("mcp_servers")
-        if not isinstance(servers, list):
-            raise RuntimeInspectionError("invalid_response", "runtime catalog 缺少 MCP 列表")
-        server = next(
-            (
-                item
-                for item in servers
-                if isinstance(item, Mapping)
-                and item.get("owner_id") == owner_id
-                and item.get("name") == server_name
-            ),
-            None,
-        )
-        if server is None:
-            raise RuntimeInspectionError(
-                "mcp_not_found",
-                f"MCP server 不存在: {owner_id}/{server_name}",
-            )
-        tools = server.get("tools")
+        """Open the selected owner session only when its detail is requested."""
+        payload = await self._call(INSPECTION_MCP_GET, {"owner_id": owner_id, "name": server_name})
+        tools = payload.get("tools")
         if not isinstance(tools, list):
             raise RuntimeInspectionError("invalid_response", "runtime catalog MCP tools 无效")
         return {

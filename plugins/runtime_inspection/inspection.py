@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Protocol
 
 from agent.plugin_composition import ServiceKey
+from agent.plugin_composition.rpc import RpcMethod
 
 
 _MAX_DOCUMENT_BYTES = 192 * 1024
@@ -77,6 +78,20 @@ class RuntimeInspectionProvider:
         }
         self._scheduler: SchedulerReader | None = None
         self._skills: SkillReader | None = None
+        self._mcp: RpcMethod | None = None
+
+    def bind_mcp(self, service: RpcMethod) -> None:
+        self._mcp = service
+
+    def unbind_mcp(self, service: RpcMethod) -> None:
+        if self._mcp is service:
+            self._mcp = None
+
+    async def get_mcp(self, owner_id: str, name: str) -> object:
+        service = self._mcp
+        if service is None:
+            return {"unavailable": {"code": "mcp_provider_unavailable", "message": "MCP 检查能力未绑定"}}
+        return await service.invoke(service.params.model_validate({"owner_id": owner_id, "name": name}), None)
 
     def bind_scheduler(self, service: SchedulerReader) -> None:
         self._scheduler = service

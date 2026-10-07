@@ -47,14 +47,15 @@ export function RuntimeDashboard() {
       </header>
 
       <section className="runtime-dashboard__metrics" aria-label="运行摘要">
-        <RuntimeMetric icon={<BookOpenText size={20} />} value={runtime.overview?.documents.length ?? 0} label="核心文档" tone="documents" />
-        <RuntimeMetric icon={<Server size={20} />} value={runtime.overview?.capabilities.mcp_servers.reduce((sum, item) => sum + item.tool_count, 0) ?? 0} label={`MCP 工具 · ${runtime.overview?.capabilities.skills.length ?? 0} Skills`} tone="mcp" />
-        <RuntimeMetric icon={<Timer size={20} />} value={runtime.overview?.jobs.filter((job) => job.enabled).length ?? 0} label="已启用定时任务" tone="jobs" />
+        <RuntimeMetric icon={<BookOpenText size={20} />} value={runtime.overview?.documents?.length ?? (runtime.overview?.errors.documents ? "不可用" : "—")} label="核心文档" tone="documents" />
+        <RuntimeMetric icon={<Server size={20} />} value={runtime.overview?.capabilities?.mcp_servers.length ?? (runtime.overview?.errors.mcp ? "不可用" : "—")} label={`MCP 服务 · ${runtime.overview?.capabilities?.skills.length ?? "—"} Skills`} tone="mcp" />
+        <RuntimeMetric icon={<Timer size={20} />} value={runtime.overview?.jobs?.filter((job) => job.enabled).length ?? (runtime.overview?.errors.jobs ? "不可用" : "—")} label="已启用定时任务" tone="jobs" />
       </section>
 
       <RuntimeTabs view={runtime.view} onSelect={runtime.selectView} />
 
       <div className="runtime-dashboard__notice-slot">
+        {runtime.overview?.errors[runtime.view] ? <div className="runtime-dashboard__error" role="alert"><AlertCircle size={18} />{runtime.overview.errors[runtime.view]}</div> : null}
         {runtime.error ? <div className="runtime-dashboard__error" role="alert"><AlertCircle size={18} />{runtime.error}</div> : null}
         <span className="sr-only" role="status" aria-live="polite">{runtime.copyFeedback}</span>
       </div>
@@ -71,6 +72,7 @@ export function RuntimeDashboard() {
           selectedKey={runtime.selectedKey}
           loading={runtime.loading}
           description={runtimeDirectoryDescription(runtime.view, runtime.overview)}
+          unavailable={!!runtime.overview?.errors[runtime.view]}
           onSelect={runtime.selectItem}
         />
         <article className="runtime-detail">
@@ -127,6 +129,7 @@ function RuntimeDirectoryList({
   loading,
   description,
   onSelect,
+  unavailable,
 }: {
   view: RuntimeView;
   items: RuntimeDirectoryItem[];
@@ -134,12 +137,13 @@ function RuntimeDirectoryList({
   loading: boolean;
   description: string;
   onSelect: (key: string) => void;
+  unavailable: boolean;
 }) {
   return (
     <div className="runtime-directory__list">
       <header><h2>{viewMeta[view].label}</h2><p>{description}</p></header>
       {loading ? <p className="runtime-directory__empty">正在读取最新运行目录…</p> : null}
-      {!loading && items.length === 0 ? <p className="runtime-directory__empty">当前目录没有可展示的项目。</p> : null}
+      {!loading && items.length === 0 ? <p className="runtime-directory__empty">{unavailable ? "此目录读取失败，请刷新重试。" : "当前目录没有可展示的项目。"}</p> : null}
       {items.map((item) => {
         const Icon = viewMeta[item.icon].icon;
         return (
@@ -162,7 +166,7 @@ function RuntimeDirectoryList({
   );
 }
 
-function RuntimeMetric({ icon, value, label, tone }: { icon: React.ReactNode; value: number; label: string; tone: RuntimeView }) {
+function RuntimeMetric({ icon, value, label, tone }: { icon: React.ReactNode; value: number | string; label: string; tone: RuntimeView }) {
   return <div className={`runtime-metric ${tone}`}><span>{icon}</span><div><small>{label}</small><strong>{value}</strong></div></div>;
 }
 

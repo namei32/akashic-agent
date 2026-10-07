@@ -16,7 +16,7 @@ from .inspection import (
 
 api_version = 3
 name = "runtime_inspection"
-version = "1.0.0"
+version = "1.0.1"
 desc = "提供固定文档与可选任务、技能的只读运行时检查投影"
 workspace_files = ("memory/MEMORY.md", "memory/SELF.md", "memory/VEDA.md")
 inject = ()
@@ -62,6 +62,8 @@ async def apply(ctx: Context) -> None:
     )
     for name, operation in rpc_methods(provider).items():
         _ = await ctx.provide(rpc_method_key(name), operation)
+    await _bind_optional(ctx, provider, rpc_method_key("mcp/tools.list"), "mcp",
+                         provider.bind_mcp, provider.unbind_mcp)
     await _bind_optional(
         ctx,
         provider,

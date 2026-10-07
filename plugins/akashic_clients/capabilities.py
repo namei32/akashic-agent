@@ -47,6 +47,7 @@ INSPECTION_DOCUMENTS_GET = rpc_method_key("inspection/documents.get")
 INSPECTION_JOBS_LIST = rpc_method_key("inspection/jobs.list")
 INSPECTION_JOBS_GET = rpc_method_key("inspection/jobs.get")
 INSPECTION_SKILLS_LIST = rpc_method_key("inspection/skills.list")
+INSPECTION_MCP_GET = rpc_method_key("inspection/mcp.get")
 
 MODEL_CALL = rpc_method_key("models/call_stats")
 MODEL_CATALOG_RPC = rpc_method_key("models/catalog")
@@ -59,6 +60,7 @@ INSPECTION_RPC_KEYS = (
     INSPECTION_JOBS_LIST,
     INSPECTION_JOBS_GET,
     INSPECTION_SKILLS_LIST,
+    INSPECTION_MCP_GET,
 )
 MODEL_RPC_KEYS = (MODEL_CALL, MODEL_CATALOG_RPC, MODEL_DISCOVER, MODEL_COMMAND)
 

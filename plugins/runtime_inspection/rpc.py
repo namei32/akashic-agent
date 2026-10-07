@@ -18,6 +18,11 @@ class JobParams(EmptyParams):
     job_id: str
 
 
+class McpParams(EmptyParams):
+    owner_id: str
+    name: str
+
+
 def _unavailable(code: str, message: str) -> dict[str, object]:
     return {"unavailable": {"code": code, "message": message}}
 
@@ -49,10 +54,16 @@ def rpc_methods(provider: RuntimeInspectionProvider) -> dict[str, RpcMethod]:
         return ({"items": [dict(row) for row in rows]} if rows is not None else
                 _unavailable("skills_unavailable", "技能检查服务尚未绑定"))
 
+    async def mcp(params: BaseModel) -> object:
+        if not isinstance(params, McpParams):
+            raise TypeError("MCP 检查参数无效")
+        return await provider.get_mcp(params.owner_id, params.name)
+
     return {
         "inspection/documents.list": RpcMethod(EmptyParams, documents),
         "inspection/documents.get": RpcMethod(DocumentParams, document),
         "inspection/jobs.list": RpcMethod(EmptyParams, jobs),
         "inspection/jobs.get": RpcMethod(JobParams, job),
         "inspection/skills.list": RpcMethod(EmptyParams, skills),
+        "inspection/mcp.get": RpcMethod(McpParams, mcp),
     }

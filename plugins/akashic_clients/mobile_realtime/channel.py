@@ -143,6 +143,10 @@ _DIRECT_MESSAGE_CATALOG: ContextVar[MessageCatalog | None] = ContextVar(
 
 _EPHEMERAL_QUERY_COMMAND_TYPES = frozenset(
     {
+        # 同步读取当前目录和 Message 页；投递事件由 inbox 独立确认，
+        # 不把一次可重读查询占用成长期副作用回执。
+        "session.list",
+        "history.get",
         "command.list",
         "model.catalog.get",
         "model.call.get",
@@ -1748,9 +1752,11 @@ class MobileRealtimeChannel:
             )
         if frame.type == "runtime.capability.list":
             _expect_keys(frame.payload, set())
+            payload = await self._require_runtime_inspection().list_capabilities()
+            _require_mobile_runtime_catalog_v1(payload)
             return CommandReply(
                 type="runtime.capability.list.ok",
-                payload=await self._require_runtime_inspection().list_capabilities(),
+                payload=payload,
             )
         if frame.type == "runtime.mcp.get":
             _expect_keys(frame.payload, {"owner_id", "server_name"})
@@ -3981,6 +3987,32 @@ def _expect_message_log_version(payload: Mapping[str, object]) -> None:
     version = payload.get("message_log_version")
     if type(version) is not int or version != 2:
         raise MobileCommandError("unsupported_message_log_version", "需要支持 Message 日志 v2 的客户端")
+
+
+def _require_mobile_runtime_catalog_v1(payload: Mapping[str, object]) -> None:
+    """旧 Android 严格要求静态活动字段；不兼容只拒绝检查请求，不伪造运行事实。"""
+    # 1. Runtime catalog v1 的 Android 解码器要求每个 Fiber 有布尔 static_active。
+    #    Core 已移除此概念；不能把缺字段的响应标成 ok，让客户端关闭聊天连接。
+    plugins = payload.get("plugins")
+    if not isinstance(plugins, list):
+        raise MobileCommandError("invalid_runtime_catalog", "运行目录缺少插件列表")
+    for plugin in plugins:
+        if not isinstance(plugin, Mapping):
+            raise MobileCommandError("invalid_runtime_catalog", "运行目录插件格式无效")
+        composition = plugin.get("composition")
+        if composition is None:
+            continue
+        if not isinstance(composition, Mapping):
+            raise MobileCommandError("invalid_runtime_catalog", "运行目录 Fiber 格式无效")
+        fibers = composition.get("fibers")
+        if not isinstance(fibers, list):
+            raise MobileCommandError("invalid_runtime_catalog", "运行目录 Fiber 格式无效")
+        for fiber in fibers:
+            if not isinstance(fiber, Mapping) or type(fiber.get("static_active")) is not bool:
+                raise MobileCommandError(
+                    "runtime_catalog_client_incompatible",
+                    "当前移动端不兼容新版插件运行结构；请在电脑端查看运行状态。聊天与历史同步不受影响。",
+                )
 
 
 def _message_page_size(payload: Mapping[str, object]) -> int:

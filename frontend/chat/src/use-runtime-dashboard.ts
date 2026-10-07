@@ -60,7 +60,7 @@ export function useRuntimeDashboard() {
     setDetailLoading(true);
     setError("");
     void loadRuntimeDetail(view, selectedKey, controller.signal)
-      .then(setDetail)
+      .then((next) => { if (!controller.signal.aborted) setDetail(next); })
       .catch((loadError: unknown) => {
         if (loadError instanceof DOMException && loadError.name === "AbortError") return;
         setError(runtimeErrorMessage(loadError));

@@ -3,18 +3,21 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+from collections.abc import Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, replace
 from agent.plugin_composition import Context
 from agent.plugin_composition.model import FiberState
 from agent.plugin_composition.execution import EXECUTION
+from agent.plugin_composition.rpc import RpcMethod, rpc_method_key
+from pydantic import BaseModel, ConfigDict, Field
 from agent.plugin_composition.mcp_slots import MCP_SERVERS, McpServerDefinition, McpSessionFailure
 from .definitions import McpServerBinding, _descriptor, _normalize_definition, _ENV_NAME, _RESERVED_ENV
 from .host import McpGenerationHost, McpMaterializedCommand
 
 api_version = 3
 name = "mcp"
-version = "1.0.0"
+version = "1.0.1"
 desc = "按调用取得 MCP 会话并持有关闭责任"
 inject = (EXECUTION,)
 
@@ -41,11 +44,11 @@ class Session:
         health, ctx = registration.health, registration.ctx
         self._host = McpGenerationHost(
             on_health=self._health,
-            on_incident=lambda _id, _name, kind, reason: ctx.report_incident(kind, reason))
+            on_incident=lambda generation_id, server_name, kind, message: ctx.report_incident(kind, message))
 
-    def _health(self, _identity, _name, ready, reason):
+    def _health(self, generation_id, server_name, healthy, reason):
         # 正常按调用退出不会使注册目标失效；并发失败会话仍保持降级。
-        self._reason = None if ready or reason == "stopped" else reason
+        self._reason = None if healthy or reason == "stopped" else reason
         self._provider.refresh_health(self._entry)
 
     async def start(self):
@@ -174,11 +177,41 @@ class McpServers:
         await owner._effect.aclose()
 
     def catalog(self):
-        if self._entries:
-            from agent.plugin_composition.runtime_catalog import RuntimeCatalogUnavailable
-            raise RuntimeCatalogUnavailable("mcp_catalog_unavailable", "MCP 工具目录按调用打开，当前没有持久会话目录")
-        return []
+        return [{"owner_id": entry.ctx.runtime.plugin_id, "name": name,
+                 "status": "declared", "tool_count": None}
+                for name, entry in sorted(self._entries.items())]
+
+    async def inspect(self, owner_id: str, name: str):
+        entry = self._entries.get(name)
+        if entry is None or entry.ctx.runtime.plugin_id != owner_id:
+            return {"unavailable": {"code": "mcp_not_found", "message": "MCP 服务未注册或已卸载"}}
+        async with self.open(entry.ctx, name) as server:
+            tools = [{"name": tool.name, "description": tool.description,
+                      "input_schema": _plain_schema(tool.input_schema)}
+                     for tool in server.tools.values()]
+        return {"owner_id": owner_id, "name": name, "tools": tools}
+
+
+def _plain_schema(value):
+    if isinstance(value, Mapping):
+        return {key: _plain_schema(child) for key, child in value.items()}
+    if isinstance(value, tuple):
+        return [_plain_schema(child) for child in value]
+    return value
+
+
+class McpParams(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    owner_id: str = Field(min_length=1, max_length=256)
+    name: str = Field(min_length=1, max_length=256)
 
 
 async def apply(ctx: Context):
-    await ctx.provide(MCP_SERVERS, McpServers(ctx))
+    servers = McpServers(ctx)
+    await ctx.provide(MCP_SERVERS, servers)
+    async def inspect(params: BaseModel):
+        if not isinstance(params, McpParams):
+            raise TypeError("MCP 查询参数无效")
+        async with ctx.runtime_scope():
+            return await servers.inspect(params.owner_id, params.name)
+    await ctx.provide(rpc_method_key("mcp/tools.list"), RpcMethod(McpParams, inspect))

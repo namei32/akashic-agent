@@ -12,7 +12,8 @@ export interface RuntimeDocument {
 export interface RuntimeMcp {
   owner_id: string;
   name: string;
-  tool_count: number;
+  tool_count: number | null;
+  status?: string;
 }
 
 export interface RuntimeJob {
@@ -41,9 +42,10 @@ export interface RuntimeDetail {
 }
 
 export interface RuntimeOverview {
-  documents: RuntimeDocument[];
-  jobs: RuntimeJob[];
-  capabilities: RuntimeCapabilities;
+  documents: RuntimeDocument[] | null;
+  jobs: RuntimeJob[] | null;
+  capabilities: RuntimeCapabilities | null;
+  errors: Partial<Record<RuntimeView, string>>;
 }
 
 export interface RuntimeDirectoryItem {
@@ -56,14 +58,23 @@ export interface RuntimeDirectoryItem {
   statusTone?: string;
 }
 
-/** Load the three read-only runtime owners as one overview transaction. */
+/** Each directory owns its result; one failed request cannot hide the others. */
 export async function loadRuntimeOverview(): Promise<RuntimeOverview> {
-  const [documents, jobs, capabilities] = await Promise.all([
+  const [documents, jobs, capabilities] = await Promise.allSettled([
     fetchRuntimeItems<RuntimeDocument>("/api/chat/runtime/documents"),
     fetchRuntimeItems<RuntimeJob>("/api/chat/runtime/jobs"),
     fetchRuntimeJson<RuntimeCapabilities>("/api/chat/runtime/capabilities"),
   ]);
-  return { documents, jobs, capabilities };
+  const errors: RuntimeOverview["errors"] = {};
+  if (documents.status === "rejected") errors.documents = runtimeErrorMessage(documents.reason);
+  if (jobs.status === "rejected") errors.jobs = runtimeErrorMessage(jobs.reason);
+  if (capabilities.status === "rejected") errors.mcp = runtimeErrorMessage(capabilities.reason);
+  return {
+    documents: documents.status === "fulfilled" ? documents.value : null,
+    jobs: jobs.status === "fulfilled" ? jobs.value : null,
+    capabilities: capabilities.status === "fulfilled" ? capabilities.value : null,
+    errors,
+  };
 }
 
 /** Load the selected runtime detail from its explicit owner. */
@@ -100,7 +111,7 @@ export async function loadRuntimeDetail(view: RuntimeView, key: string, signal: 
 export function runtimeItems(view: RuntimeView, overview: RuntimeOverview | null): RuntimeDirectoryItem[] {
   if (!overview) return [];
   if (view === "documents") {
-    return overview.documents.map((document) => ({
+    return (overview.documents ?? []).map((document) => ({
       key: document.id,
       title: document.title,
       description: `${document.description} · ${document.relative_path}`,
@@ -110,16 +121,15 @@ export function runtimeItems(view: RuntimeView, overview: RuntimeOverview | null
     }));
   }
   if (view === "mcp") {
-    return overview.capabilities.mcp_servers.map((server) => ({
+    return (overview.capabilities?.mcp_servers ?? []).map((server) => ({
       key: `${server.owner_id}\u0000${server.name}`,
       title: server.name,
-      description: `${server.tool_count} 个工具 · ${server.owner_id}`,
+      description: `${server.tool_count == null ? "工具详情按需读取" : `${server.tool_count} 个工具`} · ${server.owner_id}`,
       icon: "mcp",
-      status: "可用",
-      statusTone: "enabled",
+      status: server.status === "declared" ? "已注册" : "已发现",
     }));
   }
-  return overview.jobs.map((job) => ({
+  return (overview.jobs ?? []).map((job) => ({
     key: job.id,
     title: job.name || "未命名定时任务",
     description: `${formatFireAt(job.fire_at)} · ${job.trigger}/${job.tier}`,
@@ -131,7 +141,7 @@ export function runtimeItems(view: RuntimeView, overview: RuntimeOverview | null
 
 export function runtimeDirectoryDescription(view: RuntimeView, overview: RuntimeOverview | null): string {
   if (view === "documents") return "与移动端相同的固定运行目录";
-  if (view === "mcp") return `${overview?.capabilities.plugins.length ?? 0} 插件 · ${overview?.capabilities.skills.length ?? 0} Skills`;
+  if (view === "mcp") return overview?.capabilities ? `${overview.capabilities.plugins.length} 插件 · ${overview.capabilities.skills.length} Skills` : "能力目录尚未读取";
   return "来自 Scheduler owner 的实时任务投影";
 }
 

@@ -371,6 +371,11 @@ class MobileGatewayRuntime:
                 )
                 return
 
+            logger.info(
+                "mobile.auth.accepted device_fp=%s epoch=%s",
+                hashlib.sha256(device.device_id.encode()).hexdigest()[:12],
+                device.connection_epoch,
+            )
             accepted = AuthAcceptedControl(
                 v=1,
                 kind="control",
@@ -388,7 +393,8 @@ class MobileGatewayRuntime:
                 connection_epoch=device.connection_epoch,
                 capabilities=device.capabilities,
             )
-        except WebSocketDisconnect:
+        except WebSocketDisconnect as error:
+            logger.info("mobile.socket.disconnected code=%s", error.code)
             return
         except (ProtocolDecodeError, ValidationError) as error:
             if isinstance(error, ValidationError):
@@ -524,6 +530,17 @@ class MobileGatewayRuntime:
                         return
                     continue
                 frame = incoming
+                if isinstance(frame, ResumeControl):
+                    logger.info("mobile.sync.resume epoch=%s", connection_epoch)
+                elif isinstance(frame, GenericCommand) and frame.type in {
+                    "session.list", "history.get", "device.update",
+                }:
+                    version = frame.payload.get("message_log_version")
+                    logger.info(
+                        "mobile.sync.command epoch=%s type=%s message_log_version=%s",
+                        connection_epoch, frame.type,
+                        version if type(version) is int else "missing_or_invalid",
+                    )
                 if not isinstance(
                     frame,
                     (
@@ -715,6 +732,10 @@ class MobileGatewayRuntime:
         try:
             request = self.channel.validate_message_follow(frame)
         except MobileCommandError as error:
+            logger.warning(
+                "mobile.command.rejected epoch=%s type=%s code=%s",
+                connection.connection_epoch, frame.type, error.code,
+            )
             async with connection.send_lock:
                 await _send_reply(connection.websocket, frame_id=frame.id,
                     connection_epoch=connection.connection_epoch, reply_type="session.follow.error",
@@ -1860,6 +1881,10 @@ class MobileGatewayRuntime:
                 )
             return
         except MobileCommandError as error:
+            logger.warning(
+                "mobile.command.rejected epoch=%s type=%s code=%s",
+                connection_epoch, frame.type, error.code,
+            )
             async with connection.send_lock:
                 await _send_reply(
                     websocket,
@@ -1871,6 +1896,11 @@ class MobileGatewayRuntime:
                     turn_id=frame.turn_id,
                 )
             return
+        if reply.type.endswith(".error"):
+            logger.warning(
+                "mobile.command.rejected epoch=%s type=%s code=%s",
+                connection_epoch, frame.type, reply.payload.get("code", "unknown"),
+            )
         async with self._delivery_lock:
             if self._connections.get(device_id) is not connection:
                 raise RuntimeError("mobile command 连接已被新 epoch 替换")
@@ -2705,6 +2735,7 @@ async def _close_with_error(
     code: int,
     reason: str,
 ) -> None:
+    logger.warning("mobile.protocol.close code=%s", code)
     await _send_control(
         websocket,
         "protocol.error",
