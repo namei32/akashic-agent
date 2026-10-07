@@ -55,7 +55,18 @@ function mountRuntime(host) {
     try {
       const value = await request(item.path, controller.signal);
       if (closed || controller.signal.aborted) return;
-      node(".runtime-detail__scroll").replaceChildren(element("pre", value.markdown || "当前没有内容。", "runtime-detail__text"));
+      const detail = node(".runtime-detail__scroll");
+      if (Array.isArray(value.tools)) {
+        detail.replaceChildren(element("p", `${value.tools.length} 个工具 · ${value.owner_id}`, "runtime-detail__loading"));
+        for (const tool of value.tools) {
+          const section = element("section", "", "runtime-detail__tool");
+          section.append(element("h3", tool.name), element("p", tool.description));
+          section.append(element("pre", JSON.stringify(tool.input_schema, null, 2), "runtime-detail__schema"));
+          detail.append(section);
+        }
+      } else {
+        detail.replaceChildren(element("pre", value.markdown || "当前没有内容。", "runtime-detail__text"));
+      }
     } catch (error) {
       if (closed || controller.signal.aborted) return;
       node(".runtime-detail__scroll").replaceChildren(element("p", error.message, "runtime-dashboard__error"));
@@ -93,6 +104,9 @@ function mountRuntime(host) {
     }
     const listing = node(".runtime-directory__list");
     listing.replaceChildren(element("h2", views[selectedView]));
+    if (selectedView === "mcp" && data.mcp) {
+      listing.append(element("p", `${data.mcp.plugins.length} 插件 · ${data.mcp.skills.length} Skills`, "runtime-directory__summary"));
+    }
     let items = [];
     if (selectedView === "documents") items = (data.documents?.items || []).map((item) => ({
       title: item.title, description: item.description, disabled: !item.available,

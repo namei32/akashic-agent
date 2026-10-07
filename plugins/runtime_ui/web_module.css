@@ -1,7 +1,7 @@
 .runtime-dashboard { --runtime-inset: 28px; --runtime-list: 32%; --runtime-metric-columns: repeat(3, minmax(0, 1fr)); display: grid; min-width: 0; height: 100%; grid-template-rows: auto auto auto auto minmax(0, 1fr); color: var(--ak-ink-primary); font-family: var(--ak-type-reading); overflow: auto; }
 .runtime-dashboard__topbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px max(var(--runtime-inset), env(safe-area-inset-right, 0px)) 16px max(var(--runtime-inset), env(safe-area-inset-left, 0px)); border-bottom: 1px solid var(--ak-rule-subtle); }
 .runtime-dashboard h1, .runtime-dashboard h2, .runtime-dashboard p { margin: 0; }
-.runtime-dashboard__topbar h1 { font-size: var(--ak-sys-font-size-headline-medium); }
+.runtime-dashboard__topbar h1 { font-size: clamp(1.4rem, 2vw, 1.75rem); font-weight: 500; line-height: 1.3; margin-bottom: 8px; }
 .runtime-dashboard__topbar p, .runtime-directory__item small { color: var(--ak-ink-secondary); line-height: 1.5; }
 .runtime-dashboard button { color: inherit; font: inherit; border: 0; cursor: pointer; min-height: 40px; }
 .runtime-dashboard button:focus-visible { outline: 2px solid var(--ak-rule-focus); outline-offset: 2px; }
@@ -9,7 +9,7 @@
 .runtime-dashboard [data-refresh], .runtime-dashboard__tabs button { background: var(--ak-paper-quiet); padding: 10px 18px; border-radius: 24px; }
 .runtime-dashboard__metrics { display: grid; grid-template-columns: var(--runtime-metric-columns); gap: 16px; padding: 20px var(--runtime-inset); }
 .runtime-metric { display: flex; flex-direction: column; gap: 8px; padding: 16px; border: 1px solid var(--ak-rule-subtle); border-radius: 12px; background: var(--ak-paper-editing); }
-.runtime-metric strong { font-family: var(--ak-type-technical); }
+.runtime-metric strong { font-family: var(--ak-type-technical); font-size: 1.25rem; font-variant-numeric: tabular-nums; }
 .runtime-dashboard__tabs { display: flex; gap: 12px; padding: 8px var(--runtime-inset); flex-wrap: wrap; }
 .runtime-dashboard__tabs button { background: transparent; }
 .runtime-dashboard__tabs button[aria-selected="true"] { background: var(--ak-paper-quiet); }
@@ -18,6 +18,7 @@
 .runtime-directory { display: grid; grid-template-columns: var(--runtime-list) minmax(0, 1fr); margin: 0 var(--runtime-inset) 20px; min-height: 0; border: 1px solid var(--ak-rule-subtle); border-radius: 16px; overflow: hidden; }
 .runtime-directory__list { padding: 20px; overflow: auto; min-width: 0; background: var(--ak-paper-quiet); }
 .runtime-directory__list h2 { margin-bottom: 16px; }
+.runtime-directory__summary { margin-bottom: 16px !important; color: var(--ak-ink-secondary); font-size: 0.8125rem; }
 .runtime-directory__item { display: block; text-align: start; width: 100%; padding: 12px; border-radius: 8px; background: transparent; overflow-wrap: anywhere; }
 .runtime-directory__item:hover { background: var(--ak-paper-raised); }
 .runtime-directory__item-copy { display: flex; flex-direction: column; gap: 4px; }
@@ -26,6 +27,10 @@
 .runtime-detail__header { padding: 20px; border-bottom: 1px solid var(--ak-rule-subtle); }
 .runtime-detail__scroll { overflow: auto; padding: 20px; }
 .runtime-detail__text { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; line-height: 1.5; }
+.runtime-detail__tool { margin-top: 24px; }
+.runtime-detail__tool h3 { margin: 0 0 10px; font-size: 1rem; font-family: var(--ak-type-technical); }
+.runtime-detail__tool p { line-height: 1.6; }
+.runtime-detail__schema { white-space: pre-wrap; overflow-wrap: anywhere; padding: 16px; border-radius: 8px; background: var(--ak-paper-quiet); font-family: var(--ak-type-technical); font-size: 0.8125rem; line-height: 1.5; }
 .runtime-detail__loading { color: var(--ak-ink-secondary); }
 @media (max-width: 820px) { .runtime-dashboard { --runtime-inset: 16px; --runtime-list: minmax(0, 1fr); } .runtime-directory__item { min-height: 44px; } }
 @media (max-width: 36rem) { .runtime-dashboard { --runtime-inset: 12px; --runtime-metric-columns: minmax(0, 1fr); } }
