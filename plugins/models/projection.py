@@ -415,14 +415,18 @@ class MessageProjection:
                     self._check_summary(summaries[0]).binding_ids[0] if summaries else None
                 )
             facts[message.message_id] = value
-        # 摘要明确开启新请求；原 opaque 保存在日志，只续接同一摘要后的响应。
-        if fresh or continuation_transformed or summary_reference is not None and (
+        # 模型切换或安装迁移后，旧 opaque 仍保存在原日志中；本次请求
+        # 从完整可读历史重建，不把旧 binding 的私有状态交给新 binding。
+        binding_changed = (
+            continuation is not None
+            and continuation.binding_id != self._model.descriptor.binding_id
+        )
+        # 摘要明确开启新请求，只续接同一摘要和 binding 后的响应。
+        if fresh or binding_changed or continuation_transformed or summary_reference is not None and (
             continuation_summary != summary_reference or continuation_seq <= after_seq
         ):
             continuation = None
         if continuation is not None:
-            if continuation.binding_id != self._model.descriptor.binding_id:
-                raise ValueError("当前模型不能接续另一 binding 的 opaque 状态")
             if after_seq >= 0 and summary_reference is None:
                 raise ValueError(
                     "当前投影不能证明摘要与 opaque continuation 可共同重放"
