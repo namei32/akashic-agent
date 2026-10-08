@@ -72,9 +72,7 @@ plugins/**/.data/
 /.pytest_artifacts/
 /rss/
 
-# Benchmark 运行产物
-benchmark/result*.json
-benchmark/data/
+# 本地评测产物
 /eval/local_testsets/
 /eval/longmemeval/config.toml
 /eval/longmemeval/results/
