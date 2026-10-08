@@ -9,11 +9,15 @@ from typing import Protocol, TypeVar, cast
 
 from agent.plugin_composition import Context, EmitEventKey, ServiceKey
 from agent.plugin_contracts.proactive import (
-    EVENTMAIL_DELIVERY_V2 as EVENTMAIL_DELIVERY,
-    EVENTMAIL_WAKE_V2 as EVENTMAIL_WAKE,
-    ContentWakeServicesV2 as ContentWakeServices,
+    EVENTMAIL_ALERT_SOURCE,
+    BoundAlertSource,
 )
-
+from agent.plugin_contracts.proactive import (
+    EVENTMAIL_DELIVERY_V2 as EVENTMAIL_DELIVERY,
+)
+from agent.plugin_contracts.proactive import (
+    EVENTMAIL_WAKE_V2 as EVENTMAIL_WAKE,
+)
 from core.common.file_io import run_file_io
 
 from .store import EventMailStore
@@ -52,25 +56,6 @@ class ContentSourceServices(Protocol):
     def bind(self, source_id: str) -> BoundContentSource: ...
 
 
-class BoundAlertSource(Protocol):
-    def close(self) -> None: ...
-
-    async def report(
-        self,
-        *,
-        event_id: str,
-        payload: Mapping[str, object],
-        observed_at: datetime,
-        expires_at: datetime | None = None,
-    ) -> Mapping[str, object]: ...
-
-    async def status(self, *, event_id: str) -> str | None: ...
-
-
-class AlertSourceServices(Protocol):
-    def bind(self, source_id: str) -> BoundAlertSource: ...
-
-
 class BoundContextSource(Protocol):
     def close(self) -> None: ...
 
@@ -89,7 +74,6 @@ class ContextSourceServices(Protocol):
 
 
 EVENTMAIL_CONTENT_SOURCE = ServiceKey[ContentSourceServices]("eventmail.content_source.v2")
-EVENTMAIL_ALERT_SOURCE = ServiceKey[AlertSourceServices]("eventmail.alert_source.v2")
 EVENTMAIL_CONTEXT_SOURCE = ServiceKey[ContextSourceServices]("eventmail.context_source.v2")
 
 

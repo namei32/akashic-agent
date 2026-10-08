@@ -15,6 +15,10 @@
 
 [capabilities]
 
+[capabilities."eventmail.alert_source.v2"]
+role = "seam"
+note = "EventMail 拥有告警提交；来源通过公共合同提交固定事件，不取得邮箱存储权限"
+
 # ── Message 与 Session 权威事实 ───────────────────────────────
 [capabilities."core.message_catalog"]
 role = "core"

@@ -121,6 +121,22 @@ class SemanticInterest(Protocol):
     ) -> tuple[float, ...]: ...
 
 
+class BoundAlertSource(Protocol):
+    def close(self) -> None: ...
+
+    async def report(self, *, event_id: str, payload: Mapping[str, object],
+                     observed_at: datetime, expires_at: datetime | None = None) -> Mapping[str, object]: ...
+
+    async def status(self, *, event_id: str) -> str | None: ...
+
+
+class AlertSourceServices(Protocol):
+    def bind(self, source_id: str) -> BoundAlertSource: ...
+
+
+EVENTMAIL_ALERT_SOURCE = ServiceKey[AlertSourceServices]("eventmail.alert_source.v2")
+
+
 EVENTMAIL_WAKE_V2 = ServiceKey[ContentWakeServicesV2]("eventmail.wake.v2")
 EVENTMAIL_DELIVERY_V2 = ServiceKey[EventMailDeliveryServicesV2]("eventmail.delivery.v2")
 SEMANTIC_INTEREST = ServiceKey[SemanticInterest]("akasha.semantic-interest.v1")
