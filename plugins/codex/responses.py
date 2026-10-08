@@ -186,7 +186,9 @@ class CodexResponses:
             )
         if self._summary != "none" and not request.disable_reasoning:
             reasoning["summary"] = self._summary
-        if self._lite and not request.disable_reasoning:
+        # Lite requires this transport field even when setup probes suppress
+        # the optional reasoning effort and summary parameters.
+        if self._lite:
             reasoning["context"] = "all_turns"
         if reasoning:
             payload["reasoning"] = reasoning
