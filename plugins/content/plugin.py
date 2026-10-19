@@ -15,15 +15,15 @@ from typing import cast
 from markdown_it import MarkdownIt
 
 from agent.plugin_composition import Context, Effect
-from agent.plugin_composition.bindings import Bindings
+from plugins.ledger.contract import Bindings
 from agent.plugin_composition.model import FiberState
-from agent.plugin_contracts import (
+from plugins.ledger.contract import (
     ContentPart,
     ContentReferences,
     freeze_metadata,
     json_value,
 )
-from agent.plugin_contracts.content import (
+from plugins.content.contract import (
     CONTENT as CONTENT,
     ContentView as ContentView,
 )
@@ -57,6 +57,9 @@ def check_text(part: ContentPart) -> ContentReferences:
     return ContentReferences()
 
 
+_MARKDOWN = MarkdownIt("commonmark")
+
+
 def _literal_ranges(text: str) -> tuple[tuple[int, int], ...]:
     """保留 Markdown 代码与引用的原始区间，不把示例当成输出协议。"""
     # 1. Block token 的行范围覆盖 fenced/indented code 和 lazy blockquote。
@@ -65,7 +68,7 @@ def _literal_ranges(text: str) -> tuple[tuple[int, int], ...]:
     if offsets[-1] < len(text):
         offsets.append(len(text))
     protected: list[tuple[int, int]] = []
-    tokens = MarkdownIt("commonmark").parse(text)
+    tokens = _MARKDOWN.parse(text)
     for token in tokens:
         if token.type in {"fence", "code_block", "blockquote_open"}:
             assert token.map is not None
@@ -115,6 +118,9 @@ async def _decode_text(
     validated_references: tuple[Reference, ...] = tuple(
         decode_reference(value) for value in references
     )
+    if not protocols:
+        # 没有文本协议时不存在需要保护的区间，原文就是唯一的 text part。
+        return ((ContentPart("text", text),) if text else ()), freeze_metadata({})
     protected = _literal_ranges(text)
     source = TextSource(text, protected)
     spans: list[tuple[str, Span]] = []
@@ -215,7 +221,7 @@ class _ContentView:
     ) -> tuple[tuple[ContentPart, ...], Mapping[str, object]]:
         self._check_active()
         protocols = tuple(
-            (ctx.require_runtime_owner(CONTENT, self._content), protocol)
+            (ctx.require_runtime_identity(CONTENT, self._content).plugin_id, protocol)
             for ctx, protocol in self._protocols
         )
         parts, metadata = await _decode_text(text, protocols, references)
@@ -347,18 +353,6 @@ class Content:
                     yield view
                 finally:
                     view.close()
-
-
-@asynccontextmanager
-async def open_content(
-    bindings: Bindings, binding_id: str
-) -> AsyncGenerator[ContentView]:
-    """打开已固定的内容协议；动态配置改变时明确拒绝不同的解析选择。"""
-    async with bindings.open(binding_id, CONTENT) as (content, metadata):
-        if content.describe() != metadata:
-            raise ValueError("归档内容协议与固定描述不一致")
-        async with content.bind() as view:
-            yield view
 
 
 async def apply(ctx: Context) -> None:

@@ -21,15 +21,20 @@ args = args_parser.parse_args()
 sys.path[:0] = [str(args.source), str(args.source / 'sdk/python/src')]
 import httpx
 import tiktoken
-from agent.plugin_composition import BoundModelDescriptor, CapabilitySources, ModelCapabilities, ServiceKey
-from agent.plugin_composition.channels import CHANNEL_INPUT_V2 as CHANNEL_INPUT, ChannelInboundMessage
+from agent.plugin_composition import ServiceKey
+from plugins.models.contract import (
+    BoundModelDescriptor,
+    CapabilitySources,
+    ModelCapabilities,
+)
+from plugins.channels.contract import CHANNEL_INPUT_V2 as CHANNEL_INPUT, ChannelInboundMessage
 from core.net.http import HttpClient
 from plugins.codex.responses import CodexResponses
 from plugins.models.state import _BoundChat
 from plugins.models.store import ModelsStore
 from plugins.openai_compatible import driver as compatible
 from plugins.opencode_go import driver as opencode
-from session.message import Output
+from plugins.ledger.contract import Output
 from tests.test_default_reply import application, live_root
 
 ENCODING = tiktoken.get_encoding('cl100k_base')
@@ -88,7 +93,7 @@ def source_changes(path, reverse):
     provider = path / 'test_provider/plugin.py'
     text = provider.read_text()
     text = text.replace('from contextlib import asynccontextmanager',
-                        'from agent.plugin_contracts.context import MATERIALS\nfrom contextlib import asynccontextmanager')
+                        'from plugins.context.contract import MATERIALS\nfrom contextlib import asynccontextmanager')
     text = text.replace('inject = (TOOLS, TASKS, BINDINGS)', 'inject = (TOOLS, TASKS, BINDINGS, MATERIALS)')
     text = text.replace('    calls = []', f'''    calls = []
     async def material(messages, source):
@@ -144,7 +149,7 @@ def binding(protocol, endpoint):
         reasoning_effort=None, capabilities=ModelCapabilities(), capability_sources=CapabilitySources(), capability_digest='fixture')
     http = HttpClient(lambda: httpx.AsyncClient(base_url=endpoint, trust_env=False, timeout=httpx.Timeout(2)))
     if protocol == 'codex':
-        physical = CodexResponses(http=http, credential=Credential(), descriptor=descriptor, config={})
+        physical = CodexResponses(http=http, credential=Credential(), descriptor=descriptor, config={}, client_version="0.0.0")
     elif protocol == 'compatible':
         physical = compatible._BoundChat(compatible._ConnectionConfig(endpoint, 2, 2, 0, False),
             Credential(), descriptor, compatible._ModelConfig(None, 16), http)

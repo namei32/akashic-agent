@@ -1,5 +1,10 @@
 # Issue 750：单图插件系统与局部换代任务拆分
 
+2026-10-06 对账：[0094](../decisions/0094-plugin-runtime-uses-installed-files.md) 取消 PluginArchive。
+下文代码、配置、环境 descriptor 和完整 Root 归档均为历史实现；当前唯一选择文件保存已安装
+目录与输入元数据，配置使用当前文件，binding 打开当前服务。局部换代、排空、异步接单与
+失败 owner 保留仍有效；历史归档保留，不参与普通运行。升级入口见 [部署手册](operator-deployment.md#从旧归档指针升级)。
+
 2026-09-28 对账：本文件按工单保留的旧 Mobile、Gateway、ticket、OTA 和客户端 Gate 记录均为历史证据，不再是当前能力、接口或验收要求。当前 Android Shell 分工见 [0076](../decisions/0076-android-shell-retires-legacy-mobile-stack.md)；插件公开接口以 [V3 能力手册](plugin-v3-capabilities.md) 和真实源码为准。
 
 ## 2026-09-24 · 本地收口与运行验收边界
@@ -20,16 +25,14 @@
 - B2 在停止期按维护锁、发布锁顺序，经正式 installer 与完整 archive 准备后作一次
   selection CAS；成功只报告 selected-not-started，不启动 Manager/Root 或业务服务。
   禁用项、外部替换、配置与历史归档仍按各自 owner 保留。
-- 孤立 armed 安装会阻止 cold boot、doctor 与下一安装。显式
-  `scripts/rollback_plugin_install.py` 只恢复一个 `update_id` 的安装状态，不提供
-  confirm-install、自动回退或 Root 切换。安全条件、备份和重试见
-  [状态地图](persistence-state-map.md#1022-单图安装与停止期指定回退)。
+- 孤立 armed 安装由启动或下一安装按指针确切值结算，显式停机回退脚本已删除，见
+  [0121](../decisions/0121-plugin-install-settles-from-disk.md)。
 - Wake 已结束的业务失败仍由 task incident、failed attempt 与原来源/Delivery 输入
   负责恢复；停止时不再次抛成 generation-cleanup。取消期间真实 teardown 错误仍
   上抛并保留资源 owner。当前故障夹具证明旧 Root 真正关闭后同进程新 stack 恢复，
   不冒称两个独立 OS 进程的崩溃恢复。
-- LongMemEval 按维护者决定退役。PersonaMem 的必要 helper 收回本包，但旧
-  CoreRuntime 入口尚未恢复，不把导入/纯函数检查写成 benchmark 端到端通过。
+- LongMemEval 与 PersonaMem 已按维护者决定完整退役，旧 benchmark 入口及 helper
+  不再保留；历史运行数据未操作。
 
 本地证据集中在 `/mnt/data/issue750-overnight-20260924.DgHQu2/`：完整公开回归曾为
 2389 passed / 5 failed / 4 skipped；五个失败修复后的 clean `d7a08247` 联合对照
@@ -428,7 +431,7 @@ Tools、UI、模型及资源 provider 中与全局 snapshot 绑定的部分要�
 具体证据：
 
 - [Fiber._reconcile / CompositionRoot.freeze](../../agent/plugin_composition/context.py)：628、863 行起，冻结后不再进行正常局部重装配。
-- [RuntimeSnapshotCompiler / RuntimeSnapshotStore](../../agent/plugins/snapshot.py)：93、1078 行起，编译冻结 Root，并限制跨 snapshot 共享实际实例。
+- 旧 `agent/plugins/snapshot.py` 的 RuntimeSnapshotCompiler / RuntimeSnapshotStore：93、1078 行起，编译冻结 Root，并限制跨 snapshot 共享实际实例。
 - [PluginManager._switch_ready / _replace_formal_root](../../agent/plugins/manager.py)：1578、1671 行起，关闭候选并替换完整正式 Root。
 - [fresh-root 测试](../../tests/test_plugin_fresh_root.py)：124 行起，明确要求候选和正式组合中的每个插件都是新实例。
 - [Ui.register / seal](../../plugins/ui/plugin.py)：52、112 行起，一次性封存后不再允许登记。
@@ -886,7 +889,7 @@ T-cbecef 的六项测试源、文档已由主审及独立 review 静态接受；
 
   **iii. owner startup 的资源访问**：选窄的 owner-self 读取——`Context.get` 在本 Fiber LOADING 时允许读**本 Fiber 自己**已登记的 provide（`owner is self._fiber`），其他 owner 仍要求 ACTIVE；不开全局 fallback、不允许跨 LOADING owner 互读。`ctx.runtime_scope` 的本地化是前置依赖（见 v 的 T03a）：局部 activation 需要不经过整图 snapshot lease 的 scope 入口，接口为"按 Fiber/activation 的 scope 获取"，阶段上先于 start 执行点。
 
-  **iv. 迁移期 seam（已被 T03a-5 合同取代）**：原"局部装载标记 seam"废弃——T03a-5 定为同一不可分割单元内直接切换：内核 `_load`/`_unload` 对每次 activation 统一 dispatch 生命周期（冷启动与局部换代同链），不新增第二套 lifecycle owner。T-57630a 只删除 Manager 的 resident `run_runtime_services` 与 App/stdio 的正式 bootstrap 调用；`start_runtime`、`_start_runtime_snapshot`、`_start_closed_runtime_snapshot`、`_stop_runtime_snapshot*`、snapshot store 及真实消费者需要的清理责任保留。freeze 屏障随 fence/lease 消费者迁移一并解除，不先 no-op。
+  **iv. 迁移期 seam（已被 T03a-5 合同取代）**：原"局部装载标记 seam"废弃——T03a-5 定为同一不可分割单元内直接切换：内核 `_load`/`_unload` 对每次 activation 统一 dispatch 生命周期（冷启动与局部换代同链），不新增第二套 lifecycle owner。T-57630a 当时只删除 Manager 的 resident `run_runtime_services` 与 App/stdio 的正式 bootstrap 调用，保留尚有消费者的启动、停止和 snapshot 清理路径；freeze 屏障随 fence/lease 消费者迁移一并解除，不先 no-op。当前 `load_all()` 已等待 Fiber 完成生命周期，Manager 不再保存第二份 started 集合或提供额外启动步骤；停止仍由 `terminate_all()` 排空真实 generation、任务和 Root。
 
   **v. 校正后的实施依赖**（最小 Unicode 依赖图）：
 
@@ -2143,6 +2146,8 @@ Plugin Context → Root EventRegistry → Fiber Effect（独立，不桥接）
 T-71cb50 的 EventBus R1 两项测试源尾修与上述退役 wrapper/旧 fixture 删除已由主审与独立只读静态接受；行为测试未运行。
 
 #### T-57630a · 退役常驻 runtime loop 与正式宿主入口（production 已冻结；T-d8e47c production/test review 未通过；T-4f17d6 Cold-Start 累计静态接受，未运行）
+
+> 下文保留该批次的迁移记录。当前宿主直接监督 Web Shell、PluginWatcher 和进程停止等待；Host Bridge 监控归 HostExecution 插件。旧任务聚合与 Manager 启动记账已删除，Fiber 仍独占生命周期，真实资源仍由原 owner 排空。
 
 本批只收窄真实宿主边界，不扩大到全部 candidate/snapshot 删除。Manager 删除唯一常驻
 `run_runtime_services` loop 及其开关字段；保留仍有真实消费者的 snapshot start/stop/store、candidate/history、cleanup、operation/CAS、accepted、physical owner 与 `terminate_all` 责任。App 不再在正式启动中调用 `start_runtime` 或登记旧 loop；只有实际 `host_bridge_monitor` 等 runtime task 才创建 primary supervisor，Dashboard/PluginWatcher 仍是独立真实监督对象，意外空集合明确失败。stdio 直接等待 `StdioAppServer.run()`，EOF/错误后沿原 `ControlService → Bus → Core.stop → Manager.terminate_all → Fiber` 清理链退出。

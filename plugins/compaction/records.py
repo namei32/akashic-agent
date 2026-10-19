@@ -8,14 +8,14 @@ from typing import Annotated, Literal, Self, TypeAlias, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from agent.plugin_composition.messages import (
+from plugins.ledger.contract import (
     MessageConflict,
     MessageReader,
     OwnerStore,
     OwnerTransaction,
 )
-from agent.plugin_contracts import Message, json_value
-from agent.plugin_contracts.compaction import (
+from plugins.ledger.contract import Message, json_value
+from plugins.compaction.contract import (
     COMPACTION_SUMMARIES as COMPACTION_SUMMARIES,
 )
 
@@ -68,9 +68,11 @@ class SummaryRecord(_SummaryIdentity):
     """一次单窗口压缩的覆盖范围、真实输入与生成条件。"""
 
     version: Literal[2] = 2
-    summary_message_ids: tuple[Text, ...] = Field(min_length=1)
+    # 空表示本代只重写父摘要（覆盖范围与父代相同）。
+    summary_message_ids: tuple[Text, ...] = ()
     omitted_message_ids: tuple[Text, ...] = ()
-    model_call_ids: tuple[Text, ...] = Field(min_length=1, max_length=1)
+    # 一次生成，加上过长时的一次缩写。
+    model_call_ids: tuple[Text, ...] = Field(min_length=1, max_length=2)
     trigger: Literal["soft_limit", "context_overflow"]
     context_window: Annotated[int, Field(gt=0)]
     max_output_tokens: Annotated[int, Field(gt=0)]
@@ -211,7 +213,7 @@ def _check_lineage(
                 else parent.generation + 1 == current.generation
             )
             if (not generation_matches
-                    or len(parent.source_message_ids) >= len(current.source_message_ids)
+                    or len(parent.source_message_ids) > len(current.source_message_ids)
                     or current.source_message_ids[:len(parent.source_message_ids)] != parent.source_message_ids):
                 raise ValueError("摘要父链的 generation 或来源前缀不连续")
         if isinstance(current, SummaryRecord):
@@ -219,7 +221,8 @@ def _check_lineage(
             added = current.source_message_ids[parent_size:]
             summarized = set(current.summary_message_ids)
             omitted = set(current.omitted_message_ids)
-            if (len(added) != len(summarized) + len(omitted)
+            if ((parent is None or added) and not summarized
+                    or len(added) != len(summarized) + len(omitted)
                     or tuple(item for item in added if item in summarized) != current.summary_message_ids
                     or tuple(item for item in added if item in omitted) != current.omitted_message_ids):
                 raise ValueError("摘要本代覆盖没有被模型输入与省略消息完整分区")
@@ -310,6 +313,22 @@ class SummaryRecords:
             raise ValueError("摘要 head 没有对应 Session 的已发布记录")
         return record
 
+    def read_head(
+        self, session_id: str, *, known: tuple[int, StoredSummary] | None = None,
+    ) -> tuple[int, StoredSummary] | None:
+        """读取 head 行版本；known 版本一致时复用已核对记录，跳过完整父链核对。
+
+        摘要记录只增且不可变，head 行版本随发布单调递增，版本一致即内容一致。
+        """
+        row = self._state.read("head:" + session_id)
+        if row is None:
+            return None
+        if known is not None and known[0] == row.version:
+            return known
+        record = self.head(session_id)
+        assert record is not None
+        return (row.version, record)
+
     async def publish(
         self, record: SummaryRecord, reader: MessageReader, *, parent: StoredSummary | None,
         summary_range: Callable[[tuple[Message, ...], tuple[str, ...]], range],
@@ -333,7 +352,7 @@ class SummaryRecords:
             reference = None if parent is None else parent.reference
             if record.generation != generation or record.parent != reference:
                 raise ValueError("摘要 generation 与 parent 不连续")
-            if parent is not None and (len(record.source_message_ids) <= len(parent.source_message_ids)
+            if parent is not None and (len(record.source_message_ids) < len(parent.source_message_ids)
                     or record.source_message_ids[:len(parent.source_message_ids)] != parent.source_message_ids):
                 raise ValueError("后续摘要不能撤回已有来源")
 

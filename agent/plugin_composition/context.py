@@ -15,7 +15,6 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, AsyncGenerator, TypeVar, cast
 
-from agent.plugin_composition.access import CompositionAudit
 from agent.plugin_composition.diagnostics import (
     CorePluginDiagnostics,
     PluginDiagnostics,
@@ -38,7 +37,9 @@ from agent.plugin_composition.events import (
     TransformEventKey,
 )
 from agent.plugin_composition.executor import reject_executor_context_access
+from agent.plugin_composition.endpoints import Endpoint, EndpointPublisher
 from agent.plugin_composition.model import (
+    CallerIdentity,
     CompositionError,
     CompositionReceipt,
     FiberState,
@@ -162,7 +163,7 @@ class Context:
         return RuntimeScope(call)
 
     @contextmanager
-    def _call_scope(self) -> Iterator[None]:
+    def call_scope(self) -> Iterator[None]:
         """统一保护同步和异步入口。"""
         scope = self._reserve_scope()
         with scope if scope is not None else nullcontext():
@@ -171,7 +172,7 @@ class Context:
     @asynccontextmanager
     async def runtime_scope(self) -> AsyncGenerator[None]:
         """为需要显式延长资源寿命的业务边界保留同一次 activation。"""
-        with self._call_scope():
+        with self.call_scope():
             yield
 
     def entrypoint(self, operation: F) -> F:
@@ -182,13 +183,13 @@ class Context:
         if inspect.iscoroutinefunction(operation):
             @wraps(operation)
             async def run_async(*args: Any, **kwargs: Any) -> object:
-                with self._call_scope():
+                with self.call_scope():
                     return await operation(*args, **kwargs)
             return cast(F, run_async)
 
         @wraps(operation)
         def run_sync(*args: Any, **kwargs: Any) -> object:
-            with self._call_scope():
+            with self.call_scope():
                 result = operation(*args, **kwargs)
                 if inspect.isawaitable(result):
                     if inspect.iscoroutine(result):
@@ -208,11 +209,11 @@ class Context:
         if provider is None:
             yield None
             return
-        with provider.owner.context._call_scope():
+        with provider.owner.context.call_scope():
             yield cast(T, provider.value)
 
-    def require_runtime_owner(self, key: ServiceKey[Any], service: object) -> str:
-        """验证当前 scope 的实际服务与 Context，返回 Core 分配的插件 owner。"""
+    def require_runtime_identity(self, key: ServiceKey[Any], service: object) -> CallerIdentity:
+        """核对实际 Task、Context 和服务后返回身份；不接受调用方填写的身份字段。"""
         reject_executor_context_access()
         self._require_current()
         task = asyncio.current_task()
@@ -234,15 +235,86 @@ class Context:
                 "SERVICE_SCOPE_MISMATCH",
                 "授权服务不属于当前 Context 的 dependency store",
             )
-        return self.runtime.plugin_id
+        runtime = self.runtime
+        return CallerIdentity(runtime.plugin_id, runtime.generation_id)
 
-    def require_declared_runtime_owner(self, key: ServiceKey[Any], service: object) -> str:
-        """先核对 Context 有效性和声明，再核对实际调用许可。"""
+    def _caller_context(self) -> Context:
+        """只读取当前 Task 的实际许可，不信任继承的 ContextVar。"""
         reject_executor_context_access()
         self._require_current()
-        if key not in self._fiber.dependencies:
-            raise CompositionError("UNDECLARED_SERVICE", f"当前 Fiber 未声明依赖: {key.name}")
-        return self.require_runtime_owner(key, service)
+        current = _current_runtime_scope()
+        if current is not None:
+            caller = current._call._fiber.context
+        else:
+            binding = _lifecycle_binding.get()
+            if binding is None or binding[1] is not asyncio.current_task():
+                raise CompositionError("OWNER_CALL_CONTEXT", "操作需要实际调用许可或生命周期借用")
+            caller = binding[0]
+        if caller._root is not self._root:
+            raise CompositionError("SERVICE_SCOPE_MISMATCH", "调用方不属于 provider 的 Root")
+        caller._require_current()
+        return caller
+
+    def service_origins(
+        self, key: ServiceKey[Any], *, contributors: tuple[Context, ...] = (),
+    ) -> tuple[CallerIdentity, ...]:
+        """从调用者已声明的依赖图读取来源，不返回 Fiber、服务或安装器。"""
+        # 1. 服务必须属于真实调用者的许可；遍历只读取冻结的依赖。
+        caller = self._caller_context()
+        caller.require(key)
+        origins: dict[str, CallerIdentity] = {}
+        contexts: set[int] = set()
+        services: set[ServiceKey[Any]] = set()
+        pending: list[Context] = []
+
+        def include_context(context: Context) -> None:
+            context._require_current()
+            fiber = context._fiber
+            if (context._root is not self._root
+                or self._root._fibers.get(fiber.fiber_id) is not fiber):
+                raise CompositionError("SERVICE_SCOPE_MISMATCH", "贡献 Context 不属于当前 Root")
+            if id(context) in contexts:
+                return
+            runtime = context.runtime
+            contexts.add(id(context))
+            origins[runtime.plugin_id] = CallerIdentity(runtime.plugin_id, runtime.generation_id)
+            pending.append(context)
+
+        def include_service(service: ServiceKey[Any], requester: Context) -> None:
+            if service in services:
+                return
+            services.add(service)
+            provider = requester._fiber.dependency_store.get(service)
+            if provider is None:
+                provider = self._root._providers.get(service)
+                if provider is None or provider.owner is not requester._fiber:
+                    raise CompositionError("UNDECLARED_SERVICE", f"调用者未声明服务: {service.name}")
+            if provider.owner.runtime is None:
+                return
+            include_context(provider.owner.context)
+            if provider.binding_contributors is not None:
+                for context in provider.binding_contributors():
+                    include_context(context)
+
+        # 2. 动态贡献者仍由原 provider 声明，身份只取内核登记的 Context。
+        for context in contributors:
+            include_context(context)
+        include_service(key, caller)
+        while pending:
+            context = pending.pop()
+            for dependency in context._fiber.dependencies:
+                include_service(dependency, context)
+        return tuple(origins[name] for name in sorted(origins))
+
+    @asynccontextmanager
+    async def open_service(self, key: ServiceKey[T]) -> AsyncGenerator[T]:
+        """为已保存的动态选择打开当前 provider，并保护其准确的调用寿命。"""
+        self._require_current()
+        if not self._fiber._is_root or _current_runtime_scope() is not None:
+            self._caller_context()
+        context, value = self._root._service_provider(key)
+        async with context.runtime_scope():
+            yield value
 
     def capture_runtime_scope(self) -> RuntimeScope:
         """把当前 Task 已接纳的许可延长成一份可移交子 Task 的 scope。"""
@@ -444,6 +516,11 @@ class Context:
             )
         return value
 
+    def dependency_revision(self, key: ServiceKey[Any]) -> int:
+        """读取本 activation 已声明依赖的固定发布版本。"""
+        self.require(key)
+        return self._fiber.dependency_store[key].revision
+
     async def effect(self, setup: EffectSetup, *, label: str = "effect") -> Effect:
         reject_executor_context_access()
         self._require_current()
@@ -472,6 +549,22 @@ class Context:
 
         _ = await self.effect(setup, label=f"health:{name}")
         return handle
+
+    async def endpoint(
+        self, name: str, *, protocol: str, address: str, routes: tuple[str, ...] = (),
+    ) -> Effect:
+        """发布已就绪的监听器；同一 Effect 先撤下路由，再由插件关闭监听器。"""
+        reject_executor_context_access()
+        self._require_current()
+        runtime = self._fiber.runtime
+        endpoint = Endpoint(name, protocol, address, routes, self._fiber.path,
+                            self.generation_id if runtime is None else runtime.generation_id)
+
+        def setup() -> Callable[[], None]:
+            self._root._register_endpoint(self._fiber, endpoint)
+            return lambda: self._root._remove_endpoint(self._fiber, endpoint)
+
+        return await self.effect(setup, label=f"endpoint:{name}")
 
     def report_incident(self, kind: str, message: str) -> IncidentView:
         """记录一条结构化 Incident，但不隐式改变当前 Health。"""
@@ -586,7 +679,7 @@ class Context:
 
             async def run_owned_task() -> T:
                 await ready.wait()
-                with self._call_scope():
+                with self.call_scope():
                     if runtime is None:
                         return await run_user()
                     with plugin_entrypoint(
@@ -877,6 +970,14 @@ class RuntimeScope:
                 _runtime_scope_binding.reset(token)
                 self._binding_token = None
         self._call.release()
+
+    def discard(self) -> None:
+        """释放尚未进入的许可；已进入的 scope 必须沿其退出路径关闭。"""
+        if self._closed:
+            return
+        if self._entered_task is not None:
+            raise CompositionError("OWNER_CALL_CONTEXT", "不能丢弃已经进入的 call scope")
+        self._close()
 
     async def close(self) -> None:
         """幂等；已 enter 的 scope 只能由 entered_task 关闭。"""
@@ -1369,7 +1470,7 @@ class CompositionRoot:
         self,
         generation_id: str,
         *,
-        audit: CompositionAudit | None = None,
+        endpoint_publisher: EndpointPublisher | None = None,
     ) -> None:
         if not generation_id:
             raise ValueError("generation_id 不能为空")
@@ -1381,10 +1482,13 @@ class CompositionRoot:
         self._fibers: dict[int, Fiber] = {}
         self._providers: dict[ServiceKey[Any], _Provider] = {}
         self._health_entries: dict[tuple[int, str], _HealthEntry] = {}
+        self._endpoints: dict[tuple[int, str], Endpoint] = {}
+        self._endpoint_publisher = endpoint_publisher
+        if endpoint_publisher is not None:
+            endpoint_publisher(())
         self._incident_sequence = 0
         self._incident_counts: dict[tuple[int, str], int] = {}
         self._recent_incidents: deque[IncidentView] = deque(maxlen=self.RECENT_INCIDENT_LIMIT)
-        self._audit = audit or CompositionAudit()
         self._events = EventRegistry(
             self._bump_composition_revision,
             self._record_listener_failure,
@@ -1410,6 +1514,35 @@ class CompositionRoot:
         """标识单个 Root 实例，不参与可持久化拓扑身份。"""
 
         return self._instance_token
+
+    def endpoints(self) -> tuple[Endpoint, ...]:
+        """读取当前 Root 的唯一端点登记，不借出可变容器。"""
+        return tuple(self._endpoints.values())
+
+    def _register_endpoint(self, owner: Fiber, endpoint: Endpoint) -> None:
+        """在发布派生视图成功后提交登记，不声称回滚已经发布的外部效果。"""
+        key = (owner.fiber_id, endpoint.name)
+        if key in self._endpoints:
+            raise ValueError(f"端点重复登记: {owner.path}/{endpoint.name}")
+        used = {route for item in self._endpoints.values() for route in item.routes}
+        if used.intersection(endpoint.routes):
+            raise ValueError(f"端点路由前缀已被占用: {endpoint.routes}")
+        proposed = {**self._endpoints, key: endpoint}
+        if self._endpoint_publisher is not None:
+            self._endpoint_publisher(tuple(proposed.values()))
+        self._endpoints = proposed
+        self._bump_composition_revision()
+
+    def _remove_endpoint(self, owner: Fiber, endpoint: Endpoint) -> None:
+        """撤下路由失败时保留登记与 Effect，监听器 owner 仍负责重试清理。"""
+        key = (owner.fiber_id, endpoint.name)
+        if self._endpoints[key] is not endpoint:
+            raise RuntimeError("端点清理对象不属于当前登记")
+        proposed = {key_: item for key_, item in self._endpoints.items() if key_ != key}
+        if self._endpoint_publisher is not None:
+            self._endpoint_publisher(tuple(proposed.values()))
+        self._endpoints = proposed
+        self._bump_composition_revision()
 
     async def mount(
         self,
@@ -1492,7 +1625,6 @@ class CompositionRoot:
         incident_counts: dict[str, int] = {}
         for (_fiber_id, owner), count in self._incident_counts.items():
             incident_counts[owner] = incident_counts.get(owner, 0) + count
-        external_effects = self._audit.external_effects
         required_pending = tuple(
             view.name
             for view in fibers
@@ -1520,7 +1652,6 @@ class CompositionRoot:
                 self.root_fiber.state == FiberState.ACTIVE
                 and not required_pending
                 and not required_degraded
-                and not external_effects
             ),
             fibers=fibers,
             services=tuple(sorted(key.name for key in self._providers)),
@@ -1533,8 +1664,6 @@ class CompositionRoot:
             incident_sequence=self._incident_sequence,
             incident_counts=tuple(sorted(incident_counts.items())),
             incident_overflowed=False,
-            writes=self._audit.writes,
-            external_effects=external_effects,
         )
 
     def topology_view(
@@ -1771,22 +1900,6 @@ class CompositionRoot:
             if not provider.revoking
             if (runtime := provider.owner.runtime) is not None
         }
-
-    def binding_contributors(self, key: ServiceKey[Any]) -> tuple[Context, ...]:
-        """归档依赖来自当前服务 provider，不另存动态注册状态。"""
-        provider = self._active_provider(key)
-        if provider is None:
-            raise RuntimeError(f"归档服务已失效: {key.name}")
-        return () if provider.binding_contributors is None else provider.binding_contributors()
-
-    def context_owner(self, context: Context) -> str | None:
-        """只识别本 Root 实际存活的插件 Context，不接受重建的身份字段。"""
-        for fiber in self._fibers.values():
-            if fiber.context is context:
-                if fiber.state != FiberState.ACTIVE or fiber.runtime is None:
-                    raise RuntimeError("注册 Context 已失效或没有插件 owner")
-                return fiber.runtime.plugin_id
-        return None
 
     def plugin_dependencies(self) -> Mapping[str, frozenset[ServiceKey[Any]]]:
         """收集各插件及子 Fiber 声明的服务依赖。"""

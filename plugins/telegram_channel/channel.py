@@ -22,23 +22,9 @@ from telegram.ext import (
 from telegramify_markdown.converter import convert_with_segments
 from telegramify_markdown.entity import split_entities
 
-from agent.plugin_composition import (
-    AttachmentKind,
-    AttachmentRef,
-    ChannelAdapter,
-    ChannelCleanupFailure,
-    ChannelFactoryContext,
-    ChannelInboundMessage,
-    ChannelReady,
-    DeliveryStatus,
-    InboundIdentity,
-    ProviderDeliveryReceipt,
-    ProviderDeliveryRequest,
-    RawInbound,
-    StopReceipt,
-)
-from agent.plugin_composition.channels import (
-    CredentialRef, ProviderClient,
+from plugins.channels.contract import AttachmentKind, AttachmentRef, ChannelAdapter, ChannelCleanupFailure, ChannelFactoryContext, ChannelInboundMessage, ChannelReady, DeliveryStatus, InboundIdentity, ProviderDeliveryReceipt, ProviderDeliveryRequest, RawInbound, StopReceipt
+from agent.plugin_composition.credentials import CredentialRef, ProviderClient
+from plugins.channels.contract import (
     ChannelPresentationPorts,
     ChannelRuntimePorts,
     ControlResponseBodies,
@@ -106,7 +92,7 @@ class TelegramChannelAdapter:
         self._ingress = context.ingress
         self._identity = context.identity
         self._create_client = create_client
-        self._credentials = {"token": TelegramChannelConfig.model_validate(context.config).token}
+        self._token_ref = TelegramChannelConfig.model_validate(context.config).token
         self._attachment_import = context.attachment_import
         self._attachment_read = context.attachment_read
         raw_allow_from = context.config.get("allow_from", ())
@@ -165,11 +151,11 @@ class TelegramChannelAdapter:
 
         if self._started or self._stopping:
             raise RuntimeError("Telegram channel 已启动或正在停止")
-        token_ref = self._credentials.get("token")
+        token_ref = self._token_ref
         if token_ref is None:
             raise RuntimeError("Telegram channel 缺少 token credential")
         try:
-            self._provider_client = await self._create_client(self._credentials)
+            self._provider_client = await self._create_client({"token": token_ref})
             token = self._provider_client.credential(token_ref)
             self._app = (
                 Application.builder()

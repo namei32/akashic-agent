@@ -7,12 +7,9 @@ from dataclasses import replace
 
 from agent.plugin_composition import Context, Effect
 
-from agent.plugin_contracts.inspection import (
-    Document,
-    SCHEDULER_INSPECTION_V3 as SCHEDULER_INSPECTION,
-    SKILL_INSPECTION as SKILL_INSPECTION,
-    SkillReader as SkillReader,
-)
+from plugins.runtime_inspection.contract import Document
+from plugins.scheduler.contract import SCHEDULER_INSPECTION
+from plugins.standard_tools.contract import SkillReader
 
 _MAX_DOCUMENT_BYTES = 192 * 1024
 
@@ -94,6 +91,12 @@ class RuntimeInspectionProvider:
         service = self._skills
         return None if service is None else await service.list_skills()
 
+    async def list_skill_sources(self) -> tuple[Mapping[str, object], ...] | None:
+        """读取本地来源探测结果；缺失与不可读也原样透出。"""
+
+        service = self._skills
+        return None if service is None else await service.list_sources()
+
     async def list_jobs(self) -> tuple[Mapping[str, object], ...] | None:
         """借用本次实际 provider，读取排空后才允许其卸载。"""
         with self._ctx.borrow(SCHEDULER_INSPECTION) as service:
@@ -121,10 +124,3 @@ class RuntimeInspectionProvider:
             "description": document.description,
             "available": available,
         }
-
-
-__all__ = [
-    "RuntimeInspectionProvider",
-    "SCHEDULER_INSPECTION",
-    "SKILL_INSPECTION",
-]

@@ -2,33 +2,28 @@ from __future__ import annotations
 
 import asyncio
 
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 
 from agent.plugin_composition import Context, Effect
 from agent.plugin_composition.model import FiberState
-from agent.plugin_composition.models import BoundChatModel, ModelRequest
+from plugins.models.contract import ContextModel, ModelRequest
+from plugins.models.contract import BoundChatModel
 from agent.plugin_composition.tasks import child_task_context
-from agent.plugin_contracts import Message
-from agent.plugin_contracts.context import (
-    MaterialKind,
+from plugins.ledger.contract import Message
+from plugins.context.contract import (
+    MaterialData, MaterialKind, Prepare, ReductionStatus, SummaryData, SummaryReducer,
 )
 
 from .api import (
-    ContextModel,
-    MaterialData,
     Materials,
     Reminder,
     Summary,
-    SummaryData,
-    SummaryReducer,
     decode_material,
     decode_summary,
     material_data,
 )
-
-Prepare = Callable[[tuple[Message, ...], str], Awaitable[MaterialData]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,7 +123,7 @@ class MaterialView:
     async def reduce(
         self, snapshot: tuple[Message, ...], materials: MaterialData,
         request: ModelRequest, model: BoundChatModel, projection: ContextModel,
-        *, source: str, force: bool,
+        *, source: str, force: bool, on_status: ReductionStatus | None = None,
     ) -> SummaryData | None:
         """只有同一个摘要 owner 能缩减；其余已取得材料保持原样。"""
         self._check_active()
@@ -139,6 +134,7 @@ class MaterialView:
                     summary_value = await owner.reduce(
                         snapshot, material_data(current), request, model, projection,
                         source=source, force=force,
+                        **({"on_status": on_status} if on_status is not None else {}),
                     )
                 self._check_active()
                 summary = decode_summary(summary_value)

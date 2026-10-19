@@ -1,7 +1,7 @@
 """普通检查插件的值级 RPC；外部调用与 Web 使用同一合同。"""
 from pydantic import BaseModel, ConfigDict
 
-from agent.plugin_composition.rpc import RpcMethod
+from plugins.gateway.contract import RpcMethod
 
 from .inspection import RuntimeInspectionProvider
 
@@ -46,8 +46,13 @@ def rpc_methods(provider: RuntimeInspectionProvider) -> dict[str, RpcMethod]:
 
     async def skills(params: BaseModel) -> object:
         rows = await provider.list_skills()
-        return ({"items": [dict(row) for row in rows]} if rows is not None else
-                _unavailable("skills_unavailable", "技能检查服务尚未绑定"))
+        if rows is None:
+            return _unavailable("skills_unavailable", "技能检查服务尚未绑定")
+        sources = await provider.list_skill_sources()
+        return {
+            "items": [dict(row) for row in rows],
+            "sources": [dict(row) for row in sources or ()],
+        }
 
     return {
         "inspection/documents.list": RpcMethod(EmptyParams, documents),

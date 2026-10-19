@@ -5,7 +5,7 @@ import argparse
 import asyncio
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -24,15 +24,29 @@ args = parser.parse_args()
 sys.path.insert(0, str(args.source.resolve()))
 
 import httpx
-from agent.plugin_composition import BoundModelDescriptor, CapabilitySources, ModelCapabilities, ModelRequest
+from plugins.models.contract import ModelRequest
+from plugins.models.contract import (
+    BoundModelDescriptor,
+    CapabilitySources,
+    ModelCapabilities,
+)
 from core.net.http import HttpClient
 from plugins.models.state import _BoundChat
 from plugins.models.store import ModelsStore
 from plugins.openai_compatible import driver
 from core.common.file_io import run_file_io
-from agent.plugin_composition import InvalidRequestError, ModelUnavailableError
-from agent.plugin_composition.models import DriverChatModel, LLMResponse
-from agent.plugin_composition import CHAT_MODELS, MODEL_DRIVERS, CompositionRoot, ModelKind
+from plugins.models.contract import (
+    InvalidRequestError,
+    ModelUnavailableError,
+    ModelError,
+)
+from plugins.models.contract import LLMResponse
+from plugins.models.contract import DriverChatModel
+from agent.plugin_composition import CompositionRoot
+from plugins.models.contract import (
+    CHAT_MODELS,
+    MODEL_DRIVERS,
+)
 from plugins.models.settings import MODEL_SETTINGS, AddConnection, AddModel, CreateConnectionWithModel, SetDefaultModel
 from plugins.models.state import ModelsState
 
@@ -135,9 +149,6 @@ class LockedStore(ModelsStore):
     def resume_call(self, *values, **options):
         return self.blocked('begin', partial(super().resume_call, *values, **options))
 
-    def record_first_token(self, *values, **options):
-        return self.blocked('first-token', partial(super().record_first_token, *values, **options))
-
     def finish_call(self, *values, **options):
         return self.blocked('finish', partial(super().finish_call, *values, **options))
 
@@ -167,10 +178,6 @@ class BarrierStore(ModelsStore):
         self.pause('begin-after')
         return identity
 
-    def record_first_token(self, *values, **options):
-        self.pause('first-token')
-        return super().record_first_token(*values, **options)
-
     def finish_call(self, *values, **options):
         self.pause('finish-before')
         result = super().finish_call(*values, **options)
@@ -190,7 +197,7 @@ async def cancellation_checks(directory, server, descriptor, physical):
     observations = []
     async def delta(_value):
         pass
-    for phase in ['begin-before', 'begin-after', 'first-token', 'finish-before', 'finish-after']:
+    for phase in ['begin-before', 'begin-after', 'finish-before', 'finish-after']:
         store = BarrierStore(directory / ('cancel-' + phase + '.db'), directory / 'backups', phase)
         store.initialize()
         request = ModelRequest([{'role': 'user', 'content': 'fixture'}], request_key='cancel-' + phase, on_delta=delta)
@@ -225,7 +232,9 @@ async def cancellation_checks(directory, server, descriptor, physical):
             # 取消等待不抹掉真实成功；同 key 复用或拒绝，均不再 POST。
             try:
                 replayed = await bound.complete(request)
-            except ModelUnavailableError:
+            except (RuntimeError, TimeoutError) as _model_error:
+                if not (ModelError.matches(_model_error, ModelUnavailableError)):
+                    raise
                 assert expected == 'error'
             else:
                 assert expected == 'success' and replayed.content == 'local-result'
@@ -269,7 +278,18 @@ async def shared_checks(directory, server, descriptor, physical):
                 assert await follower is response
             assert response.content == 'local-result' and server.posts == before + 1
             assert len(store.calls_for_key(name)) == 1
-            observations.append({'case': name, 'posts': 1, 'call_rows': 1})
+            # 同 key 的两个等待者共享已结算响应；任一调用者不能改变另一个的事实。
+            try:
+                setattr(response, 'content', 'caller edit')
+            except FrozenInstanceError:
+                pass
+            else:
+                raise AssertionError('shared response accepted a caller edit')
+            replayed = await bound.complete(request)
+            assert replayed.content == response.content == 'local-result'
+            assert replayed.call_record_id == response.call_record_id
+            assert server.posts == before + 1
+            observations.append({'case': name, 'posts': 1, 'call_rows': 1, 'shared_response_frozen': True})
         finally:
             store.release.set()
             await asyncio.gather(owner, *((follower,) if follower is not None else ()), return_exceptions=True)
@@ -361,11 +381,12 @@ async def cross_store_checks(directory, server, descriptor, physical):
             if kind == 'success':
                 assert (await second).content == 'local-result'
             else:
-                expected = ValueError if kind in ['digest', 'binding'] else ModelUnavailableError
+                expected = ValueError if kind in ['digest', 'binding'] else RuntimeError
                 try:
                     await second
-                except expected:
-                    pass
+                except expected as error:
+                    if kind not in ['digest', 'binding']:
+                        assert ModelError.matches(error, ModelUnavailableError)
                 else:
                     raise AssertionError('过时准入不应再次调用 provider')
             finish.set()
@@ -409,6 +430,7 @@ async def queued_settlement_check(directory, server, descriptor, physical: Drive
         assert release.wait(5)
 
     workers = []
+    driver_failures: list[tuple[BaseException, ModelError, str]] = []
 
     class QueuedDriver:
         def estimate_context_tokens(
@@ -429,6 +451,11 @@ async def queued_settlement_check(directory, server, descriptor, physical: Drive
         async def complete(self, request: ModelRequest) -> LLMResponse:
             try:
                 return await physical.complete(request)
+            except (RuntimeError, TimeoutError) as error:
+                failure = ModelError.read(error)
+                assert failure is not None
+                driver_failures.append((error, failure, failure.message))
+                raise
             finally:
                 workers.extend(asyncio.create_task(run_file_io(occupy)) for _ in range(4))
                 await occupied.wait()
@@ -466,8 +493,12 @@ async def queued_settlement_check(directory, server, descriptor, physical: Drive
             settlement = failures
             if phase == 'failure':
                 provider_error, settlement_error = failures.exceptions
-                assert isinstance(provider_error, InvalidRequestError)
-                assert provider_error.send_evidence == 'rejected'
+                assert ModelError.matches(provider_error, InvalidRequestError)
+                assert (failure := ModelError.read(provider_error)) is not None and failure.send_evidence == 'rejected'
+                original_error, original_value, original_message = driver_failures[0]
+                assert ModelError.read(original_error) is original_value
+                assert original_value.message == original_message
+                assert failure is not original_value and '已尝试' not in original_message
                 assert 'fixture provider rejection' in str(provider_error)
                 if not reject:
                     assert isinstance(settlement_error, asyncio.CancelledError)
@@ -486,10 +517,16 @@ async def queued_settlement_check(directory, server, descriptor, physical: Drive
         assert record['state'] == ('started' if reject else expected)
         assert record['send_evidence'] == (None if reject else evidence)
         if not reject:
-            assert record['failure'] == {'begin': 'CancelledError', 'failure': 'InvalidRequestError', 'success': None}[phase]
+            if phase == 'failure':
+                assert record['failure'].startswith('InvalidRequestError: ')
+                assert 'fixture provider rejection' in record['failure']
+            else:
+                assert record['failure'] == ('CancelledError' if phase == 'begin' else None)
             try:
                 replayed = await bound.complete(request)
-            except ModelUnavailableError:
+            except (RuntimeError, TimeoutError) as _model_error:
+                if not (ModelError.matches(_model_error, ModelUnavailableError)):
+                    raise
                 assert expected == 'error'
             else:
                 assert expected == 'success' and replayed.content == 'local-result'
@@ -501,6 +538,7 @@ async def queued_settlement_check(directory, server, descriptor, physical: Drive
         return {'case': name, 'occupied_slots': count, 'posts': posts,
                 'state': record['state'], 'send_evidence': record['send_evidence'],
                 'provider_failure_reported': phase == 'failure',
+                'provider_failure_preserved': phase != 'failure' or bool(driver_failures),
                 'settlement_failure_reported': reject}
     finally:
         store.release.set()
@@ -599,7 +637,7 @@ async def scope_checks(directory, server, endpoint):
             receipt = await state.settings.apply(CreateConnectionWithModel(
                 AddConnection(0, name, name, driver.definition().driver_id,
                               endpoint, name, {'api_key': 'local-fixture'}),
-                AddModel(0, name, name, ModelKind.CHAT, 'scenario',
+                AddModel(0, name, name, 'chat', 'scenario',
                          ModelCapabilities(context_window=8192, supports_tool_calls=True),
                          CapabilitySources(context_window='fixture')),
             ))
@@ -656,7 +694,7 @@ async def check(directory, server, endpoint):
     physical = driver._BoundChat(driver._ConnectionConfig(endpoint, 3, 3, 0, False),
                                 Credential(), descriptor, driver._ModelConfig(None, 16), http)
     observations = []
-    for phase in ['begin', 'first-token', 'finish']:
+    for phase in ['begin', 'finish']:
         store = LockedStore(directory / (phase + '.db'), directory / 'backups', phase)
         store.initialize()
         received = []

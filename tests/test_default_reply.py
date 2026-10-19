@@ -6,11 +6,10 @@ import shutil
 import pytest
 from tests.fixtures.plugin_workspace import initialize_plugin_workspace
 from agent.plugin_composition.config_input import save_config
-from agent.plugin_composition.channels import CHANNEL_INPUT_V2 as CHANNEL_INPUT, ChannelInboundMessage
+from plugins.channels.contract import CHANNEL_INPUT_V2 as CHANNEL_INPUT, ChannelInboundMessage
 from agent.plugins.manager import PluginManager
-from bus.event_bus import EventBus
-from session.log import MessageLog
-from session.message import Input, Output, ToolResult
+from plugins.ledger.log import MessageLog
+from plugins.ledger.contract import Input, Output, ToolResult
 
 @asynccontextmanager
 async def live_root(host: PluginManager):
@@ -20,13 +19,16 @@ async def live_root(host: PluginManager):
     yield root
 
 @asynccontextmanager
-async def application(tmp_path, *, replying, start=True, missing_tool=False, discovery=False, compaction=False,
+async def application(tmp_path, *, replying, missing_tool=False, discovery=False, compaction=False,
                       output_tokens=4096, keep_recent_tokens=128, summary_padding=0, provider_effect_data=False,
-                      updates=False, validation_passed=True, extra_sources=None):
+                      updates=False, validation_passed=True, extra_sources=None, shell=False):
     sources = tmp_path / "plugins"
     workspace = tmp_path / "workspace"
     initialize_plugin_workspace(workspace)
+    # 夹具模型只有 10K 上下文；预算由配置固定，不依赖产品默认值。
+    save_config(workspace / "plugin-data/reply-builtin", {"max_output_tokens": output_tokens})
     for name in (
+        "ledger",
         "commands",
         "sources",
         "content",
@@ -36,7 +38,10 @@ async def application(tmp_path, *, replying, start=True, missing_tool=False, dis
         "react",
         "turn_projection",
         "reply_program",
-        *(("reply", "tool_search") if replying else ()),
+        "models",
+        "reply",
+        "standard_tools",
+        *(("tool_search",) if replying else ()),
     ):
         shutil.copytree(
             Path(__file__).parents[1] / "plugins" / name,
@@ -62,8 +67,6 @@ async def application(tmp_path, *, replying, start=True, missing_tool=False, dis
         save_config(settings, {"summary_source": ["compaction", "compaction"]})
         module = sources / "compaction/plugin.py"
         module.write_text(module.read_text().replace('Field(default=20_000,', f'Field(default={keep_recent_tokens},'))
-        reply = sources / 'reply/plugin.py'
-        reply.write_text(reply.read_text().replace('Field(default=4096,', f'Field(default={output_tokens},'))
     if missing_tool:
         settings = tmp_path / "workspace/plugin-data/reply-builtin"
         settings.parent.mkdir(parents=True, exist_ok=True)
@@ -75,8 +78,14 @@ from contextlib import asynccontextmanager
 from functools import partial
 from types import SimpleNamespace
 from pathlib import Path
-from agent.plugin_composition import CHAT_MODELS, ServiceKey
-from agent.plugin_composition.models import BoundModelDescriptor, CapabilitySources, LLMResponse, ModelCapabilities, ToolCall
+from agent.plugin_composition import ServiceKey
+from plugins.models.contract import CHAT_MODELS
+from plugins.models.contract import LLMResponse, ToolCall
+from plugins.models.contract import (
+    BoundModelDescriptor,
+    CapabilitySources,
+    ModelCapabilities,
+)
 from plugins.models.projection import MODEL_CALLS, MODEL_PROJECTION, ProjectionOwner, MODEL_MESSAGE_CHECKS, MessageChecksOwner
 from plugins.models.content import MODEL_CONTENT, ContentOwner
 from plugins.models.selection import MODEL_SELECTION, SelectionOwner
@@ -86,9 +95,9 @@ from plugins.models.store import ModelsStore
 from plugins.tools.api import Result
 from plugins.standard_tools.shell import ShellOwners, shell_cleanup
 from agent.plugin_composition.tasks import TASKS
-from agent.plugin_composition.bindings import BINDINGS
+from plugins.ledger.contract import BINDINGS
 from plugins.tools.plugin import TOOLS
-from session.message import ContentPart
+from plugins.ledger.contract import ContentPart
 api_version = 3
 name = "test_provider"
 version = "1.0.0"
@@ -97,6 +106,7 @@ async def apply(ctx):
     calls = []
     store = ModelsStore(ctx.data_root / "models.db", ctx.data_root / "backups")
     store.initialize()
+    await ctx.effect(lambda: store.close, label="model-store")
     settings = ModelsState(store, context=ctx)
     await ctx.provide(MODEL_SETTINGS, settings.settings)
     class Driver:
@@ -119,7 +129,9 @@ async def apply(ctx):
     class Models:
         @asynccontextmanager
         async def execution(self, *, model_id=None, reasoning_effort=None):
-            yield SimpleNamespace(chat=lambda role: model)
+            # 与正式 models 一致：执行期间调用方切换为提供者自己的 Context。
+            async with ctx.runtime_scope():
+                yield SimpleNamespace(chat=lambda role: model)
     class Target:
         idempotent = False
         async def prepare(self, args, source=None):
@@ -170,55 +182,29 @@ async def apply(ctx):
                 return LLMResponse("\\n".join(heading + "\\nPreserved facts." for heading in HEADINGS))
             business.append(request)
             if len(business) == 1:''').replace("Preserved facts.", "Preserved facts." + "z" * summary_padding))
+    if shell:
+        save_config(workspace / "plugin-data/context-builtin", {"prompt_sources": {"skills": "standard_tools"}})
+        for name in ("host_execution", "assets"):
+            if not (sources / name).exists():
+                shutil.copytree(Path(__file__).parents[1] / "plugins" / name, sources / name,
+                                ignore=shutil.ignore_patterns("__pycache__"))
     if extra_sources is not None:
         extra_sources(sources)
-    from infra.channels.artifacts import ChannelAttachmentArtifactStore
-    from session.artifact_store import ArtifactStore
-
-    log = MessageLog(tmp_path / "sessions.db")
-    artifact_store = ArtifactStore(tmp_path / "sessions.db")
-    artifacts = ChannelAttachmentArtifactStore(
-        workspace=workspace, metadata_store=artifact_store
-    )
-    event_bus = EventBus()
+    from agent.plugins.bundles import set_plugin_choice
+    for name in {"models", *(() if shell else ("standard_tools",)), *(() if replying else ("reply",))}:
+        set_plugin_choice(workspace, name, enabled=False)
     host = PluginManager(
         [sources],
-        event_bus=event_bus,
         workspace=workspace,
         installed_cache_root=tmp_path / "home/cache",
-        message_log=log,
-        channel_attachment_store=artifacts,
     )
     try:
         await host.load_all()
-        if start:
-            await host.start_runtime()
+        from plugins.ledger.contract import MESSAGE_CATALOG
+        log = host.live_root.context.require(MESSAGE_CATALOG)._log
         yield log, host
     finally:
-        termination_error = None
-        try:
-            await host.terminate_all()
-        except BaseException as error:
-            termination_error = error
-        cleanup_errors = []
-        for cleanup in (log.close, artifact_store.close):
-            try:
-                cleanup()
-            except BaseException as error:
-                cleanup_errors.append(error)
-        try:
-            await event_bus.aclose()
-        except BaseException as error:
-            cleanup_errors.append(error)
-        if termination_error is not None:
-            if cleanup_errors:
-                raise BaseExceptionGroup(
-                    "Manager termination and fixture cleanup failed",
-                    [termination_error, *cleanup_errors],
-                ) from termination_error
-            raise termination_error
-        if cleanup_errors:
-            raise BaseExceptionGroup("fixture cleanup failed", cleanup_errors)
+        await host.terminate_all()
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("replying", [False, True])
@@ -300,11 +286,11 @@ async def test_reply_projects_images_by_model_capability(tmp_path, vision, attac
     import io
     from PIL import Image
     from agent.plugin_composition import ServiceKey
-    from agent.plugin_contracts import ContentPart, Control
-    from infra.channels.artifacts import ChannelAttachmentArtifactStore
+    from plugins.ledger.contract import ContentPart, Control
+    from plugins.ledger.attachments import ChannelAttachmentArtifactStore
     from plugins.content.plugin import check_artifact
-    from session.artifact_store import ArtifactStore
-    from session.artifacts import AttachmentKind
+    from plugins.ledger.artifact_store import ArtifactStore
+    from plugins.ledger.contract import AttachmentKind
 
     def vision_provider(sources):
         module = sources / "test_provider/plugin.py"
@@ -315,7 +301,7 @@ async def test_reply_projects_images_by_model_capability(tmp_path, vision, attac
 
     async with application(tmp_path, replying=True, extra_sources=vision_provider) as (log, host):
         # 1. Publish five real image artifacts on separate settled history messages.
-        metadata = ArtifactStore(tmp_path / "sessions.db")
+        metadata = ArtifactStore(tmp_path / "workspace/sessions.db")
         store = ChannelAttachmentArtifactStore(
             workspace=tmp_path / "workspace", metadata_store=metadata,
         )

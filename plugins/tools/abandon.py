@@ -9,8 +9,8 @@ from typing import cast
 from agent.plugin_composition.tasks import TaskAdmission, TaskSlot
 from .api import Denied, MessageReply, Result, durable_call_key
 from .execution import _fingerprint, finish
-from agent.plugin_composition.messages import MessageCatalog, MessageReader, OwnerStore, OwnerTransaction
-from agent.plugin_contracts import CallRef, ContentPart, Control, Message, Output, ToolCall, ToolResult
+from plugins.ledger.contract import MessageCatalog, MessageReader, OwnerStore, OwnerTransaction
+from plugins.ledger.contract import CallRef, ContentPart, Control, Message, Output, ToolCall, ToolResult
 
 
 class LegacyReplyIdentityUnavailable(ValueError):
@@ -61,16 +61,17 @@ async def abandon_call(
                 return target.read(record.value["result"])
             if record.value["phase"] not in {"requested", "prepared", "started"}:
                 raise ValueError("工具回执阶段无效")
-        started = record is not None and record.value["phase"] == "started"
+        # 无阶段回执不能证明未执行；重启后内存 Task 已丢失，仍须保留效果不确定性。
+        may_have_started = record is None or record.value["phase"] == "started"
         def cancel_after_commit(_result: Result) -> None:
             if slot.current is not None:
                 slot.current.cancel()
 
         result = await finish(
             state, key, record,
-            Result("interrupted" if started else "denied", (ContentPart(
-                "text", "用户已放弃此工作；调用已中断，外部效果可能已经发生，不能据此重跑。"
-                if started else "用户已放弃此工作，工具未启动。",
+            Result("interrupted" if may_have_started else "denied", (ContentPart(
+                "text", "用户已放弃此工作；工具可能已部分执行。请先检查当前状态，再决定是否重试。"
+                if may_have_started else "用户已放弃此工作，工具未启动。",
             ),)), target,
             initial={"version": 1, "request": fingerprint, "binding": call.binding_id,
                      "reply_id": target.message_id, "arguments": call.arguments},
@@ -90,7 +91,7 @@ async def follow_abandon(
     """只消费持久 abandon；坏 item 只影响本 Session 的保守 cursor，其余继续推进。"""
     seen: dict[str, int] = {}
     failed: set[str] = set()
-    stream = catalog.follow().__aiter__()
+    stream = catalog.follow(wake_on=Control).__aiter__()
     pending_next: asyncio.Task[Mapping[str, int]] | None = None
     try:
         while True:
@@ -179,5 +180,5 @@ def abandoned_calls(messages: tuple[Message, ...], control: Message) -> tuple[Ca
     return tuple(calls)
 
 
-def reject_start(_transaction: OwnerTransaction) -> None:
+def reject_start(_transaction: OwnerTransaction | None) -> None:
     raise Denied("放弃消费者没有启动工具的权限")

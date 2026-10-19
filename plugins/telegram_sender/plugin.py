@@ -4,7 +4,6 @@ from contextlib import asynccontextmanager
 from typing import Protocol, Self
 from urllib.parse import urlsplit
 
-import aiohttp
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from agent.plugin_composition import (
@@ -12,13 +11,11 @@ from agent.plugin_composition import (
     Context,
     CredentialRef,
 )
-from agent.plugin_composition.artifacts import ARTIFACT_READ
-from agent.plugin_composition.messages import MESSAGE_CATALOG
-from agent.plugin_contracts.delivery import (
+from plugins.ledger.contract import ARTIFACT_READ
+from plugins.ledger.contract import MESSAGE_CATALOG
+from plugins.delivery.contract import (
     DELIVERY_SENDERS as DELIVERY_SENDERS,
 )
-
-from .sender import TelegramSender
 
 api_version = 3
 name = "telegram_sender"
@@ -57,6 +54,10 @@ async def run(ctx: Context) -> None:
         return
     token_ref = config.token
     assert token_ref is not None
+    # aiohttp 与 Telegram 渲染依赖只在启用后加载。
+    import aiohttp
+
+    from .sender import TelegramSender
 
     @asynccontextmanager
     async def open_sender() -> AsyncGenerator[TelegramSender]:

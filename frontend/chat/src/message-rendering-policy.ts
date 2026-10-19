@@ -6,7 +6,8 @@ export interface MessageRenderingFeatures {
 const fencedCodePattern = /^\s{0,3}(`{3,}|~{3,})([^\n]*)$/gm;
 const blockMathPattern = /(^|\n)\s*\$\$[\s\S]*?\$\$\s*(?=\n|$)/m;
 const inlineMathPattern = /(^|[^\\$])\$[^\s$](?:[^$\n]*?[^\s$])?\$(?!\$)/m;
-const markdownSyntaxPattern = /(^|\n)\s{0,3}(?:#{1,6}\s|>|[-+*]\s|\d+[.)]\s|```|~~~|(?:-{3,}|_{3,}|\*{3,})\s*$)|!?(?:\[[^\]]+\]\([^\n)]+\))|`[^`\n]+`|\*\*|__|~~|https?:\/\/|<\/?[a-z][^>]*>/im;
+// 脚注只认行首的定义"[^x]:"：孤立的"[^x]"没有定义就是普通文字，不能为它换掉纯文本的换行保留。
+const markdownSyntaxPattern = /(^|\n)\s{0,3}(?:#{1,6}\s|>|[-+*]\s|\d+[.)]\s|```|~~~|(?:-{3,}|_{3,}|\*{3,})\s*$|\[\^[^\]\s]+\]:)|!?(?:\[[^\]]+\]\([^\n)]+\))|`[^`\n]+`|\*\*|__|~~|https?:\/\/|<\/?[a-z][^>]*>/im;
 
 /** Detect rich Markdown features so expensive renderers load only when needed. */
 export function detectMessageRenderingFeatures(markdown: string): MessageRenderingFeatures {
@@ -47,4 +48,18 @@ export function canBatchStreamingMarkdown(
   return batchCharacters > 1
     && next.startsWith(previous)
     && next.length - previous.length < batchCharacters;
+}
+
+/** 工具值只解析完整 JSON 对象或数组；普通字符串保持字面含义。 */
+export function readToolData(value: unknown): unknown {
+  if (typeof value !== "string" || !/^\s*[\[{]/u.test(value)) return value;
+  try { return JSON.parse(value) as unknown; }
+  catch (error) { if (error instanceof SyntaxError) return value; throw error; }
+}
+
+/** 复制保留原字符串；结构化工具值使用完整 JSON，不把空值丢掉。 */
+export function toolDataText(value: unknown): string {
+  if (value === undefined) return "";
+  if (typeof value === "string") return value;
+  return JSON.stringify(value, null, 2);
 }

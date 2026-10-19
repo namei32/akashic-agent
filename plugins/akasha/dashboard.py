@@ -8,18 +8,19 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query
 
 from agent.plugin_composition import DashboardContext
-from agent.plugin_composition.messages import MESSAGE_CATALOG
-from agent.plugin_contracts import ContentPart, Message
+from plugins.ledger.contract import MESSAGE_CATALOG
+from plugins.ledger.contract import ContentPart, Message
 
 from . import ledger
-from .plugin import AKASHA_MEMORY_PATH, AKASHA_RECORDS_VIEW
-from .recalls import ContextSource, Hit, ProgramSource, Recall, RecallRecordsRead, ToolSource
+from .plugin import AKASHA_MEMORY_PATH
+from .contract import AKASHA_RECORDS_VIEW, RecallRecordsRead
+from .contract import ContextSource, Hit, ProgramSource, Recall, ToolSource
 
 
-from agent.plugin_contracts.configuration import register_routes
+from plugins.ui.contract import UI
 from .settings import SETTINGS
 
-inject = (SETTINGS, AKASHA_RECORDS_VIEW, AKASHA_MEMORY_PATH, MESSAGE_CATALOG)
+inject = (UI, SETTINGS, AKASHA_RECORDS_VIEW, AKASHA_MEMORY_PATH, MESSAGE_CATALOG)
 
 
 def _records(context: DashboardContext) -> RecallRecordsRead:
@@ -145,7 +146,7 @@ def _row(identity: str, recall: Recall, context: DashboardContext, *, full_text:
 
 def register(app: FastAPI, context: DashboardContext) -> None:
     """Register read-only routes over the learned turns, Recall and the Message log."""
-    register_routes(app, context, SETTINGS, "/api/dashboard/akasha/config")
+    context.require(UI).register_configuration(app, context, SETTINGS, "/api/dashboard/akasha/config")
 
     @app.get("/api/dashboard/akasha-ledger/overview")
     async def get_ledger_overview() -> dict[str, object]:

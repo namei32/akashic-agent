@@ -15,25 +15,24 @@ os.chdir(ROOT)
 
 from scripts.build_plugin_distribution import _bundle_plugin
 from scripts.distribution_runtime import prepare_wheels
-from session.log import MessageLog
-from session.message import Input
+from plugins.ledger.log import MessageLog
+from plugins.ledger.contract import Input
 from scripts.install_plugin_distribution import (
-    install_profile,
-    ensure_profile,
+    install_bundle,
+    ensure_bundle,
     _write_receipt,
     publish_distribution,
 )
 from agent.plugins.install import install_git_plugin
 from agent.migrations.runner import MigrationRunner
 from agent.plugins.manager import PluginManager
+from agent.plugin_composition.config_input import load_config
 from agent.plugins.manifest import (
-    load_plugin_manifest,
-    set_plugin_enabled,
     workspace_plugin_data_dir,
 )
-from agent.plugins.distribution_sources import distribution_sources
+from agent.plugins.bundles import set_plugin_choice, plugin_choices, load_bundle
+from agent.plugins.distribution_sources import distribution_sources, DistributionSources
 from agent.plugins.selection import PluginSelection
-from bus.event_bus import EventBus
 
 
 def git(repo, *args):
@@ -84,17 +83,13 @@ def migration(repo, name, migration_id, body):
     code = "from yoyo import step\n" + body
     (package / f"{migration_id}.py").write_text(code)
     files = sorted(package.glob("*.py"))
-    catalog = (f'schema_version = 1\nbundle_id = "{name}"\nversion = "1"\n'
+    catalog = (f'schema_version = 2\nbundle_id = "{name}"\nversion = "1"\n'
                f'migration_root = "{package_name}"\npackage_name = "{package_name}"\n')
-    for file in files:
-        digest = hashlib.sha256(file.read_bytes()).hexdigest()
-        catalog += f'\n[[files]]\npath = "{file.name}"\nsha256 = "{digest}"\n'
     for file in files:
         if file.name == "__init__.py":
             continue
-        digest = hashlib.sha256(file.read_bytes()).hexdigest()
         catalog += (f'\n[[migrations]]\nid = "{file.stem}"\npath = "{file.name}"\n'
-                    f'depends = []\ntransactional = true\nsha256 = "{digest}"\n')
+                    f'depends = []\ntransactional = true\n')
     (plugin_root / "migration.catalog.toml").write_text(catalog)
 
 
@@ -104,22 +99,15 @@ def distribution(repo, out, names, defaults):
     stamp = git(repo, "show", "-s", "--format=%cI", sha)
     rows = [_bundle_plugin(repo, sha, stamp, "plugins/" + n, out, set()) for n in names]
     (out / "core.tar").write_bytes(b"isolated fixture core identity")
-    profile = {
-        "schema_version": 1,
-        "name": "scenario",
-        "marketplace": "release",
-        "description": "isolated",
-        "initialization": {
-            "plugin_configs": [{"owner": "alpha", "config": {"user": "initial"}}]
-        },
-        "plugins": [
-            {"name": n, "depends_on": [], "reason": "isolated"} for n in defaults
-        ],
-    }
-    (out / "profiles").mkdir()
-    (out / "profiles/default.json").write_text(json.dumps(profile))
+    bundle = ['schema_version = 1', '[rows]']
+    for name in defaults:
+        bundle.extend([f'[rows."{name}"]', f'plugin = "{name}@release"'])
+        if name == "alpha":
+            bundle.append('config = {user = "initial"}')
+    (out / "bundles").mkdir()
+    (out / "bundles/base.toml").write_text("\n".join(bundle))
     report = {
-        "schema_version": 2,
+        "schema_version": 3,
         "source_commit": sha,
         "source_tree": git(repo, "rev-parse", "HEAD^{tree}"),
         "core": {
@@ -127,17 +115,46 @@ def distribution(repo, out, names, defaults):
             "sha256": hashlib.sha256((out / "core.tar").read_bytes()).hexdigest(),
         },
         "plugins": rows,
-        "profiles": [
+        "marketplace": "release",
+        "bundles": [
             {
-                "path": "profiles/default.json",
+                "path": "bundles/base.toml",
                 "sha256": hashlib.sha256(
-                    (out / "profiles/default.json").read_bytes()
+                    (out / "bundles/base.toml").read_bytes()
                 ).hexdigest(),
             }
         ],
     }
     (out / "distribution.json").write_text(json.dumps(report))
     return out
+
+
+def install_legacy_cache(dist, bundle, *, workspace, plugins_home, config_path):
+    """真实安装旧 cache 布局，保留逐个 Git 安装产生的来源事实。"""
+    receipt = install_bundle(dist, bundle, workspace=workspace, plugins_home=plugins_home, config_path=config_path)
+    report = json.loads((dist / "distribution.json").read_text())
+    artifacts = {row["name"]: row for row in report["plugins"]}
+    previous = os.environ.get("AKASHIC_PLUGIN_DISTRIBUTION")
+    os.environ["AKASHIC_PLUGIN_DISTRIBUTION"] = str(dist)
+    try:
+        for row in load_bundle(bundle):
+            if row.disabled:
+                continue
+            artifact = artifacts[row.plugin.split("@")[0]]
+            result = install_git_plugin(workspace=workspace, source=str(dist / artifact["file"]),
+                marketplace=report["marketplace"], ref_name=artifact["source_revision"], plugins_home=plugins_home)
+            receipt["installed"].append({"name": result.plugin_name, "marketplace": result.marketplace,
+                "source_revision": result.source_revision, "installed_path": str(result.installed_path),
+                "data_path": str(result.data_path)})
+    finally:
+        if previous is None:
+            os.environ.pop("AKASHIC_PLUGIN_DISTRIBUTION")
+        else:
+            os.environ["AKASHIC_PLUGIN_DISTRIBUTION"] = previous
+    receipt["schema_version"] = 1
+    receipt["formal_installer"] = "agent.plugins.install.install_git_plugin"
+    receipt["profile"] = receipt.pop("bundle")
+    return receipt
 
 
 def snapshot(path):
@@ -152,23 +169,70 @@ def selected(workspace):
     s = PluginSelection(workspace)
     r = s.read()
     return {
-        s.archive.read_descriptor(c)["plugin_id"]: (c, s.archive.read_descriptor(c))
-        for c in s.archive.read_descriptor(r)["components"]
+        s.read_input(c)["plugin_id"]: (c, s.read_input(c))
+        for c in s.components(r)
     }
 
 
 async def manager(workspace, home, dist=None):
-    ds = distribution_sources(workspace, home, dist) if dist else None
+    ds = distribution_sources(workspace, home, dist) if dist else DistributionSources()
     m = PluginManager(
         [],
-        event_bus=EventBus(),
         workspace=workspace,
         installed_cache_root=home / "cache",
-        distribution_sources=ds.sources if ds else (),
-        ignored_installed_roots=ds.ignored_installed_roots if ds else frozenset(),
+        distribution=ds,
     )
     await m.load_all()
     return m
+
+
+def seed_and_check_preflight(core, root, distribution, work, home, config):
+    """旧 Core 生成真实选择，新发布 CLI 接受它并拒绝归档损坏。"""
+    seed = """import asyncio, sys
+from pathlib import Path
+from agent.plugins.manager import PluginManager
+async def run():
+    m = PluginManager([], workspace=Path(sys.argv[1]),
+                      installed_cache_root=Path(sys.argv[2]) / 'cache')
+    await m.load_all()
+    await m.terminate_all()
+asyncio.run(run())
+"""
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join((str(core), str(core / "sdk/python/src")))}
+    with (root / "seed.log").open("w") as output:
+        subprocess.run([sys.executable, "-c", seed, str(work), str(home)], cwd=root,
+                       env=env, stdout=output, stderr=output, check=True, timeout=60)
+    plan = root / "seed-plan.json"
+    plan.write_text(json.dumps({"schema_version": 1,
+                               "expected_root_ref": PluginSelection(work).read(), "targets": []}))
+    command = [sys.executable, str(ROOT / "scripts/install_plugin_distribution.py"),
+               "--publish", "--preflight-only", "--distribution", str(distribution),
+               "--bundle", str(distribution / "bundles/base.toml"),
+               "--workspace", str(work), "--plugins-home", str(home),
+               "--config", str(config), "--plan", str(plan), "--inputs", str(root)]
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join((str(ROOT), str(ROOT / "sdk/python/src")))}
+    before = snapshot(work.parent)
+    with (root / "seed-preflight.log").open("w") as output:
+        subprocess.run(command, env=env, stdout=output, stderr=output, check=True, timeout=60)
+    assert snapshot(work.parent) == before
+    selection = PluginSelection(work)
+    descriptor = selected(work)["alpha@release"][1]
+    code = Path(descriptor["code"])
+    # 运行代码和来源证据的损坏都必须被同一个完整归档校验拒绝。
+    for filename in ("plugin.py", ".akashic-source.json"):
+        path = code / filename
+        content = path.read_bytes()
+        mode = path.stat().st_mode & 0o777
+        path.chmod(mode | 0o200)
+        try:
+            path.write_bytes(content + b"\n# altered archive\n")
+            result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=60)
+            (root / f"corrupt-{filename.lstrip('.')}.log").write_text(result.stdout + result.stderr)
+            assert result.returncode != 0 and "selected 源码身份不一致: alpha@release" in result.stderr
+        finally:
+            path.write_bytes(content)
+            path.chmod(mode)
+        assert snapshot(work.parent) == before
 
 
 async def run(args):
@@ -213,9 +277,9 @@ async def run(args):
         check=True,
         stdout=subprocess.DEVNULL,
     )
-    r = install_profile(
+    r = install_legacy_cache(
         old,
-        old / "profiles/default.json",
+        old / "bundles/base.toml",
         workspace=work,
         plugins_home=home,
         config_path=config,
@@ -226,7 +290,9 @@ async def run(args):
         config_path=config,
         workspace=work,
     ).run()
-    # Real legacy Manager creates the durable old selection.
+    if args.seed_core:
+        seed_and_check_preflight(args.seed_core.resolve(), root, old, work, home, config)
+    # Real Manager reads the durable selection and applies a config update.
     m = await manager(work, home)
     await m.apply_config_input(
         "alpha@release",
@@ -236,7 +302,7 @@ async def run(args):
     )
     await m._operation.task
     await m.terminate_all()
-    set_plugin_enabled("disabled@release", enabled=False, plugins_home=home)
+    set_plugin_choice(work, "disabled@release", enabled=False)
     # Preserve bytes for all business state, cache and first receipt.
     for n in oldnames:
         (workspace_plugin_data_dir(work, n, "release") / "sentinel.bin").write_bytes(
@@ -295,9 +361,9 @@ async def run(args):
     )
     if args.with_wheels:
         prepare_wheels(new)
-    result = ensure_profile(
+    result = ensure_bundle(
         new,
-        new / "profiles/default.json",
+        new / "bundles/base.toml",
         workspace=work,
         plugins_home=home,
         config_path=config,
@@ -329,9 +395,9 @@ async def run(args):
         == json.loads((new / "distribution.json").read_text())["source_commit"]
     )
     stable = PluginSelection(work).read()
-    ensure_profile(
+    ensure_bundle(
         new,
-        new / "profiles/default.json",
+        new / "bundles/base.toml",
         workspace=work,
         plugins_home=home,
         config_path=config,
@@ -347,11 +413,11 @@ async def run(args):
     }
     assert m.generation("optional@release").instance.version == "2"
     # Existing enable is a durable choice applied by normal deployment/startup.
-    set_plugin_enabled("disabled@release", enabled=True, plugins_home=home)
+    set_plugin_choice(work, "disabled@release", enabled=True)
     await m.terminate_all()
-    ensure_profile(
+    ensure_bundle(
         new,
-        new / "profiles/default.json",
+        new / "bundles/base.toml",
         workspace=work,
         plugins_home=home,
         config_path=config,
@@ -359,14 +425,14 @@ async def run(args):
     )
     m = await manager(work, home, new)
     assert m.generation("disabled@release").instance.version == "2"
-    set_plugin_enabled("alpha@release", enabled=False, plugins_home=home)
+    set_plugin_choice(work, "alpha@release", enabled=False)
     await m.reconcile_changed()
     assert m.generation("alpha@release") is None
-    set_plugin_enabled("alpha@release", enabled=True, plugins_home=home)
+    set_plugin_choice(work, "alpha@release", enabled=True)
     await m.terminate_all()
-    ensure_profile(
+    ensure_bundle(
         new,
-        new / "profiles/default.json",
+        new / "bundles/base.toml",
         workspace=work,
         plugins_home=home,
         config_path=config,
@@ -396,15 +462,15 @@ async def run(args):
             ".",
         )
         assert subprocess.check_output(command, text=True).strip() == "25.0"
-    ref = m.generation("alpha@release").archive_ref
-    assert m._archive.read_descriptor(ref)["python_environments"]
+    ref = m.generation("alpha@release").input_ref
+    assert m._selection.read_input(ref)["python_environments"]
     await m.uninstall("newcomer@release")
     await m._operation.task
-    assert load_plugin_manifest(home)["newcomer@release"] is False
+    assert plugin_choices(work)["newcomer@release"] is False
     await m.terminate_all()
-    ensure_profile(
+    ensure_bundle(
         new,
-        new / "profiles/default.json",
+        new / "bundles/base.toml",
         workspace=work,
         plugins_home=home,
         config_path=config,
@@ -443,15 +509,49 @@ async def run(args):
         inputs=root,
     )
     assert pub["new_root_ref"] == json.loads(plan.read_text())["expected_root_ref"]
+    # Core 更新使用当前镜像路径；配置、依赖和外置插件选择保持不变。
+    refs_before = selected(work)
+    environments_before = snapshot(work / "runtime/plugin-python-environments")
+    (repo / "core-only.txt").write_text("new Core, unchanged plugins\n")
+    core_only = distribution(repo, root / "core-only", ["alpha", "disabled", "optional", "newcomer"],
+                             ["alpha", "disabled", "newcomer"])
+    if args.with_wheels:
+        prepare_wheels(core_only)
+    ensure_bundle(core_only, core_only / "bundles/base.toml", workspace=work, plugins_home=home,
+                   config_path=config, receipt_path=receipt)
+    current_inputs = selected(work)
+    assert current_inputs["outside@thirdparty"] == refs_before["outside@thirdparty"]
+    for plugin_id, (_, descriptor) in current_inputs.items():
+        if descriptor["source_type"] == "builtin":
+            assert Path(descriptor["code"]) == core_only / "sources" / plugin_id.split("@")[0]
+            assert descriptor["config_revision"] == refs_before[plugin_id][1]["config_revision"]
+            assert descriptor["python_environments"] == refs_before[plugin_id][1]["python_environments"]
+    assert snapshot(work / "runtime/plugin-python-environments") == environments_before
+    # Changed plugin source gets a new input without rebuilding unchanged dependencies.
+    requirements_before = (repo / "plugins/alpha/requirements.txt").read_bytes()
+    plugin(repo, "alpha", "3")
+    (repo / "plugins/alpha/requirements.txt").write_bytes(requirements_before)
+    code_changed = distribution(repo, root / "code-changed", ["alpha", "disabled", "optional", "newcomer"],
+                                ["alpha", "disabled", "newcomer"])
+    if args.with_wheels:
+        prepare_wheels(code_changed)
+    ensure_bundle(code_changed, code_changed / "bundles/base.toml", workspace=work, plugins_home=home,
+                   config_path=config, receipt_path=receipt)
+    changed = selected(work)
+    assert changed["alpha@release"][0] != refs_before["alpha@release"][0]
+    assert changed["alpha@release"][1]["python_environments"] == refs_before["alpha@release"][1]["python_environments"]
+    assert snapshot(work / "runtime/plugin-python-environments") == environments_before
+    assert changed["outside@thirdparty"] == refs_before["outside@thirdparty"]
+    assert Path(changed["optional@release"][1]["code"]) == code_changed / "sources/optional"
     # Corrupt new image bytes are rejected before any selection change.
     before = PluginSelection(work).read()
     entry = new / "sources/alpha/plugin.py"
     original = entry.read_bytes()
     entry.write_text("def invalid(:\n")
     try:
-        ensure_profile(
+        ensure_bundle(
             new,
-            new / "profiles/default.json",
+            new / "bundles/base.toml",
             workspace=work,
             plugins_home=home,
             config_path=config,
@@ -470,7 +570,7 @@ async def run(args):
         work / "opaque-business.db"
     ).read_bytes() == b"not-a-database: do not inspect or rewrite"
     # 新发行版自动先迁移；显式停用不影响内置数据升级。
-    set_plugin_enabled("disabled@release", enabled=False, plugins_home=home)
+    set_plugin_choice(work, "disabled@release", enabled=False)
     expected_bytes = PluginSelection(work).path.read_bytes()
     migration(repo, "alpha", "scenario_alpha_upgrade", f"""
 import json
@@ -492,20 +592,20 @@ step(upgrade)
                             ["alpha", "disabled", "newcomer"])
     if args.with_wheels:
         prepare_wheels(migrated)
-    ensure_profile(migrated, migrated / "profiles/default.json", workspace=work, plugins_home=home,
+    ensure_bundle(migrated, migrated / "bundles/base.toml", workspace=work, plugins_home=home,
                    config_path=config, receipt_path=receipt)
     assert "disabled@release" not in selected(work)
     assert selected(work)["outside@thirdparty"][0] == external_before
-    from agent.plugin_composition.archive import decode_config
-    assert decode_config(selected(work)["alpha@release"][1]["config"])["upgraded"] is True
+    from agent.plugin_composition.config_input import decode_config
+    assert load_config(work / "plugin-data/alpha-release")[0]["upgraded"] is True
     with sqlite3.connect(work / "migrations.sqlite3") as ledger:
         assert ledger.execute("SELECT COUNT(*) FROM scenario_alpha_done").fetchone() == (1,)
         assert ledger.execute("SELECT COUNT(*) FROM scenario_disabled_done").fetchone() == (0,)
     # 模拟迁移已成功而组合尚未提交；重试仍收录已迁移配置，不重跑 step。
     PluginSelection(work).path.write_bytes(expected_bytes)
-    ensure_profile(migrated, migrated / "profiles/default.json", workspace=work, plugins_home=home,
+    ensure_bundle(migrated, migrated / "bundles/base.toml", workspace=work, plugins_home=home,
                    config_path=config, receipt_path=receipt)
-    assert decode_config(selected(work)["alpha@release"][1]["config"])["upgraded"] is True
+    assert load_config(work / "plugin-data/alpha-release")[0]["upgraded"] is True
     # 正常 runtime 启动也只检查当前发行版，不解析外置 catalog。
     previous_distribution = os.environ.get("AKASHIC_PLUGIN_DISTRIBUTION")
     os.environ["AKASHIC_PLUGIN_DISTRIBUTION"] = str(migrated)
@@ -530,7 +630,11 @@ step(upgrade)
     preflight = publish_distribution(distribution=published, workspace=work, plugins_home=home,
                                     config_path=config, plan=plan, inputs=root, preflight_only=True)
     assert preflight["migration_ids"] == ["scenario_publish_upgrade"]
-    assert snapshot(state) == before_preflight
+    after_preflight = snapshot(state)
+    assert {k: v for k, v in after_preflight.items()
+            if not k.startswith(("workspace/runtime/plugin-archives/", "workspace/runtime/plugin-python-environments/"))} == {
+        k: v for k, v in before_preflight.items()
+        if not k.startswith(("workspace/runtime/plugin-archives/", "workspace/runtime/plugin-python-environments/"))}
     publish_distribution(distribution=published, workspace=work, plugins_home=home,
                          config_path=config, plan=plan, inputs=root)
     migration(repo, "optional", "scenario_failed_upgrade",
@@ -541,7 +645,7 @@ step(upgrade)
         prepare_wheels(failed)
     before_failure = PluginSelection(work).read()
     try:
-        ensure_profile(failed, failed / "profiles/default.json", workspace=work, plugins_home=home,
+        ensure_bundle(failed, failed / "bundles/base.toml", workspace=work, plugins_home=home,
                        config_path=config, receipt_path=receipt)
     except RuntimeError as error:
         assert "expected migration failure" in str(error)
@@ -559,6 +663,7 @@ step(upgrade)
     assert runner.check() == ("scenario_core_upgrade",)
     assert runner.run().migrations == ("scenario_core_upgrade",)
     assert runner.run().state == "current"
+    assert not (work / "runtime/plugin-archives").exists()
     print(
         "PASS update/removal/optional/default/disabled/config/external/byte-preservation/restart/enable/environment/uninstall/preflight/publish/failure/core-yoyo/builtin-yoyo/external-exclusion/migration-retry",
         flush=True,
@@ -570,6 +675,8 @@ step(upgrade)
                 "candidate_checkout": str(ROOT),
                 "source_identity": identity,
                 "with_wheels": args.with_wheels,
+                "seed_core": str(args.seed_core.resolve()) if args.seed_core else None,
+                "cross_version_preflight": bool(args.seed_core),
                 "scenarios": 24,
             },
             indent=2,
@@ -581,5 +688,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--with-wheels", action="store_true")
+    parser.add_argument("--seed-core", type=Path, help="用旧 Core 生成已选归档后验证新发布 CLI")
     args = parser.parse_args()
     asyncio.run(run(args))

@@ -6,15 +6,15 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
-from agent.plugin_contracts import ContentPart
-from agent.plugin_contracts.tools import (
+from plugins.ledger.contract import ContentPart
+from plugins.tools.contract import (
     TOOLS as TOOLS,
     CallSource as CallSource,
     ToolCatalog as ToolCatalog,
-    ToolPresentation as ToolPresentation,
     ToolRef as ToolRef,
     ToolView as ToolView,
 )
+from plugins.tools.contract import ToolPresentation as ToolPresentation
 
 ToolOutcome = Literal["success", "denied", "error", "interrupted"]
 

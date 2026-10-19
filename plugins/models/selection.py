@@ -1,9 +1,9 @@
 from collections.abc import Mapping, MutableMapping, Sequence
 from typing import cast
 
-from agent.plugin_composition.models import ChatModelSelection
-from agent.plugin_contracts import ContentPart, ContentReferences, Input, Message
-from agent.plugin_contracts.models import MODEL_SELECTION as MODEL_SELECTION
+from plugins.models.contract import ChatModelSelection
+from plugins.ledger.contract import ContentPart, ContentReferences, Input, Message
+from plugins.models.contract import MODEL_SELECTION as MODEL_SELECTION
 
 SESSION_MODEL_SELECTION_KEY = "model_selection"
 LEGACY_MODEL_OVERRIDE_KEY = "model_runtime_override"

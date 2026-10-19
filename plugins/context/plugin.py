@@ -9,22 +9,25 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agent.plugin_composition import Context
-from agent.plugin_composition.models import ModelRequest
-from agent.plugin_contracts import (
+from plugins.ledger.contract import MessageSnapshot
+from plugins.models.contract import ContextModel, ModelRequest
+from plugins.ledger.contract import (
     Message,
 )
-from agent.plugin_contracts.context import (
+from plugins.context.contract import (
+    output_reserve,
     CONTEXT as CONTEXT,
+    CONTEXT_NOTICE_DISPLAY,
     MATERIALS_V4,
+    MaterialData,
 )
 
 from .api import (
-    ContextModel,
     ContextOverflow,
-    MaterialData,
     Materials,
     Summary,
     check_summary,
+    check_notice,
     decode_material,
     settled_prefixes,
     summary_range,
@@ -58,10 +61,10 @@ class Config(BaseModel):
         return value
 
 
-def _summary_cutoff(snapshot: tuple[Message, ...], summary: Summary | None) -> int:
+def _summary_cutoff(snapshot: Sequence[Message], summary: Summary | None) -> int:
     """摘要代替已选择窗口的旧区间，窗口外更早历史不进入请求。"""
     # 1. 在快照输入边界拒绝混合 Session、重排与重复身份。
-    if snapshot:
+    if snapshot and type(snapshot) is not MessageSnapshot:
         session = snapshot[0].session_id
         if any(item.session_id != session for item in snapshot):
             raise ValueError("Context 快照只能属于一个 Session")
@@ -81,12 +84,14 @@ def _summary_cutoff(snapshot: tuple[Message, ...], summary: Summary | None) -> i
 
 class ContextBuilder:
     check_summary = staticmethod(check_summary)
+    check_notice = staticmethod(check_notice)
     summary_range = staticmethod(summary_range)
     settled_prefixes = staticmethod(settled_prefixes)
 
     @staticmethod
-    def _reminder_content(materials: Materials) -> str | None:
-        reminders = [escape(part.text, quote=False) for part in materials.reminders if part.text.strip()]
+    def _reminder_content(materials: Materials, *, replay: bool = True) -> str | None:
+        reminders = [escape(part.text, quote=False) for part in materials.reminders
+                     if part.replay is replay and part.text.strip()]
         if not reminders:
             return None
         return (
@@ -98,7 +103,7 @@ class ContextBuilder:
 
     @staticmethod
     def reminder_content(materials: MaterialData) -> str | None:
-        """返回本次请求实际使用的末尾 reminder 正文。"""
+        """返回本次请求实际使用的可回放 reminder 正文。"""
         return ContextBuilder._reminder_content(decode_material(materials))
 
     def build(
@@ -117,12 +122,17 @@ class ContextBuilder:
             raise ValueError("输出预算必须是非负整数")
         decoded_materials = decode_material(materials)
         # 1. Model owner 保留自身的 call IDs 与 opaque replay，Context 不重造它们。
-        snapshot = tuple(snapshot)
+        # 存储已证明 Session、身份和顺序；普通调用输入仍在本边界固定并校验。
+        if type(snapshot) is not MessageSnapshot:
+            snapshot = tuple(snapshot)
         cutoff = _summary_cutoff(snapshot, decoded_materials.summary)
         reminder = self._reminder_content(decoded_materials)
         if reminder is None:
             current_reminder_input_id = None
         replay_reminder = reminder if current_reminder_input_id is not None else None
+        current_context = self._reminder_content(decoded_materials, replay=False)
+        # 无 Input 身份的调用者仍自行追加材料，不能把它认成已保存的 replay。
+        projected_context = current_context if reminder is None or replay_reminder is not None else None
         if window_start is not None:
             if decoded_materials.summary is not None:
                 raise ValueError("已有摘要的请求不能重新选择首次窗口")
@@ -139,6 +149,7 @@ class ContextBuilder:
                 fresh=True,
                 current_reminder=replay_reminder,
                 current_reminder_input_id=current_reminder_input_id,
+                current_context=projected_context,
             )
         else:
             rendered = model.render(
@@ -146,6 +157,7 @@ class ContextBuilder:
                 summary_reference=None if decoded_materials.summary is None else decoded_materials.summary.reference,
                 current_reminder=replay_reminder,
                 current_reminder_input_id=current_reminder_input_id,
+                current_context=projected_context,
             )
         if any(
             row["role"] not in {"user", "assistant", "tool"}
@@ -171,11 +183,16 @@ class ContextBuilder:
                 }
             )
         rows.extend(rendered.messages)
-        if reminder is not None:
+        if reminder is not None and replay_reminder is None:
             rows.append({"role": "user", "content": reminder})
+        if current_context is not None and projected_context is None:
+            # Live materials never enter replay facts or overwrite a user Input.
+            rows.append({"role": "user", "content": current_context})
         request = replace(
             rendered,
             messages=rows,
+            # Opaque provider sessions can retain rules omitted from replay facts.
+            continuation=None if current_context is not None else rendered.continuation,
             tools=tools,
             system_prompt="",
             max_output_tokens=max_output_tokens,
@@ -184,11 +201,12 @@ class ContextBuilder:
         if model.max_tool_schemas is not None and len(tools) > model.max_tool_schemas:
             raise ValueError("可见工具数量超过模型容量")
         estimated = model.estimate(request)
-        if (
-            model.context_window is not None
-            and estimated + max_output_tokens > model.context_window
-        ):
-            raise ContextOverflow(estimated, max_output_tokens, model.context_window, request=request)
+        window = model.context_window
+        if window is not None and estimated + output_reserve(max_output_tokens, window) > window:
+            raise ContextOverflow(estimated, output_reserve(max_output_tokens, window), window, request=request)
+        # 与 Pi 的 clampMaxTokensToContext 一致：输入接近窗口时收紧本次输出上限，而不是缩输入。
+        if window is not None and estimated + max_output_tokens > window:
+            request = replace(request, max_output_tokens=window - estimated)
         return request
 
     def build_attempt(
@@ -216,5 +234,10 @@ class ContextBuilder:
 async def apply(ctx: Context) -> None:
     config = Config.model_validate(ctx.config)
     _ = await ctx.provide(CONTEXT, ContextBuilder())
+    def display_notice(part):
+        _ = check_notice(part)
+        return {"text": part.value}
+
+    _ = await ctx.provide(CONTEXT_NOTICE_DISPLAY, display_notice)
     materials = ContextMaterials(ctx, prompt_sources=config.prompt_sources, summary_source=config.summary_source or None)
     _ = await ctx.provide(MATERIALS_V4, materials, binding_contributors=materials.binding_contributors)

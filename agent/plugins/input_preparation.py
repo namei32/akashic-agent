@@ -1,4 +1,4 @@
-"""Build one fixed plugin input before a runtime generation exists."""
+"""准备当前安装输入，不复制插件运行代码。"""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Literal, cast
 
 from agent.plugin_composition.config_input import load_config, config_bytes, CONFIG_INPUT
-from agent.plugin_composition.archive import PluginArchive, encode_config
+from agent.plugins.selection import PluginSelection
 from agent.plugins.manifest import (
     validate_workspace_plugin_data_path,
     workspace_plugin_data_dir,
@@ -20,21 +20,27 @@ from agent.plugins.manifest import (
 from agent.plugins.python_environment import ENVIRONMENT_FILE, PythonEnvironments, read_environment_refs
 from agent.plugins.static_manifest import (
     PluginSourceCompileError,
-    PluginSourceContentError,
     StaticPluginManifest,
     load_static_plugin_manifest,
 )
 
-PLUGIN_ARCHIVE_BINDING_API = 3
+PLUGIN_INPUT_API = 3
+# watcher 与运行变化比较共用排除规则；安装来源摘要仍包含来源标签。
+SOURCE_EXCLUDED_NAMES = frozenset({
+    ".git", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".venv",
+    "__pycache__", "node_modules", ENVIRONMENT_FILE, ".akashic-source.json",
+})
+_SOURCE_LABEL = ".akashic-source.json"
 
 
 @dataclass(frozen=True, slots=True)
 class PreparedPluginInput:
-    """The archived input and source facts used by one runtime generation."""
+    """一次加载的安装路径、配置与来源事实。"""
 
     plugin_id: str
-    archive_ref: str
+    input_ref: str
     source_revision: str
+    runtime_revision: str
     config_revision: str
     config: dict[str, object]
     static_manifest: StaticPluginManifest
@@ -45,9 +51,9 @@ class PreparedPluginInput:
 
 
 def prepare_plugin_input(
-    mod: Mapping[str, str], *, workspace: Path, archive: PluginArchive, initial: bool = False,
+    mod: Mapping[str, str], *, workspace: Path, selection: PluginSelection, initial: bool = False,
 ) -> PreparedPluginInput:
-    """Check, compile, and archive one source without loading its module."""
+    """校验并编译已安装源码，不提前导入模块。"""
 
     # 1. Check the discovered source identity and read its current config.
     plugin_id = _resolve_plugin_id(mod)
@@ -60,7 +66,7 @@ def prepare_plugin_input(
     identity = load_static_plugin_manifest(plugin_dir)
     if mod.get("manifest_digest", "") != identity.identity_digest:
         raise RuntimeError("source discovery identity 已漂移")
-    revision = _source_revision(plugin_dir)
+    revision, runtime_revision = source_revisions(plugin_dir)
     data_dir = _resolve_plugin_data_dir(mod["name"], mod, workspace)
     validate_workspace_plugin_data_path(data_dir, workspace)
     config, config_revision = load_config(data_dir)
@@ -73,17 +79,8 @@ def prepare_plugin_input(
             raise ValueError("初始配置必须是映射")
         config_revision = hashlib.sha256(config_bytes(config)).hexdigest()
 
-    # 2. Fix the code tree, read its manifest, and compile every Python file.
-    code_ref = archive.save(
-        plugin_dir, exclude=frozenset({".venv", "node_modules", ENVIRONMENT_FILE}),
-    )
-    code_dir = archive.open(code_ref)
-    try:
-        archived_identity = load_static_plugin_manifest(code_dir)
-    except PluginSourceContentError as error:
-        raise RuntimeError("插件归档静态身份损坏") from error
-    if archived_identity != identity:
-        raise RuntimeError("插件安装身份在归档前发生变化")
+    # 2. 直接编译安装目录；外部环境变化不会被另一个代码快照隐藏。
+    code_dir = plugin_dir.resolve(strict=True)
     for source_path in sorted(code_dir.rglob("*.py")):
         if any(part in {"__pycache__", ".venv", "node_modules"} for part in source_path.parts):
             continue
@@ -95,7 +92,7 @@ def prepare_plugin_input(
                 f"插件源码无法编译: {source_path}"
             ) from error
 
-    # 3. Save the same v4 descriptor after all source checks succeed.
+    # 3. 准备当前选择的元数据；代码字段只表示实际安装路径。
     environments: dict[str, str] = {}
     if identity.python:
         if (plugin_dir / ENVIRONMENT_FILE).exists():
@@ -106,23 +103,25 @@ def prepare_plugin_input(
             owner = PythonEnvironments(workspace)
             environments = {
                 runtime.runtime_root: owner.prepared(
-                    code_ref, runtime,
+                    plugin_dir, runtime,
                     wheel_digest=mod.get("wheel_tree_sha256", "")
                     if (plugin_dir / runtime.requirements).read_text().strip() else "",
                 ) for runtime in identity.python
             }
-    ref = archive.save_descriptor({
-        "version": 4, "code": code_ref, "python_environments": environments,
+    ref = selection.prepare({
+        "version": 6, "code": str(code_dir), "python_environments": environments,
+        "entrypoints": dict(identity.entrypoints),
         "plugin_id": plugin_id, "source_revision": revision,
-        "config_revision": config_revision, "config": encode_config(config),
+        "config_revision": config_revision,
         "source_type": mod["source_type"],
         **({"distribution_source": mod["distribution_source"]} if "distribution_source" in mod else {}),
         "data_dir": data_dir.resolve().relative_to(workspace.resolve()).as_posix(),
-        "runtime": {"python_tag": sys.implementation.cache_tag, "binding_api": PLUGIN_ARCHIVE_BINDING_API},
+        "runtime": {"python_tag": sys.implementation.cache_tag, "binding_api": PLUGIN_INPUT_API},
     })
     return PreparedPluginInput(
-        plugin_id=plugin_id, archive_ref=ref,
-        source_revision=revision, config_revision=config_revision, config=config,
+        plugin_id=plugin_id, input_ref=ref,
+        source_revision=revision, runtime_revision=runtime_revision,
+        config_revision=config_revision, config=config,
         static_manifest=identity, plugin_dir=plugin_dir, code_dir=code_dir,
         data_dir=data_dir,
         source_type=cast(Literal["builtin", "installed"], mod["source_type"]),
@@ -153,14 +152,24 @@ def _require_plugin_path(plugin_dir: Path, path: Path, label: str) -> None:
         raise RuntimeError(f"插件 {label} 越界: {path}") from error
 
 
-def _source_revision(plugin_dir: Path) -> str:
-    """Hash the plugin source tree with the existing exclusion and path rules."""
-    digest = hashlib.sha256()
+def _source_revision(plugin_dir: Path, *, runtime_only: bool = False) -> str:
+    """校验完整源码；仅在比较运行变化时忽略来源标签。"""
+    (digest,) = _digest_tree(plugin_dir, (not runtime_only,))
+    return digest
+
+
+# 一次遍历同时得到完整摘要与忽略来源标签的运行摘要。
+def source_revisions(plugin_dir: Path) -> tuple[str, str]:
+    source, runtime = _digest_tree(plugin_dir, (True, False))
+    return source, runtime
+
+
+# 每个摘要按是否包含来源标签取条目；喂入的字节与逐个单独遍历完全相同。
+def _digest_tree(plugin_dir: Path, include_label: tuple[bool, ...]) -> tuple[str, ...]:
+    digests = tuple(hashlib.sha256() for _ in include_label)
+    labelled = tuple(digest for digest, include in zip(digests, include_label) if include)
     root = plugin_dir.resolve(strict=False)
-    excluded = {
-        ".git", ".mypy_cache", ".pytest_cache", ".ruff_cache",
-        ".venv", "__pycache__", "node_modules", ENVIRONMENT_FILE,
-    }
+    excluded = SOURCE_EXCLUDED_NAMES - {_SOURCE_LABEL} if labelled else SOURCE_EXCLUDED_NAMES
     for current, directories, filenames in os.walk(plugin_dir, followlinks=False):
         directories[:] = sorted(name for name in directories if name not in excluded)
         current_path = Path(current)
@@ -169,18 +178,22 @@ def _source_revision(plugin_dir: Path) -> str:
                 continue
             path = current_path / name
             relative = path.relative_to(plugin_dir)
-            if path.is_symlink():
-                resolved = path.resolve(strict=False)
-                _require_plugin_path(root, resolved, "源码符号链接")
-                digest.update(str(relative).encode())
-                digest.update(os.readlink(path).encode())
-                if resolved.is_file():
-                    digest.update(resolved.read_bytes())
-                continue
-            if not path.is_file():
-                continue
-            resolved = path.resolve(strict=False)
-            _require_plugin_path(root, resolved, "源码文件")
-            digest.update(str(relative).encode())
-            digest.update(path.read_bytes())
-    return digest.hexdigest()
+            targets = labelled if _SOURCE_LABEL in relative.parts else digests
+            for chunk in _source_entry_chunks(root, path, relative):
+                for digest in targets:
+                    digest.update(chunk)
+    return tuple(digest.hexdigest() for digest in digests)
+
+
+# 单个源码条目参与摘要的字节；越界路径在读取前失败。
+def _source_entry_chunks(root: Path, path: Path, relative: Path) -> tuple[bytes, ...]:
+    if path.is_symlink():
+        resolved = path.resolve(strict=False)
+        _require_plugin_path(root, resolved, "源码符号链接")
+        link = (str(relative).encode(), os.readlink(path).encode())
+        return (*link, resolved.read_bytes()) if resolved.is_file() else link
+    if not path.is_file():
+        return ()
+    resolved = path.resolve(strict=False)
+    _require_plugin_path(root, resolved, "源码文件")
+    return str(relative).encode(), path.read_bytes()

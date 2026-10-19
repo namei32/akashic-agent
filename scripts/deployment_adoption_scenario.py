@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -14,16 +15,17 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scripts.deployment_composition_scenario import (
-    commit, distribution, git, manager, plugin, selected, snapshot,
+    commit, distribution, git, manager, plugin, selected, snapshot, install_legacy_cache,
 )
-from scripts.install_plugin_distribution import install_profile, ensure_profile, publish_distribution, _write_receipt
+from scripts.install_plugin_distribution import install_bundle, ensure_bundle, publish_distribution, _write_receipt, _code_identity
 from agent.plugins.artifacts import read_pointers, resolve_pointer
 from agent.plugins.distribution_sources import distribution_sources, distribution_migration_sources
 from agent.plugins.install import install_git_plugin
 from agent.plugins.input_preparation import prepare_plugin_input
-from agent.plugins.manifest import set_plugin_enabled
+from agent.plugins.bundles import set_plugin_choice
 from agent.plugins.selection import PluginSelection, SelectionConflictError
 from agent.plugins.static_manifest import load_static_plugin_manifest
+from plugins.ledger.contract import json_value
 
 
 async def run():
@@ -47,7 +49,7 @@ async def run():
     os.environ.pop("AKASHIC_PLUGIN_DISTRIBUTION", None)
     subprocess.run([sys.executable, str(ROOT / "main.py"), "init", "--config", str(config),
                     "--workspace", str(work)], check=True, stdout=subprocess.DEVNULL)
-    first_receipt = install_profile(first, first / "profiles/default.json", workspace=work,
+    first_receipt = install_legacy_cache(first, first / "bundles/base.toml", workspace=work,
                                     plugins_home=home, config_path=config)
     m = await manager(work, home)
     await m.terminate_all()
@@ -57,7 +59,7 @@ async def run():
     (repo / "plugins/alpha").rename(repo / "plugins/alpha_legacy")
     (repo / "plugins/retired").rename(repo / "plugins/retired_source")
     historical = distribution(repo, root / "historical", ["alpha_legacy", "retired_source", "disabled"], names)
-    install_profile(historical, historical / "profiles/default.json", workspace=work,
+    install_legacy_cache(historical, historical / "bundles/base.toml", workspace=work,
                     plugins_home=home, config_path=config)
     selection = PluginSelection(work)
     prepared = []
@@ -68,8 +70,8 @@ async def run():
         prepared.append(prepare_plugin_input(
             {"name": name, "marketplace": "release", "plugin_root": str(artifact),
              "module_path": str(artifact / "plugin.py"), "manifest_digest": identity.identity_digest,
-             "source_type": "installed"}, workspace=work, archive=selection.archive,
-        ).archive_ref)
+             "source_type": "installed"}, workspace=work, selection=selection,
+        ).input_ref)
     selection.commit(tuple(prepared), expected_ref=selection.read())
     m = await manager(work, home)
     await m.terminate_all()
@@ -84,7 +86,7 @@ async def run():
     await m.install(source=str(external), marketplace="thirdparty", ref_name="", sparse_paths=[], update_id="outside")
     await m._operation.task
     await m.terminate_all()
-    set_plugin_enabled("disabled@release", enabled=False, plugins_home=home)
+    set_plugin_choice(work, "disabled@release", enabled=False)
     selection = PluginSelection(work)
     baseline = selection.read()
     old = selected(work)
@@ -105,7 +107,7 @@ async def run():
         evidence = historical / "distribution.json"
         entries.append({
             "plugin_id": plugin_id, "component_ref": ref, "artifact_pointer": pointers.stable.path,
-            "source_revision": git(artifact, "rev-parse", "HEAD"), "code_sha256": descriptor["code"],
+            "source_revision": git(artifact, "rev-parse", "HEAD"), "code_sha256": _code_identity(artifact),
             "manifest_digest": load_static_plugin_manifest(artifact).identity_digest,
             "data_dir": descriptor["data_dir"],
             "source_commit": json.loads(evidence.read_text())["source_commit"],
@@ -145,18 +147,18 @@ async def run():
     plan.write_text(json.dumps(document))
     from scripts.install_plugin_distribution import load_deployment_plan
     proof = load_deployment_plan(plan)[3]
-    orphan = selection.archive.save_descriptor(proof)
+    (root / "uncommitted-proof.json").write_text(json.dumps(proof))
     assert not distribution_sources(work, home, target).legacy_ids
     assert selection.read() == baseline
     result = publish()
     new_root = selection.read()
     assert result["new_root_ref"] == new_root != baseline
-    assert selection.archive.read_descriptor(new_root)["distribution_adoption_ref"] == orphan
+    assert json_value(selection.adoption()) == proof
     assert selected(work)["outside@thirdparty"][0] == old["outside@thirdparty"][0]
     assert "retired@release" not in selected(work) and "disabled@release" not in selected(work)
     # 3. 普通第二次启动、配置提交与停用均保留同一凭证及退役归属。
     for _ in range(2):
-        ensure_profile(target, target / "profiles/default.json", workspace=work, plugins_home=home,
+        ensure_bundle(target, target / "bundles/base.toml", workspace=work, plugins_home=home,
                        config_path=config, receipt_path=receipt)
         assert len(distribution_migration_sources(work, home, target)) == 2
         m = await manager(work, home, target)
@@ -164,10 +166,9 @@ async def run():
         assert "retired@release" not in selected(work)
     current = selection.read()
     inherited = selection.commit(tuple(ref for ref, _ in selected(work).values()), expected_ref=current)
-    assert selection.archive.read_descriptor(inherited)["distribution_adoption_ref"] == orphan
+    assert json_value(selection.adoption()) == proof
     assert len(distribution_sources(work, home, target).ignored_installed_roots) == 3
-    from scripts.rollback_plugin_install import _selected_code
-    assert _selected_code(selection, inherited, "outside@thirdparty")[0] == old["outside@thirdparty"][1]["code"]
+    assert "outside@thirdparty" in {selection.read_input(ref)["plugin_id"] for ref in selection.components(inherited)}
     plan.write_text(json.dumps({"schema_version": 1, "expected_root_ref": inherited, "targets": []}))
     assert publish()["new_root_ref"] == inherited
     retired_source = historical / json.loads((historical / "distribution.json").read_text())["plugins"][1]["file"]
@@ -177,6 +178,43 @@ async def run():
         assert "不能接管" in str(error)
     else:
         raise AssertionError("retired data identity reused")
+    # 4. 模拟下一镜像覆盖同一路径：旧选择只声明归属，新选择必须固定新发行版。
+    plugin(repo, "alpha", "4")
+    next_distribution = distribution(repo, root / "next-image", ["alpha", "disabled"], ["alpha", "disabled"])
+    next_commit = json.loads((next_distribution / "distribution.json").read_text())["source_commit"]
+    shutil.rmtree(target)
+    shutil.copytree(next_distribution, target)
+    try:
+        distribution_sources(work, home, target)
+    except ValueError as error:
+        assert "provenance mismatch" in str(error)
+    else:
+        raise AssertionError("ordinary runtime accepted old selection against next image")
+    before = snapshot(state)
+    assert publish(True)["status"] == "preflight_ok"
+    assert snapshot(state) == before
+    result = publish()
+    updated = selection.read()
+    assert updated != inherited and result["new_root_ref"] == updated
+    assert selected(work)["alpha@release"][1]["distribution_source"] == next_commit
+    assert selected(work)["outside@thirdparty"][0] == old["outside@thirdparty"][0]
+    ensure_bundle(target, target / "bundles/base.toml", workspace=work, plugins_home=home,
+                   config_path=config, receipt_path=receipt)
+    m = await manager(work, home, target)
+    assert m.generation("alpha@release").instance.version == "4"
+    await m.terminate_all()
+    plan.write_text(json.dumps({"schema_version": 1, "expected_root_ref": updated, "targets": []}))
+    assert publish()["new_root_ref"] == updated
+    # 新镜像退役已选内置插件时，旧代码目录缺失不阻止预检，也不删除数据。
+    plugin(repo, "disabled", "5")
+    retired_distribution = distribution(repo, root / "retired-image", ["disabled"], ["disabled"])
+    shutil.rmtree(target)
+    shutil.copytree(retired_distribution, target)
+    assert publish(True)["status"] == "preflight_ok"
+    updated = publish()["new_root_ref"]
+    assert "alpha@release" not in selected(work)
+    m = await manager(work, home, target)
+    await m.terminate_all()
     artifact = home / "cache/release/retired" / entries[1]["artifact_pointer"]
     source = artifact / "plugin.py"
     original = source.read_bytes()
@@ -191,8 +229,8 @@ async def run():
     assert snapshot(home / "cache") == cache_before
     assert snapshot(work / "plugin-data") == data_before
     assert receipt.read_bytes() == receipt_before
-    (root / "result.json").write_text(json.dumps({"result": "passed", "root": new_root, "adoption": orphan}))
-    print("PASS historical-adoption/read-only-preflight/wrong-data/orphan/restart/retirement/disabled/external/preservation/drift", flush=True)
+    (root / "result.json").write_text(json.dumps({"result": "passed", "root": updated, "adoption": json_value(selection.adoption())}))
+    print("PASS historical-adoption/read-only-preflight/wrong-data/orphan/restart/retirement/disabled/external/preservation/drift/next-image-at-same-path", flush=True)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,6 @@ import pytest
 from agent.plugin_composition import FiberState
 from agent.plugins.install import install_git_plugin
 from agent.plugins.manager import PluginManager
-from bus.event_bus import EventBus
 from tests.fixtures.plugin_workspace import initialize_plugin_workspace
 from tests.test_plugin_fresh_root import module
 from tests.test_plugin_install import _commit, _write_v3_plugin
@@ -50,7 +49,7 @@ def installed_host(tmp_path, *, fail_close=False):
         )
     initialize_plugin_workspace(workspace)
     host = PluginManager(
-        [], event_bus=EventBus(), workspace=workspace,
+        [], workspace=workspace,
         installed_cache_root=home / "cache",
     )
     return host, home / "cache/lab/target", workspace
@@ -88,11 +87,11 @@ async def test_uninstall_accepts_before_target_owner_drains_and_preserves_peer(
         peer_fiber = peer.fiber
         peer_token = peer_context.fiber.activation_token
         peer_state = dict(peer.instance.module.STATE)
-        archive_ref = target.archive_ref
-        assert archive_ref is not None
-        archive_source = target.code_dir / "plugin.py"
-        archive_source_before = archive_source.read_bytes()
-        archive_descriptor_before = host._archive.read_descriptor(archive_ref)
+        input_ref = target.input_ref
+        assert input_ref is not None
+        installed_source = target.code_dir / "plugin.py"
+        installed_source_before = installed_source.read_bytes()
+        input_before = host._selection.read_input(input_ref)
 
         async def hold_peer_scope():
             async with peer_context.runtime_scope():
@@ -110,6 +109,7 @@ async def test_uninstall_accepts_before_target_owner_drains_and_preserves_peer(
             assert accepted["selection_ref"] == host._selection.read()
             assert operation is not None and not operation.task.done()
             assert cache.is_dir()
+            assert installed_source.read_bytes() == installed_source_before
             assert target.module_path in sys.modules
             target_status = status_for(host, "target@lab")
             assert target_status["installed"] is True
@@ -125,6 +125,8 @@ async def test_uninstall_accepts_before_target_owner_drains_and_preserves_peer(
         assert host.generation("peer@lab") is peer
         assert peer.fiber is peer_fiber
         assert peer_context.fiber.activation_token is peer_token
+
+        assert installed_source.read_bytes() == installed_source_before
 
         consumer_release.set()
         result = await asyncio.gather(operation.task, return_exceptions=True)
@@ -143,12 +145,12 @@ async def test_uninstall_accepts_before_target_owner_drains_and_preserves_peer(
         assert peer.instance.module.STATE == peer_state
         assert consumer.fiber.state is FiberState.PENDING
         assert consumer.fiber.dependency_store == {}
-        assert archive_source.read_bytes() == archive_source_before
-        assert host._archive.read_descriptor(archive_ref) == archive_descriptor_before
+        assert not installed_source.exists()
+        assert host._selection.read_input(input_ref) == input_before
 
         target_status = status_for(host, "target@lab")
         assert target_status["installed"] is False
-        assert target_status["enabled"] is None
+        assert target_status["enabled"] is False
         assert target_status["cache_exists"] is False
         assert operation_status(host)["state"] == "done"
     finally:

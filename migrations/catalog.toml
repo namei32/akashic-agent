@@ -1,2 +1,25 @@
-schema_version = 1
-migrations = []
+schema_version = 2
+
+[[migrations]]
+id = "20261004_01_message_source_index"
+bundle = "ledger"
+
+[[migrations]]
+id = "20261004_02_message_body_kind_index"
+bundle = "ledger"
+
+[[migrations]]
+id = "20261004_03_session_soft_delete"
+bundle = "ledger"
+
+[[migrations]]
+id = "20261004_04_session_title"
+bundle = "ledger"
+
+[[migrations]]
+id = "20261007_01_message_prefix_revision"
+bundle = "ledger"
+
+[[migrations]]
+id = "20261011_01_derived_storage"
+bundle = "ledger"

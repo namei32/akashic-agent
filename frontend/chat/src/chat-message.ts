@@ -1,4 +1,5 @@
 import type { FileUIPart } from "ai";
+import type { SentAttachmentItem } from "./attachment-card";
 
 export type ChatRole = "user" | "assistant";
 
@@ -16,6 +17,8 @@ export interface ToolBlock {
   output: unknown;
   errorText: string | undefined;
   durationMs?: number;
+  /** 结果附带的图片（截图、读图）；与文字结果一起在调用卡片里展示。 */
+  attachments?: SentAttachmentItem[];
 }
 
 export type AgentBlock = ThinkingBlock | ToolBlock;
@@ -23,6 +26,7 @@ export type AgentBlock = ThinkingBlock | ToolBlock;
 export type MessageAttachment = FileUIPart & {
   id: string;
   path?: string;
+  sizeBytes?: number;
 };
 
 export interface ChatMessage {
@@ -37,6 +41,8 @@ export interface ChatMessage {
   durationMs?: number;
   createdAt?: string;
   canonical?: boolean;
+  /** 本地发送中的消息：sending 等待服务端确认，retrying 正在换连接重发；确认后移除。 */
+  delivery?: "sending" | "retrying";
   controlTurnId?: string;
   reply?: {
     messageId: string;

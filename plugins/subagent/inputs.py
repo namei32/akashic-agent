@@ -4,13 +4,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from agent.plugin_contracts import (
+from plugins.ledger.contract import (
     ContentPart,
 )
-from agent.plugin_contracts.content import (
+from plugins.content.contract import (
     CONTENT as CONTENT,
 )
-from agent.plugin_contracts.delivery import (
+from plugins.delivery.contract import (
     DELIVERY_GUARDED_START as DELIVERY,
     DELIVERY_SENDERS as DELIVERY_SENDERS,
     GuardedDeliveries as Deliveries,
@@ -19,15 +19,15 @@ from agent.plugin_contracts.delivery import (
     Selection as Selection,
     Senders as Senders,
 )
-from agent.plugin_contracts.reply import (
+from plugins.reply.contract import (
     REPLY_PROGRAM_V3 as REPLY_PROGRAM,
 )
-from agent.plugin_contracts.sources import (
+from plugins.conversation.contract import (
     CHECK_ORIGIN as CHECK_ORIGIN,
     CONVERSATION_COMPLETE_V2 as CONVERSATION_COMPLETE,
     ConversationCompleteV2 as ConversationComplete,
 )
-from agent.plugin_contracts.tools import (
+from plugins.tools.contract import (
     ALL_TOOLS as ALL_TOOLS,
     TOOL_BIND_SAVED as TOOL_BIND_SAVED,
     TOOLS as TOOLS,

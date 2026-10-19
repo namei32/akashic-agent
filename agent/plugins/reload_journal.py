@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Literal, cast
 
 from agent.plugins import update_rollback, config_updates
-from agent.plugins.artifacts import ArtifactPointer, ArtifactPointers
+from agent.plugins.artifacts import ArtifactPointer, ArtifactPointers, read_pointers
 from agent.plugins.selection import PluginSelection
 
 ReloadPhase = Literal[
@@ -87,30 +87,6 @@ class ReloadTransactionRecord:
     base_artifact_pointer: str | None = None
     candidate_artifact_pointer: str | None = None
     recovery_target: RecoveryTarget | None = None
-
-    @property
-    def old_snapshot_id(self) -> str | None:
-        """Return the stable snapshot that the attempt started from."""
-
-        return self.base_snapshot_id
-
-    @property
-    def new_snapshot_id(self) -> str | None:
-        """Return the candidate snapshot produced by the attempt."""
-
-        return self.candidate_snapshot_id
-
-    @property
-    def old_generation_id(self) -> str | None:
-        """Return the stable generation that the attempt started from."""
-
-        return self.base_generation_id
-
-    @property
-    def attempt_generation_id(self) -> str:
-        """Return the generation being prepared by this attempt."""
-
-        return self.generation_id
 
     @property
     def resource(self) -> str | None:
@@ -279,18 +255,10 @@ class ReloadJournal:
             return update_rollback.read(conn, update_id)
 
     def set_input_ref(self, update_id: str, input_ref: str) -> None:
-        """Persist the fixed archive input before selection CAS."""
+        """选择提交前保存本次安装的输入身份。"""
         with self._connect() as conn:
             _ = conn.execute("BEGIN IMMEDIATE")
             update_rollback.set_input_ref(conn, update_id=update_id, input_ref=input_ref)
-
-    def update_for_reload(self, tx_id: str) -> update_rollback.UpdateRollback | None:
-        """有更新恢复点时，完整旧指针对只由该记录恢复。"""
-        with self._connect() as conn:
-            if not update_rollback.check_schema(conn):
-                return None
-            row = conn.execute("SELECT update_id FROM plugin_updates WHERE reload_tx_id=?", (tx_id,)).fetchone()
-            return None if row is None else update_rollback.read(conn, row[0])
 
     def record_update_error(self, update_id: str, error: str) -> None:
         """保存实际失败原因，不把诊断写入伪装成发布或回退。"""
@@ -301,6 +269,17 @@ class ReloadJournal:
             )
             if changed.rowcount != 1:
                 raise KeyError(f"插件更新不存在: {update_id}")
+
+    def require_contract_restart(self, update_id: str) -> None:
+        """安装已提交且输入固定后记录重启要求，不改变安装恢复 phase。"""
+        with self._connect() as conn:
+            changed = conn.execute(
+                "INSERT INTO plugin_contract_restarts(update_id) SELECT update_id FROM plugin_updates "
+                "WHERE update_id=? AND phase='committed' AND input_ref IS NOT NULL",
+                (update_id,),
+            )
+            if changed.rowcount != 1:
+                raise RuntimeError("合同重启要求需要已提交的安装与固定输入")
 
     def commit_update(self, update_id: str) -> None:
         """离线安装没有 runtime reload；安装 owner 核验完成后提交恢复点。"""
@@ -324,26 +303,46 @@ class ReloadJournal:
                 query += " AND update_id=?"
                 values = (update_id,)
             for row in conn.execute(query, values).fetchall():
-                update_rollback.rollback(conn, update_rollback.read(conn, row[0]), plugins_home, now=_now(), error=error)
+                update_rollback.rollback(conn, update_rollback.read(conn, row[0]), plugins_home, workspace=self.path.parent.parent, now=_now(), error=error)
 
-    def rollback_install_update(
-        self, plugins_home: Path, *, expected: update_rollback.UpdateRollback, error: str,
-    ) -> None:
-        """Roll back one unchanged, unlinked install row under the caller's offline locks."""
+    def settle_orphaned_installs(self, plugins_home: Path) -> tuple[tuple[str, str, str], ...]:
+        """按磁盘指针结算无 runtime 记录的中断安装；调用方已持有发布锁。"""
         with self._connect() as conn:
             _ = conn.execute("BEGIN IMMEDIATE")
-            current = update_rollback.read(conn, expected.update_id)
-            if current != expected:
-                raise RuntimeError("插件安装恢复点在预检后改变")
-            if current.phase != "armed" or current.reload_tx_id is not None or current.input_ref is not None:
-                raise RuntimeError("指定记录不是孤立 armed 安装")
-            update_rollback.rollback(conn, current, plugins_home, now=_now(), error=error)
+            if not update_rollback.check_schema(conn):
+                return ()
+            rows = conn.execute(
+                "SELECT update_id FROM plugin_updates WHERE phase='armed' AND reload_tx_id IS NULL ORDER BY update_id"
+            ).fetchall()
+            updates = tuple(update_rollback.read(conn, str(row[0])) for row in rows)
+            return tuple(
+                (update.update_id, update.plugin_id, update_rollback.settle_orphan(
+                    conn, update, plugins_home, workspace=self.path.parent.parent, now=_now()))
+                for update in updates
+            )
 
-    def create_config_update(self, request_id: str, plugin_id: str, previous_input: str, input_ref: str) -> None:
-        """记录配置请求；新输入已归档但尚未被 selection 采用。"""
+    def bind_boot_input(self, plugin_id: str, input_ref: str, code: Path) -> None:
+        """把尚未绑定的已提交安装接到本次启动实际选中的输入；只认代码确为候选制品的输入，可重复调用。"""
         with self._connect() as conn:
-            conn.execute("INSERT INTO config_updates(request_id,plugin_id,previous_input,input_ref,state) VALUES (?,?,?,?,'accepted')",
-                         (request_id, plugin_id, previous_input, input_ref))
+            _ = conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT update_id FROM plugin_updates WHERE plugin_id=? AND phase='committed' AND input_ref IS NULL",
+                (plugin_id,),
+            ).fetchall()
+            for row in rows:
+                update = update_rollback.read(conn, str(row[0]))
+                pointers = read_pointers(update.plugin_base, validate_content=False)
+                if update.candidate.path is None or pointers is None or pointers.stable != update.candidate:
+                    continue
+                if (update.plugin_base / update.candidate.path).resolve() == code.resolve():
+                    update_rollback.set_input_ref(conn, update_id=update.update_id, input_ref=input_ref)
+
+    def create_config_update(self, request_id: str, plugin_id: str, previous_input: str, input_ref: str,
+                             config_revision: str, pending_config: str) -> None:
+        """暂存未完成配置请求；完成后不保留可执行的配置快照。"""
+        with self._connect() as conn:
+            conn.execute("INSERT INTO config_updates(request_id,plugin_id,previous_input,input_ref,config_revision,pending_config,state) VALUES (?,?,?,?,?,?,'accepted')",
+                         (request_id, plugin_id, previous_input, input_ref, config_revision, pending_config))
 
     def config_update(self, request_id: str) -> dict[str, object]:
         with self._connect() as conn:
@@ -352,6 +351,13 @@ class ReloadJournal:
             if row is None:
                 raise KeyError(request_id)
             return dict(row)
+
+    def clear_pending_config(self, request_id: str) -> None:
+        """当前配置已经耐久发布或请求未被选择，才丢弃临时请求正文。"""
+        with self._connect() as conn:
+            cursor = conn.execute("UPDATE config_updates SET pending_config=NULL WHERE request_id=?", (request_id,))
+            if cursor.rowcount != 1:
+                raise KeyError(request_id)
 
     def finish_config_update(self, request_id: str, state: str, error: str = "") -> None:
         with self._connect() as conn:
@@ -717,21 +723,6 @@ class ReloadJournal:
             for row in rows
         )
 
-    def runtime_generation_ids(self, tx_id: str) -> tuple[str, ...]:
-        """从实际取得资源的事件读取身份，候选 ID 不代替正式 owner。"""
-        record = self.get(tx_id)
-        identities = {record.generation_id}
-        if record.base_generation_id is not None:
-            identities.add(record.base_generation_id)
-        for event in self.events(tx_id):
-            owner = event.details.get("runtime_generation_id")
-            if isinstance(owner, str):
-                identities.add(owner)
-            owners = event.details.get("runtime_generations")
-            if isinstance(owners, dict):
-                identities.update(cast(dict[str, str], owners).values())
-        return tuple(sorted(identities))
-
     def annotate(self, tx_id: str, details: dict[str, object]) -> None:
         """Append evidence without inventing another public rollout phase."""
 
@@ -818,17 +809,6 @@ class ReloadJournal:
     def pending_recovery(self) -> tuple[ReloadRecoveryAction, ...]:
         with self._connect() as conn:
             return self._pending_recovery(conn)
-
-    def orphaned_armed_updates(self) -> tuple[update_rollback.UpdateRollback, ...]:
-        """Read installs with no runtime transaction to settle at boot."""
-        with self._connect() as conn:
-            return tuple(
-                update_rollback.read(conn, str(row[0]))
-                for row in conn.execute(
-                    "SELECT update_id FROM plugin_updates "
-                    "WHERE phase='armed' AND reload_tx_id IS NULL ORDER BY update_id"
-                )
-            )
 
     def settle_generation_cleanup(
         self, *, tx_id: str, plugin_id: str, generation_id: str, receipt: str,
@@ -1009,6 +989,7 @@ class ReloadJournal:
             conn.execute(config_updates.SCHEMA)
             for statement in update_rollback.SCHEMA.values():
                 _ = conn.execute(statement)
+            conn.execute(update_rollback.CONTRACT_RESTART_SCHEMA)
 
     def _check_existing_schema(self) -> None:
         """Read an existing journal without creating or altering any object."""
@@ -1036,7 +1017,8 @@ class ReloadJournal:
                 "runtime/plugin-reloads.sqlite3 缺少 plugin_updates；"
                 "不会由普通启动补造历史表"
             )
-        config_updates.check_schema(conn)
+        update_rollback.check_contract_restart_schema(conn)
+        config_updates.check_current_schema(conn)
         required = {
             "reload_transactions": {
                 "tx_id", "plugin_id", "base_snapshot_id", "candidate_snapshot_id",
@@ -1304,7 +1286,7 @@ def check_pending_publication(workspace: Path) -> None:
     """迁移与离线发布不得覆盖安装或配置 owner 尚未结算的事实。"""
     selection = PluginSelection(workspace)
     root = selection.read()
-    components = () if root is None else cast(tuple[str, ...], selection.archive.read_descriptor(root)["components"])
+    components = () if root is None else selection.components(root)
     with ReloadJournal.inspect_existing(workspace) as journal:
         if journal.pending_recovery or journal.armed_updates:
             raise PendingPublicationError("reload/install owner 尚未结算；不得覆盖未决事实")

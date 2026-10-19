@@ -70,6 +70,10 @@ Akashic Agent 必须在多轮会话、进程重启、插件换代和工作区切
 
 新会话不依赖维护者脑内背景、旧聊天记忆或 agent 猜测。项目工作手册必须用最少文本提供当前需求、决策理由、未完成事项和协作纪律。
 
+### OBJ-005 输入遇到暂时故障仍尝试输出
+
+一次输入的模型生成遇到超时、断流、限流或暂时服务故障时，默认可取消地重试，最多 10 次，期间向用户显示第几次尝试和已持续多久，减少用户重复要求继续。恢复保留已完成消息和工具回执，只重试当前模型生成。永久错误、内部/存储故障、明确取消及显式预算耗尽必须给出真实结果，不伪造成功。未知 usage 与可能重复生成费用如实保留；模型重试不授予工具或送达重发权限。恢复边界见 [0092](decisions/0092-model-generation-recovers-until-output.md)。
+
 ## 3. 项目工作手册
 
 ### WBK-001 共享现实
@@ -186,6 +190,10 @@ Thinking 与工具调用沿共享页面的一条过程轨迹展示；流式消�
 或子插件时按 Web module Effect 递归清理。Core Web Host 与 conversation-ui 不得按 Computer、Browser 或
 其他子插件名称分支，工具区也不得取得 Session、Turn 或插件领域状态所有权。
 
+工具区可以把聊天报告的当前会话 ID 作为只读事实转交给子标签，按标签声明的 `accepts` 路由来自用户手势的意图，
+并把核对过会话的标签引用请求转发为输入框草稿；它不保存、不推导这些事实，Agent 活动只能亮徽标，不能展开工具区。
+见 [0121](decisions/0121-conversation-workbench-tabs.md)。
+
 ### WEBUI-009 聊天导航置顶与展开状态独立
 
 聊天导航可以置顶真实项目和没有 `project` 维度的普通可见会话。`default` 只表示该维度缺失，
@@ -273,6 +281,8 @@ prompt 必须区分只读调查、设计、实现、评审和外部协调。读�
 
 每类权威状态必须有唯一拥有层。其他模块使用窄接口读取或请求变更，不能各自维护一份可独立漂移的“真相”。
 
+Session 与 Models 账本的提交保证覆盖普通进程崩溃；宿主断电或操作系统崩溃后，允许丢失最新已提交事务。外部效果不会随记录丢失而撤销，此类故障后可能需要人工核查，也不保证避免重复执行。该故障模型见 [0099](decisions/0099-ledger-commits-use-wal-normal.md)，不授予任何主动裁切、改写或删除历史的权限。
+
 ### STA-002 临时视图不得反向定义保留策略
 
 C 类对象可以裁切、再建和回收，但不能因为自身容量、显示或性能要求删除 A 类事实。B 类索引可由显式维护流程再次生成；运行时降级不得顺带改写 A 类事实。
@@ -293,7 +303,11 @@ D 类效果只能由拥有 prepared、committed、failed 和必要补偿语义�
 
 不存在、空结果、合法跳过、明确降级、输入错误、数据损坏和内部故障必须可区分。只有拥有正确恢复动作的边界才能捕获异常并降级；其余错误 fail-fast、fail-loud。
 
+模型长度截断不等于空响应、quiet 或完成；截断批次的工具不得执行。默认回复预算包含推理，显式预算保留，缺省跟随固定模型能力；选择与未知能力策略见 [0089](decisions/0089-reply-output-budget-includes-reasoning.md)。
+
 工具结果使用 `success / denied / error / interrupted`。error 和 interrupted 不证明外部效果为零；模型获得原错误与先检查现场的提示，不能自动重复原操作。Tools/Delivery 仅在原 key 查询或 provider 幂等合同下恢复；后台发送失败必须关闭本次业务等待，不保留 unknown 未决状态。数据库、binding 和内部契约异常仍向上传播。完整自愈、跳过、重试和中断规则见 [0063](decisions/0063-execution-failures-have-terminal-results.md)。
+
+默认消息工具调用按 [0100](decisions/0100-message-tool-calls-recover-at-turn-granularity.md) 使用 ToolCall/ToolResult 表达意图与终态；重启后未结调用不执行，补充结果未知的 error。ReAct 重启与用户显式重试使用当前材料发起新模型请求，不恢复旧请求，接受旧请求可能已处理所带来的重复付费。原消息、旧请求记录和工具回执保留。
 
 ## 7. 上下文和会话
 
@@ -307,27 +321,32 @@ D 类效果只能由拥有 prepared、committed、failed 和必要补偿语义�
 
 预算不足时按耐久等级处理：先减少装饰性内容，再减少可再次查询的 skills、meme、长期记忆和检索结果；只有这些内容已经移除仍超限，才缩小发送给模型的历史窗口。当前用户指令和最近完整语义回合优先保留。
 
-### CTX-003 窗口以完整 Turn 投影为边界
+### CTX-003 窗口保留当前输入和工具配对
 
-Prompt 历史不得从孤立 assistant 或 tool result 开始。assistant 工具调用和对应结果成对保留；合法 user 边界或明确的 proactive assistant 边界拥有窗口起点。长工具结果只允许在临时模型视图中截短。
+Prompt 历史不得从孤立 tool result 开始。assistant 工具调用和对应结果成对保留；摘要提供前文时，近期原文可以从 assistant 消息开始。当前工作 Input 逐字保留。长工具结果只允许在临时模型视图中截短。
 
 Turn 是按 source 过滤的 Message 日志上的无状态读投影：`Output.finish=complete|quiet` 关闭一段，`Control.abandon` 在 `through_seq` 处关闭被放弃前缀；暂停和一次 provider 失败不能把消息日志拆成多个 Turn。Turn 投影返回消息引用和状态，不拥有执行、取消或写入权限。Context 可以复用同一分组，但必须保留工具请求/结果配对。
 
-已送达的 proactive assistant 消息进入 prompt history 时保留完整正文，不得施加 proactive 专属字符预算或改写成 preview。整体请求超限时，只能由通用 prompt history 退化按完整 Turn 边界缩小窗口。
+已送达的 proactive assistant 消息进入 prompt history 时保留完整正文，不得施加 proactive 专属字符预算或改写成 preview。整体请求超限时，由通用 prompt history 按 CTX-007 的安全批次边界缩小窗口。
 
 ### CTX-004 派生上下文不得伪装成用户原话
 
 skills、长期记忆和检索结果必须带来源和信任级别，作为 system context 或独立数据块进入请求。当前 user message 始终独立；工具授权不能由提示词内容决定。
 
-请求使用“system → 已保存消息的模型投影（含当前输入与摘要）→ 一个末尾 user-role `<system-reminder>`”。
+请求使用 system 与已保存消息的模型投影（含当前输入与摘要）；派生材料使用独立的
+user-role `<system-reminder>`，不并入用户原话。同一 Input 的相同材料保留首次使用位置；
+新材料在本次请求末尾加入，不为每次工具续接移动已有材料。理由见 [0096](decisions/0096-context-reminders-keep-their-first-position.md)。
 VEDA、SELF/MEMORY、技能目录与常驻指令、渠道规则、固定工具目录留在 system；时间、Akasha 召回和本次后台结果进入提醒。
 提醒不另写独立 Message、不制造用户 Input。每次模型请求固定一份材料，超出完整请求预算明确报错，不能按优先级静默丢弃。
 提醒块身份为实际贡献插件 ID 与局部名称，同一身份重复时报错；priority 升序，仅决定排列，同优先级按插件 ID、名称的 UTF-8 字节升序。
 SELF/MEMORY 低频更新不要求迁出 system，也不承诺其异步发布与 compaction 只产生一次 provider 缓存失效。
 成功的模型 Output 在 `model.facts` 中保存当次 reminder、其真实 Input 身份与 SHA-256 摘要，以及 wire tool
 call replay；恢复旧请求时使用该已提交事实重建原 provider 前缀。同一 Input 的同一 reminder 只在
-prompt history 重放一次，当前请求的同一材料仍作为末尾 reminder 出现；同一 Input 后续材料改变、
+prompt history 重放一次，当前请求复用该位置；同一 Input 后续材料改变、
 不同 Input 的材料和未带身份的旧事实都照实保留。它不新增 Input、授权或持久上下文副本，失败和取消也不伪造 replay。
+不进入历史的实时材料随当前 reminder 放置；没有可回放 reminder 时放在本来源最新 Input 后。
+其正文每次读取当前贡献，撤下后不得从旧 Output 恢复。材料实际变化、裁切窗口或切换模型
+可以改变请求前缀；不得为保留缓存使用过期材料。
 
 用户提交的图片在当前模型声明支持图片输入时，须以真实图片内容进入请求。附件名称与
 文字占位不能代替原图。Model 内容 owner 通过窄 Artifact 只读租约取得有界字节，构造请求图；
@@ -359,26 +378,31 @@ Core 在每一次 session 业务 provider 请求前，必须在 system prompt、
 拥有上下文语义。
 
 subagent 的主循环、两种收束摘要和 mandatory exit 四个 provider 入口使用同一容量、软水位、
-完整 Turn 单元与 raw tail 规则，但 compact 结果只存在于 subagent 内存，不写 session
+安全工具批次与 raw tail 目标规则，但 compact 结果只存在于 subagent 内存，不写 session
 ledger。插件 jobs、history route 和视觉短调用由各自 owner 管理，不进入此 Gate；超窗继续
 暴露既有 provider 错误或该 owner 已声明的 fail-open 语义。
 
-Compaction 插件不拆分已提交的完整 Turn 投影；开放 source 段只把完整闭合的 tool-call/result batch 当作临时压缩单元。当前 user anchor、未闭合工具
-和外部效果证据必须保留；raw tail 从后向前累计至少 20,000 token，
-跨过完整 Turn 单元可以略大于 20,000。若没有合法切点使重建 payload 同时低于软水位和
-硬边界，必须阻断本次调用。tool call 返回后先完整执行 batch，下一次 provider 调用
-再次经过本 Gate。
+Compaction 只改变模型请求视图，允许在已结算或明确放弃的工具批次后切分已完成或开放
+Turn；持久 Turn 不拆分。当前工作 Input 逐字保留，未闭合工具不得被摘要，外部效果与
+继续任务所需证据进入摘要。raw tail 从后向前以 20,000 token 为目标；容量冲突时允许
+减少原文量，并向用户显示原因。真实摘要加入完整请求后必须降低输入估算并满足硬容量，
+不要求低于 74% 软水位。仅软水位触发且摘要发生可恢复错误时，原请求仍满足硬容量才
+可继续；本地硬容量失败或 provider 明确拒绝则必须阻断。取消、损坏与内部契约错误
+不降级。状态复用 Reply 预览，降级诊断随真实 Output 保存，历史、实时与复制均可见，
+但不作为 provider 输入、replay 或摘要资料。tool batch 完成后下一次请求重新检查容量。
+理由见 [0095](decisions/0095-context-compaction-uses-settled-batches.md)。
 
-ledger 没有任何 generation 时，首次 compact 必须先从当前向历史方向按完整 Turn 单元
-选择不超过 `floor(context_window * 0.74)` 软水位的最大连续近期窗口，同时满足完整请求的硬输入边界；不得为凑满预算跨过阈值。当前未结束工作不可跳过：若它本身已超窗，先按上述闭合工具批次规则压缩，再检查完整请求，不能在首次窗口选择时提前拒绝。窗口外更早历史不得进入首次 provider payload、source plan 或摘要，
-但 SessionDB 原始消息必须完整保留。已有 generation 后只处理有效 cursor 到当前的增量。
+首次 compact 从日志起点记录累计覆盖，以安全批次选近期原文。每代仍只把上一摘要和
+一个可容纳的连续近期窗口送入摘要模型；更早退出请求的资料写入 omitted 分区，不冒充
+真实摘要输入。当前工作不可跳过，SessionDB 原消息完整保留。已有 generation 后只
+处理上次覆盖末尾到当前的增量；真实模型输入与省略资料沿 0068 的分区合同保存。
 
 持久 checkpoint 写入 `session_compactions`，保存 summary、parent lineage、source_ref、
 retained tail、usage、失效字段和模型容量；`sessions.last_consolidated` 只表示当前
 有效 generation，checkpoint INSERT 与 cursor 推进在同一事务中完成。summary 不是用户
 原话、真实工具或外部效果，采用 Pi-mono 的 Goal、Constraints & Preferences、Progress
 （Done/In Progress/Blocked）、Key Decisions、Next Steps、Critical Context 六段格式。
-当前模型失败后使用配置的 main/default fallback；两者失败时阻断。旧
+当前模型失败后使用配置的 main/default fallback；两者失败沿上述软水位与硬容量规则处理。旧
 `react_compaction` 字节保留但不再读取或生成；压缩不得 UPDATE 或 DELETE 既有消息。
 
 Included checkpoint 在跨文件 effect 前必须先写入 session-incarnation scoped
@@ -394,13 +418,16 @@ MEMORY/SELF。插件失败不回滚 ledger；重放相同 receipt 必须幂等�
 通过删除 source rows 绕过 fence。只有成功提交、receipt recovery 或确定性的无 receipt
 orphan recovery 可以清除 prepare。
 
-### CTX-008 长结果折叠保留原文与首次判断机会
+### CTX-009 当前目录与仓库规则属于请求材料
 
-长工具结果的折叠由普通插件管理，只改变模型视图。原始结果必须完整保留，模型先完整收到该内容，
-有效响应提交后才允许收起；失败、估算和未提交响应不算完整展示。回读可以取全文或准确范围，
-回读结果同样遵守先展示后折叠，短内容无需收起。折叠前必须具有当前会话可用的回读工具，
-不得重跑原工具来恢复证据、跨会话读取或把部分结果声称为全文。首次全文超出容量时明确失败，
-不伪造已读回执。详见 [0081](decisions/0081-content-views-keep-original-messages.md)。
+每次模型请求读取 Session 当前目录和适用 AGENTS，目录切换在同 Turn 下一请求生效。规则从最近 Git 根到当前目录按父子顺序读取，每层 override 优先，累计上限 32 KiB；更深规则在进入对应目录前读取。来源和读取失败可见；失败允许聊天并暂停依赖规则的仓库修改。规则删除或切换撤下旧材料，不保存为永久用户消息、全局 persona 或记忆，不自动加载项目配置、Skill 或启动脚本。
+
+### CTX-008 工具结果持续可见
+
+上下文中的工具结果不得因已经展示过而自动替换成预览或回读引用。原始消息完整保留，
+既有回读引用继续展开指定全文或字符范围，不重跑原工具恢复证据，不改写历史记录。
+上下文容量继续按既有非破坏性窗口与摘要协议处理；详见
+[0090](decisions/0090-tool-results-stay-visible.md)。
 
 ### SES-001 Message 追加按事实原子提交
 
@@ -448,21 +475,37 @@ Message 的 `metadata` 是按插件命名空间组织的普通 JSON 对象，用
 
 metadata 与正文同事务提交，参与同 ID 幂等核对，提交后不可原位更新。未知扩展在存储、历史读取和客户端同步中原样保留；缺少插件不影响正文与通用附件可读。插件不支持扩展版本时明确报告该扩展不可用，不猜测解释或删除数据。后续反馈与消费进度由插件自己保存并关联 message_id。物理减少仍只按 SES-003 执行。
 
+### SES-011 Project 默认目录与 Session 当前目录独立
+
+Project 可以永不关联目录；首次关联已存在且可访问的执行主机目录后固定，同值重试幂等，改绑或清空失败。新 Session 在创建提交时一次快照默认值，包括未指定和已失效路径；旧 Session 不追溯继承。Agent 可显式切换当前 Session 的已有目录，成功后持久保留，失败保留旧值。切换不改变组织身份、scope、消息、记忆和其他 Session，不自动创建或删除 worktree。
+
+UI 只有 Project 首次目录选择入口，提交前显示完整路径和不可更改说明；取消不保存。Session 只读展示当前路径和规则来源。失效目录保留并明确显示不可用，不混同未关联，不自动创建或回退到运行 workspace、scratch 或 Project 默认值。删除 Project/Session 不删除外部目录。
+
 ### SES-010 Session scope 是接纳时固定的宽键
 
 Session 的 `scope` 是一组 `维度 → 取值` 的固定事实，例如 `{project: p_x}`，以后可以增加 `computer` 等维度。Message 通过 `session_id` 继承 scope，不逐条复制。scope 与 visibility、learning 一起在 Session 首次接纳时写入并永久不变；同 ID 重试属性相同则幂等，不同则失败。缺失维度一律解释为 `default`，因此增加维度不迁移旧 Session，旧数据自然属于 `(default, …)`。
 
 Core 只保存和比较 scope，不解释维度含义。每个维度必须有唯一 owner 插件注册取值校验；没有 owner 的维度不能接纳，取值只在首次接纳时校验。维度 owner 的记录只能改名或归档，不能删除，使历史 Session 永远可解析。消费者（展示、记忆、检索）只读 scope，各自决定如何分组，不能反向改写。
 
+### SES-012 首条用户消息自动命名
+
+启用自动标题插件时，新会话首条用户输入可以后台生成简短标题，写入现有 `sessions.title`。
+它不阻塞回复，不为旧会话批量补标题，也不在后续消息或用户清除标题时再次生成。
+写入只在标题仍为空且会话未软删时成功；用户已提交的非空标题优先，竞争失败直接放弃。
+这里按落库时的当前值乐观判断，不增加标题版本或追踪先改名再清空的历史。
+预期模型失败、超时或空响应可使用首句截断；内部与存储错误必须可见。
+标题变化不改变消息、attributes、学习输入、`updated_at` 或目录排序；不自动减少任何数据。
+
 ## 8. 记忆系统
 
 ### MEM-001 档案重写同时验证结构和事实保全
 
 替换 MEMORY 或 SELF 要求模型输出 Markdown 结构合法、必需 section 完整，且受保护事实没有无理由消失。结构合法不代表语义完整；删除 pinned fact 必须有显式 tombstone、来源和理由。
+常驻档案超额时，允许按 MEM-014 压缩并舍弃低价值条目；此授权不扩展到 topics 中的 pinned 主题或会话正文。
 
 ### MEM-002 Markdown 记忆按 checkpoint 直接且独立提交
 
-Included compaction checkpoint 是 Markdown 记忆唯一的自动写入触发。MEMORY 与 SELF 分别按
+Included compaction checkpoint 是 Markdown 新事实的自动提炼来源；既有条目的去重整理和 MEM-014 超额剪枝可独立触发。MEMORY 与 SELF 分别按
 `source_ref + kind` 幂等提交；一份失败不得伪装另一份成功，也不得回滚 Session ledger。
 每次替换前先保留恢复点，并以校验、fsync 和原子 replace 发布。旧非空 PENDING 只允许在
 带备份和 receipt 的一次性迁移中合并，在线 runtime 不再创建或消费 PENDING。
@@ -515,7 +558,13 @@ Akasha 按固定版本的 Turn 投影取得全部 Input 与唯一完成 Output�
 
 ### MEM-011 历史投影按完整 Turn 和 token tail 保留
 
-Session compaction、Markdown consolidation 的切点和 prompt history 必须使用同一版本的完整 Turn 投影。每条已送达 proactive、`message_push`、schedule fire 和 spawn completion assistant 若属于独立 source，则各自作为独立单元；任何窗口、retained tail 或 consolidation cursor 不得落入一个已关闭 Turn 内部。runtime 不再使用 `memory_window` 计数；compaction 反向累积至少 20,000 token，并允许因完整 Turn 跨过阈值。展开后可以超过 token target，但重建 provider payload 必须满足当前模型硬输入边界。
+Turn 归属与 Markdown consolidation 使用同一版本的完整 Turn 投影；模型请求摘要按
+CTX-007 的安全工具批次切分，20,000 token 是近期原文目标。每条已送达 proactive、
+`message_push`、schedule fire 和 spawn completion assistant 若属于独立 source，仍拥有
+原归属。Markdown 不学习累计摘要覆盖尚未到达结束边界的 Turn；后续覆盖完整闭合后，
+按父链的真实摘要输入补学被延后的尾部，已完整应用的 Turn 不重复学习，省略资料不
+因此恢复资格。runtime 不再使用
+`memory_window`；临时请求切点不得改变 Message、Turn 或学习资格。
 
 ### MEM-012 Markdown 新用户事实必须有用户原文证据
 
@@ -525,11 +574,18 @@ Markdown 新草稿逐条引用本次可学习的真实 Message ID。用户事实
 
 ### MEM-013 Akasha 图是按 scope 路由的物化视图
 
-`sessions.db/messages` 仍是唯一事实来源；Akasha 的每张图只是日志上的一个物化视图，拥有自己的成员选择与消费进度，不是日志分区。路由由 Akasha 拥有的策略决定：每个 `(维度, 取值)` 一条 `global | isolated | off`，缺失即 `global`，与旧行为一致。global 学习进入并召回 default 图；isolated 只在本范围自己的图内学习和召回，多个维度同为 isolated 时按显式偏键合成一张图；off 不写入任何图但仍召回其所属图。`learning=excluded` 仍是 Core 的硬排除，优先于任何策略。
+`sessions.db/messages` 仍是唯一事实来源；Akasha 的每张图只是日志上的一个物化视图，拥有自己的成员选择与消费进度，不是日志分区。路由由 Akasha 拥有的策略决定：每个 `(维度, 取值)` 一条学习策略 `global | isolated | off` 和独立的 `recall` 开关，缺失即 `global` 与 `true`，与旧行为一致。global 学习进入并召回 default 图；isolated 只在本范围自己的图内学习和召回，多个维度同为 isolated 时按显式偏键合成一张图；off 不写入任何图但仍召回其所属图；任一维度的 `recall=false` 禁止该 Session 的自动和显式召回，记忆工具不能绕过。创建项目的“不使用记忆”对应 `off + recall=false`，不影响聊天记录、会话上下文或 Markdown 档案。`learning=excluded` 仍是 Core 的硬排除，优先于任何策略。
 
 default 图沿用 `memory/akasha.db`，不迁移已有数据；独立图位于 `memory/akasha-graphs/<规范键摘要>/`，附带记录规范键的 `manifest.json`，embedding 仍按 Message 共享。策略只能在该取值还没有任何 Session 时一次写入；已有 Session 后改变策略需要另行批准的显式重建协议，普通 UI 不提供改写。显式重建逐图执行，每张图各自按 MEM-009 留恢复点并原子替换。
 
 单张图需要重建或 embedding 空间不匹配时，必须明确报告该图身份和原因，停止该图的学习与召回，其他图继续运行。访问故障图不得回退到全局图；健康图成功不得清除故障图状态。公共 embedding 依赖不可用时，按实际依赖范围报告不可用。未预期异常继续传播，不作为可跳过的图故障。
+
+### MEM-014 常驻 Markdown 档案超额自动剪枝
+
+MEMORY 的三个用户章节及 SELF 的受管理章节超出配置配额时，Markdown owner 必须让模型按长期价值压缩、合并或舍弃较低价值条目，并恢复到配额内；既有文件超额与本批提炼将导致超额都适用。
+剪枝只解释现有条目，不新增事实，不改标题、其他手写章节、topics、Session 或 Akasha 数据。模型不能凭文件顺序判定矛盾条目的新旧；不确定时优先保留重要约束。
+提交使用已验证操作、不可覆盖的写前副本和幂等 receipt，明确区分成功、冲突与失败。非法或不完整结果不写文件；可重试模型或文件故障保留进度并稍后重试。定期整理的时间与数量门槛不得阻止容量自愈。
+本条允许常驻 Markdown 正文物理减少；来源消息和写前副本不因此减少。决定与代价见 [0116](decisions/0116-markdown-budget-pruning.md)。
 
 ## 9. 运行时、并发和出站
 
@@ -548,6 +604,8 @@ default 图沿用 `memory/akasha.db`，不迁移已有数据；独立图位于 `
 已有 durable inbound handoff 仍须按原 owner 的提交证据结算；移除旧入口不授权删除未结算的 handoff。
 
 ### RUN-004 Linux 正式入口由 Supervisor 托管
+
+Docker 分发是本条的明确例外：容器直接启动 Gateway，由 AppRuntime 拥有公网 Web、boot 与 readiness；Docker init 收割容器子进程，systemd 管理 Compose。容器不注册 `agent_restart`。自部署通过现有 Shell 提交独立宿主任务，指定回合正常结束且最终回复确认送达、关闭新工作准入并排空后才停止；正常关闭证据与实际旧写入者退出成立后才能迁移。失败不伪造成功，也不自动续跑原回合。直接 Python 启动仍遵循下述 Supervisor 合同。见 [0091](decisions/0091-shell-self-deployment.md)。
 
 Linux 上无子命令执行 `python main.py` 是正式服务入口，必须先进入 workspace 唯一的 Supervisor，再由每个 boot 唯一的 Guardian 启动和清理 gateway。`supervise` 只作为 Linux 兼容别名；显式 `gateway` 只用于未托管调试，并且不得注册 `agent_restart`。非 Linux 默认入口必须明确警告并进入 unmanaged gateway，`supervise` 必须拒绝启动，且两者都不得提供 `agent_restart`、Supervisor settings、私有 readiness/commit 或 boot 进程树清理。Linux 自重启仍须经过当轮获授工具 view、回复持久化与送达、boot-scoped 私有提交证据和约定退出码；`agent_restart` 由 `message_push` 的 supervised-only child 提供，不以工具搜索结果作为授权。旧 boot 清理尽力执行并记录未清空目标，但清理失败不阻止已合法提交的下一代。普通退出、崩溃、伪造退出码或未知进程身份不得拉起下一代，也不得触发 crash auto-restart。
 
@@ -715,11 +773,11 @@ Scope 唯一持有资源关闭责任，provider 实现实际关闭。消费者�
 
 ### PLG-009 Skill 和 MCP 通过插件安装发布
 
-Skill、Drift skill 和 MCP server 由固定插件制品中的代码通过对应 provider 注册。插件底座不解释 `akashic.plugin.toml`，不保留静态资产导出与 `apply` 并行的注册路径。安装只准备代码与运行环境；资源请求只定义一次，由拥有该资源的 provider 验证和执行。Core 固定制品与组合，不解释 Skill 格式、MCP 命令或 Workload 端点关联。历史 skill 目录、软链接和 ownership journal 保留，不自动减少；未完成外部效果仍由原 owner 负责。
+普通 Skill 按 workspace、用户目录、插件来源的顺序选择，使用时热读取；来源分层不授予额外权限。Drift skill 和 MCP server 由已安装插件代码通过对应 provider 注册。插件底座不解释 `akashic.plugin.toml`，不保留静态资产导出与 `apply` 并行的注册路径。安装只准备代码与运行环境；资源请求只定义一次，由拥有该资源的 provider 验证和执行。Core 固定制品与组合，不解释 Skill 格式、MCP 命令或 Workload 端点关联。Skill 不复制资源目录或永久保存历史文件树；相对资源使用实际目录。历史 skill 目录、归档、软链接和 ownership journal 保留，不自动减少；未完成外部效果仍由原 owner 负责。
 
 ### PLG-010 卸载插件默认保留 plugin-data
 
-插件制品、安装选择和 workspace 内 `plugin-data` 使用不同生命周期。普通卸载在同一运行图上局部移除该插件节点，释放旧运行资源，但保留数据、历史 binding 与恢复仍引用的制品。不把物理制品 GC 混入换代。永久删除插件数据需要名称不同的用户操作、影响预览、独立备份和再次确认，不能作为卸载的隐式 cascade。
+插件代码、安装选择和 workspace 内 `plugin-data` 使用不同生命周期。普通卸载在同一运行图上局部移除该插件节点，排空实际 owner 后删除外置安装代码；内置只停用。不保留历史代码作为恢复调用的前提，旧归档仍不自动删除。数据、配置、历史 binding 与回执保留。永久删除插件数据需要名称不同的用户操作、影响预览、独立备份和再次确认，不能作为卸载的隐式 cascade。
 
 ### PLG-011 插件 UI 投影返回有界语义结果
 
@@ -729,13 +787,13 @@ Core 只负责通用传输、revision、运行实例引用、调度、取消和�
 
 ### PLG-012 安装请求由宿主持有异步应用任务
 
-发起安装、更新或卸载的调用只登记请求并先返回 accepted，accepted 不等于 active；宿主接管后续应用任务，调用不得同步等待自身引用的释放，不得在调用内停 endpoint 或删除代码。普通卸载保留 plugin-data、SessionDB、memory、journal 和 canonical source；停止或清理失败保留实际 owner 并报告残留，不能假报完成。
+发起安装、更新或卸载的调用只登记请求并先返回 accepted，accepted 不等于 active；宿主接管后续应用任务，调用不得同步等待自身引用的释放，不得在调用内停 endpoint 或删除代码。普通卸载保留 plugin-data、SessionDB、memory、journal 和外部源码仓库，安装目录按 PLG-010 在排空后移除；停止或清理失败保留实际 owner 并报告残留，不能假报完成。
 
 ### PLG-013 安装选择是唯一持久输入选择
 
-运行时只有一张图，普通请求使用当前运行实例。安装增加不可变制品，并由唯一 owner 持锁原子更新已选输入记录；选择与运行状态明确分离，accepted 不等于 active。不存在 latest 候选、候选授权、晋升或 revert 撤销：新版本应用失败只使实际硬依赖分支不可用，不自动恢复旧版本；选择提交后进程退出时下次正常启动读取新选择，不续跑未完成的应用，不猜测旧版本安全。显式安装旧版本也是一次普通安装，仍由该版本解释现有数据，不承诺数据恢复。选择写入结果不确定时停止本次应用并报告不确定，不回写旧值。operator 显式更新仍固定精确制品、独占应用并记录真实验证来源，不伪造测试成功。旧状态格式只在带备份、锁与完整性检查的显式升级中转换，不在普通启动路径维持双读双写。
+运行时只有一张图，普通请求使用当前运行实例。安装发布实际代码目录，由唯一 owner 持锁原子更新唯一当前选择；运行时读取已安装文件和当前配置，不保存代码、配置或依赖图的历史闭包。版本和输入摘要只用于诊断与提交身份，不承诺外部环境不变。选择与运行状态明确分离，accepted 不等于 active。不存在 latest 候选、候选授权、晋升或 revert 撤销：新版本应用失败只使实际硬依赖分支不可用，不自动恢复旧版本；选择提交后进程退出时下次正常启动读取新选择，不续跑未完成的应用，不猜测旧版本安全。显式安装旧版本也是一次普通安装，仍由该版本解释现有数据，不承诺数据恢复。选择写入结果不确定时停止本次应用并报告不确定，不回写旧值。operator 显式更新仍固定精确版本、独占应用并记录真实验证来源，不伪造测试成功。旧状态格式只在带备份、锁与完整性检查的显式升级中转换，不在普通启动路径维持双读双写。见 [0094](decisions/0094-plugin-runtime-uses-installed-files.md)。外置插件的指针替换是安装唯一提交点；启动和下一安装按指针确切值结算中断安装，启动时外置输入以指针与 workspace patch 修正 selection，见 [0121](decisions/0121-plugin-install-settles-from-disk.md)。
 
-首次 `PluginSelection.read()` 为 `None` 时，底座可对每个 source 做静态 identity 与源码 compile 准备；插件自身的内容错误只保留进程内 source diagnostic，并跳过该输入。一次且仅一次 CAS 提交完整成功子集，全失败提交 `()`；提交后的 import/apply/Fiber 错误仍由 selected generation owner 解释，不反向健康过滤 selection。共享配置、cache/pointer、权限、归档、身份、selection/CAS 与 host 错误必须 fail-loud。watcher/SIGHUP 只 reconcile 当前 selection：新增或修复但未选 source 不自动安装，源码暂失不自动停用；运行期新增选择成员须显式 install，移除成员须显式 disable/uninstall；产品部署按 ONB-002 组合固定分发来源，已选健康 source 的更新仍走既有受控 prepare/replacement/CAS 链。source diagnostic 不新增 durable owner/schema/writer，`plugin_status` 可单独投影它并与 generation/Fiber 错误区分。
+首次 `PluginSelection.read()` 为 `None` 时，底座可对每个 source 做静态 identity 与源码 compile 准备；插件自身的内容错误只保留进程内 source diagnostic，并跳过该输入。一次且仅一次 CAS 提交完整成功子集，全失败提交 `()`；提交后的 import/apply/Fiber 错误仍由 selected generation owner 解释，不反向健康过滤 selection。共享配置、cache/pointer、权限、安装环境、身份、selection/CAS 与 host 错误必须 fail-loud。watcher/SIGHUP 只 reconcile 当前 selection：新增或修复但未选 source 不自动安装，源码暂失不自动停用；运行期新增选择成员须显式 install，移除成员须显式 disable/uninstall；产品部署按 ONB-002 组合固定分发来源，已选健康 source 的更新仍走既有受控 prepare/replacement/CAS 链。source diagnostic 不新增 durable owner/schema/writer，`plugin_status` 可单独投影它并与 generation/Fiber 错误区分。
 
 ### PLG-014 新插件使用开放组合能力并由 Core 统一应用
 
@@ -757,6 +815,11 @@ Channel factory/lifecycle/delivery/presentation、Dashboard module hook/HTTP 和
 诊断失败不得改变插件调用结果、事件顺序、Incident、取消和清理语义。精确 Turn、operation 与
 运行实例身份只作为 structured metadata；Prometheus 只聚合经过真实运行验证的低基数维度。
 诊断日志和聚合指标都是派生证据，不成为 Session、插件状态或外部效果的权威事实。
+
+默认组合提供本地运行诊断供运维读取，不提供诊断页面或顶部导航，不依赖外部监控服务。
+近期样本和操作记录有固定容量，慢读者缺口必须可见；换代和退出可清空临时诊断副本，不改业务状态。
+详细内存分配追踪默认关闭，由运维限时开启；导出只响应显式请求。
+未来外部接入只消费版本化只读记录，并独立拥有发送与失败，不给业务调用增加网络背压。
 
 ### PLG-016 内置插件与外部插件使用同一能力边界
 
@@ -782,9 +845,30 @@ Workload readiness 完成后，同一组合的 MCP 才能通过实际资源引�
 当前 release 中仍存在的内置插件，不能伪造 installed artifact pointer，也不能把缺少当前插件的状态记为
 成功。内置插件不得绕过该路径直接管理容器。
 
-默认 `computer` 插件通过这条普通边界提供一台持久 Linux 用户桌面。人工操作使用 generation-bound RFB
-通道直达同一 Xvnc display，Agent 的 Browser Use、Computer Use 和 OpenCLI 也只操作这台桌面及其唯一
-Chromium profile；Chat 不能用截图、方向按钮或独立文字表单伪装成桌面控制。
+默认 `computer` 插件通过这条普通边界提供一个持久 Chromium（用户看到的名称是“浏览器”）。
+容器只运行这一个浏览器，没有桌面层；Agent 的 Browser Use 与 OpenCLI 都操作它及其唯一 profile，
+操作单位是标签。人工观看与操作使用 generation-bound H.264 WebSocket 通道；Chat 不能用截图、
+方向按钮或独立文字表单伪装成浏览器控制。
+持久身份由磁盘 profile 保存；首次使用按需启动浏览器。无实际操作满 10 分钟且 Agent Turn 与
+身份刷新都结束后允许释放；面板打开、轮询和自动重连不延长占用或唤醒。下一次使用恢复
+已保存身份，JS 绑定和页面运行状态重新初始化。启停与主 profile 的单 writer 由 Computer
+插件内唯一 owner 保证；释放失败不能继续启动第二个 writer。身份刷新结束后不留下它打开的页面。
+见 [0084](decisions/0084-computer-keeps-identity-without-an-idle-desktop.md)、
+[0123](decisions/0123-computer-is-one-browser.md)；显示选择见
+[0088](decisions/0088-computer-streams-h264-over-dashboard-websocket.md)。
+Agent 可另建匿名 BrowserContext 做 E2E，与个人 profile 同进程但隔离身份和页面存储，
+不读取主 profile 的 cookie 与存储，不装 OpenCLI 扩展；面板标签条按真实 Context 和页面列出标签。
+画面同一时刻只给一个窗口，尺寸跟随该窗口；观看默认只读，未接管时键鼠、剪贴板与上传不送达浏览器。
+用户明确接管才获得输入权限，接管期间暂停 Computer Agent 操作；断开或主动释放后恢复。
+活动只提示，不打开工具区，包括移动端；工具区已打开时画面跟随 Agent 新开的标签，
+用户手动选过标签后本轮不再跟随。见 [0092](decisions/0092-computer-viewing-and-control.md)、
+[0123](decisions/0123-computer-is-one-browser.md)。
+匿名实例属于创建它的 Turn，最多同时八个；稳定 ID 可找回同一实例，不得误选主浏览器。
+完整结算且输入释放确认的脚本错误保留页面与 JS 绑定；取消、调用中断、Session 重置、
+Turn 结束或休眠时释放。匿名实例连续闲置 10 分钟且无正在执行操作或人工接管时释放；
+观看和目录轮询不延长期限。回收原因明确可查，失效 ID 不自动重建或切换主浏览器。
+关闭时销毁其 Context，页面一起消失，既有截图由原 owner 保留。
+见 [0093](decisions/0093-computer-reuses-anonymous-browsers.md)。
 
 ### PLG-018 工具依赖传递实际注册引用
 
@@ -793,7 +877,7 @@ Chromium profile；Chat 不能用截图、方向按钮或独立文字表单伪�
 显式依赖 `ALL_TOOLS`。当前引用失效时 fail-loud；已提交 Message 中的 binding 保留不可变业务
 metadata、回执和历史事实，并在调用者本次 activation 选定的 scope 中打开实际 service，
 不把历史 `root_ref` 当作普通执行的永久 generation 锁。插件系统负责依赖与切换，不按代码 hash、
-generation 或 archive_ref 判断旧数据能否处理。当前插件负责自己的持久化数据与外部效果，
+generation 或 input_ref 判断旧数据能否处理。当前插件负责自己的持久化数据与外部效果，
 处理不了就明确报错；系统传播错误，不兜底重跑。见 [0070](decisions/0070-plugins-own-persisted-data.md)。
 
 `load_tools` 只在获授 view 内按准确插件 ID 展示完整 schema，并可把自身协议中的间接调用解码为唯一真实
@@ -864,6 +948,10 @@ Shell 在短等待窗口内返回已完成结果；命令仍运行时返回当�
 
 工具执行错误必须作为工具结果或明确异常交给当轮 Agent；当前 query 结束后的 execution cleanup 属于独立生命周期。回复一旦按 OUT-001 提交，cleanup 的权限错误、超时或残留不得把 turn 改成 failed，也不得阻止已获合法提交的 Gateway 重启。仅剩 zombie 时由 Guardian 持续 `wait` 回收；仍有活进程且当前权限不能终止时，runtime 保留 execution ownership、记录结构化诊断，并在本次 runtime 内隔离同 owner 的新 Shell spawn，普通对话继续运行。cleanup 未确认前不得把 execution 从注册表移除；重启不持久化该隔离状态。
 
+### SH-004 Session 目录统一工具目标且不改变执行回执
+
+Shell 默认 cwd 与文件相对路径使用同一 Session 当前目录和执行 backend；未指定保留既有默认行为，失效明确失败。prepare 固定最终 cwd 和绝对目标，重试/恢复不重新读取当前目录。单次显式 cwd 不修改 Session，运行中进程保持启动目录。目录切换独占工具批次；混合批次在任何准备与效果之前明确拒绝，模型需单独调用。
+
 ### SH-003 Bridged Shell 保留统一句柄和 boot ownership
 
 Host Bridge 必须保留 SH-001 的完成/续接结果、增量输出、PTY 输入与 resize、硬超时、显式 stop 和整个进程组回收语义，不得降级成一次性同步 subprocess。每个宿主 execution 绑定 Core `boot_id` 与 lease；Core 断开、旧 boot 退出或生命周期 owner 要求清理时，Bridge 停止接受该 boot 的新 job，并在新代启动前终止且证明旧 job 空集。Bridge 不能全局串行不同 session，也不拥有 turn、programmatic control plane 或 restart 的业务终态。
@@ -878,11 +966,11 @@ Host Bridge 必须保留 SH-001 的完成/续接结果、增量输出、PTY 输�
 
 add、cancel 和 reschedule 先构造 candidate，持久化成功后才替换内存。stop 后不再产生新 tick；关闭回收 in-flight，停止期间周期任务不重排。
 
-### SCH-003 Soft 调度任务是无状态原子执行
+### SCH-003 定时任务在创建它的会话里执行
 
-每次 soft job 只使用当前 prompt、系统能力和工具完成一次独立 ReAct，不读取同一 job 的旧触发历史。每次触发使用独立的内部 Session，追加恢复所需的 Input、Output、ToolCall 和 ToolResult；这些消息不进入目标聊天的历史、自动投递或记忆学习。完整执行事实遵守消息只追加与工具效果恢复合同，不按任务结束自动删除。
+任务属于创建它的会话。`notify` 到点原文推送；`run` 在该会话里以本次触发独占的来源跑一轮回复，Input、工具调用、工具结果与最终回复都追加到该会话，不读取同一 job 的旧触发过程。历史范围由任务指定，默认只看本次触发；选择带会话历史时与普通对话相同。主对话空闲后才开始，用户的新输入优先。任务来源不进入记忆学习，任务内不提供写长期记忆的工具。
 
-目标 channel 负责忙碌时的准入与最终发送；推理成功且结果非空时，来源只向目标聊天追加一条最终通知并独立投递。回复完成、实际送达和 job 结算分别依据各自事实，失败、空结果或未知效果不得伪装成已送达。重启先恢复同一次触发的原消息、工具与发送回执，不能重新执行已完成的工作。
+最终回复非空时只投递这条原消息。回复完成、实际送达和 job 结算分别依据各自事实，失败、空结果或未知效果不得伪装成已送达。重启先恢复同一次触发的原消息、工具与发送回执，不能重新执行已完成的工作。
 
 ### PRO-001 主动流程的空、跳过和失败可区分
 

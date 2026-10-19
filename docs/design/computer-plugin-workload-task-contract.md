@@ -1,5 +1,7 @@
 # Computer 插件与 Workload 原子能力任务合同
 
+> 显示传输勘误：本栈的默认人工显示改为 [0088](../decisions/0088-computer-streams-h264-over-dashboard-websocket.md) 的 H.264 WebSocket，接入与验收见 [显示设计](computer-h264-display.md)。下文 RFB/noVNC 是原实现的历史基线；同一 display/profile、generation 与输入语义约束继续适用。
+
 - 状态：implemented / verified
 - 日期：2026-08-31
 - 基线：`origin/main@322f71a464eee3da99b018914bf4644f0b7338c5`
@@ -210,22 +212,10 @@ McpServer(
 
 ### 5.3 Chat 工具区
 
-`conversation-ui` 的 Web module 声明 `conversation.tools.v1`，cardinality 为 `list`。子 entry 合同只有：
-
-```ts
-interface ConversationTab {
-  id: string;
-  label: string;
-  order: number;
-  render(host: HTMLElement, view: ConversationTabView): void | (() => void);
-}
-
-interface ConversationTabView {
-  active: boolean;
-  onActiveChange(listener: (active: boolean) => void): () => void;
-  requestAttention(noticeId: string): void;
-}
-```
+`conversation-ui` 的 Web module 声明 `conversation.tools.v2`，cardinality 为 `list`。子 entry 与父视图的类型见
+`packages/akashic-conversation-tools-v2/index.d.ts`，结构摘要取同目录 `contract.json`；v1 已随 [0121](../decisions/0121-conversation-workbench-tabs.md) 删除。
+v2 在 v1 的 `active`、`onActiveChange`、`requestAttention` 之外，增加聊天报告的当前会话 `session` 与 `onSessionChange`，
+以及用户点击触发的意图投递 `onIntent` 与引用回输入框的 `quote`（字段与上限见合同 JSON）。
 
 顶部是标签，不叫 `tag`；用户界面使用“标签”，entry 使用浏览器常用的 `ConversationTab`。
 `ConversationTabView` 是 generation-bound 父视图；它不暴露 `open()` 或可写父状态。conversation-ui 唯一拥有
@@ -253,7 +243,7 @@ interface ConversationTabView {
 多个插件只增加标签：
 
 ```text
-conversation.tools.v1
+conversation.tools.v2
 ├── computer: Computer
 ├── files: Preview
 └── call: Transcript
@@ -415,7 +405,7 @@ WorkloadData 也不能挂正式目录；Computer candidate 只使用隔离复制
 - 唯一的普通插件工具 `computer`，组合 Browser 与 Desktop 驱动；
 - MCP 子进程只承接 WorkloadEnv、启动检查和驱动控制连接，不发布模型工具；
 - `opencli` Skill；Skill 只教 Agent 通过普通 `shell` 调用 CLI，不把 CLI 参数包装成 Browser Tool；
-- `conversation.tools.v1` 中的 Computer 标签；标签使用标准 noVNC RFB client，不自行模拟鼠标或键盘；
+- `conversation.tools.v2`（原 v1）中的 Computer 标签；标签使用标准 noVNC RFB client，不自行模拟鼠标或键盘；
 - 人工输入经 generation-bound dashboard WebSocket 到 RFB；Agent 视觉输入经 Gateway 到同一个 Xvnc display；
 - profile 与登录刷新状态的插件数据 schema。
 
@@ -436,9 +426,15 @@ OpenCLI daemon、extension 和 connectivity 可用。登录态是各站自己的
 Agent 使用 `computer` 执行持久 JavaScript，通过 `browser` 读取页面结构和操作元素，通过
 `sky` 完成桌面输入和截图。调用身份、取消、标签归属和 Turn 收尾见
 [驱动源码迁移](computer-driver-source-migration.md)。原四个 MCP 工具已移除。
-截图结果原子写入 Computer plugin-data 下的有界文件集合并返回绝对路径，统一提示用 `read_file`
-读取。`read_file` 按当前 Agent 的真实模型能力提供图片内容；不支持图片时才提示使用
-`read_image_vision`。截图工具不把 base64 当作文本返回；每次写入仍只保留最近 32 张截图。
+截图结果在同一次工具回执中成为图片附件，模型可直接查看；绝对路径同时保留供后续使用。
+Computer MCP 仍原子写入 plugin-data 下的截图缓存，每次只保留最近 32 张。Computer 工具
+通过 Ledger 的窄导入接口保存独立的持久附件；同一调用超过 32 张也使用原图字节，不依赖
+缓存路径仍存在。消息和附件只增加，不改写旧回执；缓存淘汰、Turn 结束或插件卸载不删除
+Ledger 附件。旧消息和图片可按原引用回读。`read_file` 保留为图片文件的通用入口；只有当前
+模型已经收到像素时，才可以省略重复回读。不支持图片的主模型通过 `read_image_vision(path,
+prompt)` 得到视觉描述，不能仅凭文件路径声称看过图片。该工具由 standard_tools 注册，
+Files 拥有路径与图片读取，Models 拥有本次执行冻结的 vision 角色；没有可用视觉模型时明确
+失败，不循环截图或猜测。base64 不作为主模型文本返回。
 
 用户通过完整 RFB client 使用桌面；Agent 通过同一个容器内的驱动操作。两条路径复用同一桌面、
 浏览器和 profile。原 HTTP 路由仍供已有 benchmark 与驱动检查使用，不作为模型工具发布。

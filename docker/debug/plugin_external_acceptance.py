@@ -56,13 +56,6 @@ _SAFE_CAPABILITY_ENTRYPOINTS = {
 # keeping the acceptance run free of network credentials and external sends.
 _BOOTSTRAP_CONFIG = """[runtime]
 workspace = {workspace!r}
-
-[app_server]
-enabled = true
-listen = ""
-max_connections = 32
-ingress_queue_size = 128
-outbound_queue_size = 512
 """
 
 
@@ -499,6 +492,10 @@ def _write_bootstrap_config(
     save_config(workspace / "plugin-data" / f"akashic_clients-{marketplace}", {
         "enabled": True, "web": {"enabled": True, "socket_path": ""},
     })
+    save_config(workspace / "plugin-data" / f"gateway-{marketplace}", {
+        "enabled": True, "listen": "", "max_connections": 32,
+        "ingress_queue_size": 128, "outbound_queue_size": 512,
+    })
     path.write_text(
         _BOOTSTRAP_CONFIG.format(workspace=repr(str(workspace))),
         encoding="utf-8",
@@ -510,9 +507,9 @@ def _runtime_task_evidence(runtime: Any) -> dict[str, Any]:
     tasks = {
         name: getattr(runtime, name)
         for name in (
-            "dashboard_task",
+            "web_shell_task",
             "plugin_watcher_task",
-            "_primary_task",
+            "_shutdown_task",
         )
     }
     return {
@@ -618,7 +615,7 @@ async def _start_app_runtime(
         }
     )
     checks = evidence["checks"]
-    from agent.plugin_composition.channels import CHANNELS
+    from plugins.channels.contract import CHANNELS
     channel_provider = None if live_root is None else live_root.context.get(CHANNELS)
     evidence["channel_host_present"] = channel_provider is not None
     checks.update(
@@ -869,7 +866,7 @@ async def _invoke_capability(
                 or not isinstance(input_value["value"], dict)
             ):
                 raise ValueError("model.facts oracle input 必须是 {kind,value} ContentPart")
-            from session.message import ContentPart
+            from plugins.ledger.contract import ContentPart
 
             actual = value(ContentPart(input_value["kind"], input_value["value"]))
         elif service in {
@@ -905,7 +902,7 @@ async def _invoke_capability(
             raise ValueError("Message roundtrip 结果缺少 session_id")
         if not isinstance(message_id, str) or not message_id:
             raise ValueError("Message roundtrip 结果缺少 message_id")
-        from agent.plugin_composition.messages import MESSAGE_CATALOG
+        from plugins.ledger.contract import MESSAGE_CATALOG
 
         catalog = root.context.require(MESSAGE_CATALOG)
         message = catalog.reader(session_id).get(message_id)
@@ -941,7 +938,6 @@ def _generation_evidence(
     *,
     generation: Any,
     artifact: Path,
-    workspace: Path,
     repo_root: Path,
     source_checkout: Path | None,
 ) -> dict[str, Any]:
@@ -957,11 +953,10 @@ def _generation_evidence(
     if not isinstance(module_file, str):
         return evidence
     module_path = Path(module_file).resolve(strict=True)
-    archive_root = (workspace / "runtime" / "plugin-archives").resolve(strict=False)
     installed_entrypoint = (artifact / "plugin.py").resolve(strict=True)
     evidence["module_file_sha256"] = _sha256(module_path)
     evidence["installed_entrypoint_sha256"] = _sha256(installed_entrypoint)
-    checks["module_file_is_core_archive"] = _under(module_path, archive_root)
+    checks["module_file_is_installed_entrypoint"] = module_path == installed_entrypoint
     checks["module_file_not_checkout"] = not any(
         _under(module_path, root)
         for root in (repo_root / "plugins", source_checkout)
@@ -1110,7 +1105,6 @@ async def _exercise(
                 _generation_evidence(
                     generation=generation,
                     artifact=artifact,
-                    workspace=workspace,
                     repo_root=repo_root,
                     source_checkout=source_checkout,
                 )
@@ -1319,7 +1313,6 @@ async def _exercise_fleet(
                     _generation_evidence(
                         generation=generation,
                         artifact=row["artifact"],
-                        workspace=workspace,
                         repo_root=repo_root,
                         source_checkout=row.get("source_checkout"),
                     )
@@ -1445,6 +1438,7 @@ async def _exercise_business_composition(
     marketplace: str,
     workspace: Path,
     plugins_home: Path,
+    api_sources: tuple[Path, ...] = (),
     core_root: Path | None = None,
     replacement: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -1493,17 +1487,11 @@ async def _exercise_business_composition(
     PluginSelection(workspace).initialize()
     from agent.plugins.install import install_git_plugin
     from agent.plugins.manager import PluginManager
-    from bus.event_bus import EventBus
-    from session.log import MessageLog, SessionAttributes
-
-    log = MessageLog(workspace / "sessions.db")
-    bus = EventBus()
+    log = None
     manager = PluginManager(
         [],
-        event_bus=bus,
         workspace=workspace,
         installed_cache_root=plugins_home / "cache",
-        message_log=log,
     )
     reports: list[dict[str, Any]] = []
     installed_by_id: dict[str, dict[str, Any]] = {}
@@ -1543,6 +1531,11 @@ async def _exercise_business_composition(
         return evidence
 
     try:
+        from agent.plugins.bundles import set_plugin_choice
+        for source in api_sources:
+            installed = install_git_plugin(workspace=workspace, source=str(source),
+                marketplace=marketplace, plugins_home=plugins_home)
+            set_plugin_choice(workspace, _plugin_id_from_manifest(installed.installed_path, marketplace), enabled=False)
         # 1. Install every declared provider and consumer before loading the
         # composition.  A single package is never treated as an isolated pass.
         for job in jobs:
@@ -1597,9 +1590,11 @@ async def _exercise_business_composition(
             reports.append(row)
 
         await manager.load_all()
+        from plugins.ledger.contract import MESSAGE_CATALOG, SessionAttributes
         initial_root = manager.live_root
         if initial_root is None:
             raise RuntimeError("business composition 未形成 live Root")
+        log = initial_root.context.require(MESSAGE_CATALOG)._log
         initial_generations = {
             plugin_id: manager.generation(plugin_id)
             for plugin_id in installed_by_id
@@ -1620,15 +1615,18 @@ async def _exercise_business_composition(
             if not isinstance(plugin_id, str):
                 continue
             generation = initial_generations.get(plugin_id)
-            row["checks"]["apply"] = generation is not None
+            from agent.plugin_composition import FiberState
+            row["checks"]["apply"] = (generation is not None and generation.fiber is not None
+                                      and generation.fiber.state is FiberState.ACTIVE)
             if generation is None:
                 row["error"] = row.get("error", "apply 后缺少 live generation")
                 continue
+            if generation.fiber is not None and generation.fiber.error is not None:
+                row["error"] = str(generation.fiber.error)
             source_checkout = _source_checkout(str(row["source"]), repo_root)
             row["generation"] = _generation_evidence(
                 generation=generation,
                 artifact=Path(str(row["installed_artifact"])),
-                workspace=workspace,
                 repo_root=repo_root,
                 source_checkout=source_checkout,
             )
@@ -1636,7 +1634,7 @@ async def _exercise_business_composition(
                 {
                     key: bool(row["generation"]["checks"].get(key, False))
                     for key in (
-                        "module_file_is_core_archive",
+                        "module_file_is_installed_entrypoint",
                         "module_file_not_checkout",
                         "module_bytes_match_installed_artifact",
                     )
@@ -1827,20 +1825,15 @@ async def _exercise_business_composition(
         try:
             await manager.terminate_all()
         finally:
-            try:
-                log.close()
-                await bus.aclose()
-            finally:
-                if source_restore is not None:
-                    original, backup = source_restore
-                    if original.exists():
-                        raise RuntimeError(f"原源码路径被重新占用，备份保留在 {backup}")
-                    backup.rename(original)
+            if source_restore is not None:
+                original, backup = source_restore
+                if original.exists():
+                    raise RuntimeError(f"原源码路径被重新占用，备份保留在 {backup}")
+                backup.rename(original)
 
     resource_close = {
         "live_root_closed": manager.live_root is None,
-        "message_log_closed": log._closed,
-        "event_bus_closed": bus._closed,
+        "message_log_closed": log is not None and log._closed,
     }
     for row in reports:
         row.pop("artifact", None)

@@ -1,40 +1,44 @@
 from __future__ import annotations
 
 from importlib import import_module
-from agent.plugin_composition.ui import UI
+from plugins.ui.contract import UI
 
 import hashlib
+import base64
 import json
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import cast
 
 from agent.plugin_composition import (
-    MCP_SERVERS,
     RUNTIME_STARTED,
     ServiceKey,
-    WORKLOADS,
     Context,
-    McpServerDefinition,
-    WorkloadEnv,
+)
+from plugins.workloads.contract import (
+    WORKLOADS,
     Workload,
     WorkloadData,
     WorkloadHealth,
     WorkloadLimits,
     WorkloadPort,
 )
+from plugins.mcp.contract import MCP_SERVERS, McpServerDefinition, WorkloadEnv
 from core.common.file_io import run_file_io
 
-from agent.plugin_composition.assets import INSTALLED_ASSETS
-from agent.plugin_composition.bindings import BINDINGS
-from agent.plugin_composition.messages import MESSAGE_CATALOG, OWNER_STATE
+from plugins.assets.contract import INSTALLED_ASSETS
+from plugins.ledger.contract import BINDINGS
+from plugins.ledger.contract import MESSAGE_CATALOG, OWNER_STATE
 from .inputs import CallSource, Result, TOOLS, TURN_PROJECTION, TurnProjection
-from agent.plugin_composition.messages import MessageCatalog, OwnerRecord, OwnerStore
-from agent.plugin_contracts import ContentPart, Input, Message, Output, ToolCall
+from plugins.ledger.contract import MessageCatalog, OwnerRecord, OwnerStore
+from plugins.ledger.contract import ARTIFACT_IMPORT, AttachmentKind, ContentPart, Input, Message, Output, ToolCall
 
 from .control import ComputerDriverError, endpoint_name, request
 
+# 私有耐久 control binding；工具的 freeze/open 在本插件内保存并打开同一个 key。
 COMPUTER_CONTROL = ServiceKey["ComputerControl"]("computer.control.v1")
 
 
@@ -139,7 +143,7 @@ def _driver_context(generation_id: str, identity: ComputerCall, call_id: str) ->
 api_version = 3
 name = "computer"
 version = "2.0.0"
-desc = "Persistent Linux desktop, browser, and visual control"
+desc = "The user's logged-in browser: tabs, anonymous contexts, and visual control"
 author = "Akashic Core"
 inject = (UI,
     INSTALLED_ASSETS,
@@ -149,6 +153,7 @@ inject = (UI,
     BINDINGS,
     MESSAGE_CATALOG,
     OWNER_STATE,
+    ARTIFACT_IMPORT,
     TURN_PROJECTION,
 )
 workspace_roots = ()
@@ -156,7 +161,7 @@ workspace_files = ()
 
 _IMAGE = (
     "ghcr.io/kachofugetsu09/akashic-computer@"
-    "sha256:4a4381b211024ac1fbf3730bd835a8cfa6cd7dd36996bf018437c13796ef0894"
+    "sha256:aaf9cf3c0b9cf08b8a88f2935e3be1ff47e1bac118610bdfe6bd2664ff07d3c9"
 )
 
 
@@ -201,10 +206,28 @@ class _ComputerTool:
         return values
 
     async def invoke(self, key: str, arguments: Mapping[str, object]) -> Result:
+        """保留文本顺序，把截图直接提交为本次工具回执的图片附件。"""
+        # 1. 动作仍由原 control owner 执行；失败不伪装成空成功。
         value = await self._control.run(key, self._control_binding, arguments)
         if value.get("kind") == "driver_error":
             return Result("error", (ContentPart("text", cast(str, value["error"])),))
-        return Result("success", (ContentPart("text", json.dumps(value, ensure_ascii=False)),))
+        # 2. 文本与图片保持驱动顺序；Ledger 拥有持久附件，截图缓存仍由 MCP 管理。
+        parts = []
+        for item in cast(list[dict[str, str]], value["content"]):
+            if item["type"] == "text":
+                parts.append(ContentPart("text", item["text"]))
+            elif item["type"] == "image":
+                with TemporaryDirectory(prefix="akashic-computer-image-") as folder:
+                    path = Path(folder) / "screenshot"
+                    raw = base64.b64decode(item["data"], validate=True)
+                    _ = await run_file_io(lambda: path.write_bytes(raw))
+                    ref = await self._control.ctx.require(ARTIFACT_IMPORT).import_source(str(path), AttachmentKind.IMAGE)
+                if ref.kind is not AttachmentKind.IMAGE:
+                    raise ValueError("Computer returned invalid image bytes")
+                parts.append(ContentPart("artifact_ref", ref.artifact_id))
+            else:
+                raise ValueError(f"Unknown Computer content type: {item['type']}")
+        return Result("success", tuple(parts))
 
     async def query(self, key: str) -> Result | None:
         _ = key
@@ -254,29 +277,40 @@ async def apply(ctx: Context) -> None:
     await ctx.require(UI).register(
         ctx, web="web_module.js",
         dashboard=lambda: import_module(".dashboard", __package__),
-        requires=("conversation.tools.v1",),
+        requires=("conversation.tools.v2",),
         provides=(),
         contract_digests={
-            "conversation.tools.v1": "ed47d69b84e946e27a2e297634e96bcc6afc72a3d3089caac1a14632703efb54",
+            "conversation.tools.v2": "dcbf5db629d4fa6fed4019ad91663f9af94c5b9a02f9e67c94b0745e40f19049",
         },
     )
     await ctx.require(INSTALLED_ASSETS).register(ctx, "skills", "skills")
     _ = await ctx.require(TOOLS).declare_group(ctx, description=desc)
+    # 浏览器容器只挂载 state 数据目录（Controller 负责创建与属主）；本地静态页放进其中的 pages。
+    pages = ctx.data_root / "state" / "pages"
     control = ComputerControl(ctx)
     _ = await ctx.provide(COMPUTER_CONTROL, control)
     await ctx.require(TOOLS).register(
         ctx,
         name="computer",
         description=(
-            "Read or operate browser and desktop UI in the persistent container. "
+            "Read or operate web pages in the user's logged-in browser. "
             "Prefer web_search/web_fetch for information available without UI interaction; "
             "use this for interactive or login-dependent pages, visual inspection, or when "
             "search/fetch fails or cannot provide the needed content. "
             "Prefer suitable dedicated skills, connectors, APIs or CLIs when available. "
-            "Run JavaScript with the initialized browser and desktop APIs. "
-            "Use browser.tabs, tab.ax, tab.playwright, tab.dom_cua or sky. "
-            "Bindings persist within this Session. Call nodeRepl.write(value) or "
-            "nodeRepl.emitImage(bytes) for output. Read the computer skill first."
+            "Run JavaScript with the initialized browser APIs. "
+            "Only documented APIs are available; this is not full Playwright. "
+            "Use explicit nodeRepl.write/emitImage output; expression values are not echoed. "
+            "Use browser.tabs, tab.ax, tab.playwright, tab.dom_cua or tab.cua. "
+            "Use agent.browsers.create() for an anonymous BrowserContext and close() to release it. "
+            "Reuse anonymous browser bindings across calls; browsers.get(browserId) reselects the same instance. "
+            "Ordinary script errors keep pages and bindings when cleanup succeeds; the receipt says when reset. "
+            "Use var for reusable bindings, browser.tabs.list() and browser.tabs.new(); read API documentation before actions. "
+            "Idle anonymous instances release after 10 minutes. Call nodeRepl.write(value) or "
+            "nodeRepl.emitImage(bytes) for output. Read the computer skill first. "
+            "The browser runs in its own container: localhost there is the container, and host ports "
+            f"are usually firewalled. To show a local static page, write it under {pages} (create it if needed) and open "
+            "file:///data/pages/<relative path>."
         ),
         parameters={
             "type": "object",
@@ -321,7 +355,7 @@ async def _register_workload(ctx: Context):
             command=("/opt/computer/start.sh",),
             ports=(
                 WorkloadPort("gateway", 8080),
-                WorkloadPort("display", 6080),
+                WorkloadPort("stream", 6081),
                 WorkloadPort("opencli", 19826, loopback=19825),
             ),
             data=(WorkloadData("state", "/data"),),

@@ -1,31 +1,21 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import logging
 import os
 import signal
-import stat
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-import uvicorn
+from bootstrap.web_shell import WebShellServer
 
-from agent.config import resolve_app_server_endpoint
-from agent.control.service import ControlService
-from agent.host_bridge.monitor import HostBridgeStatus, build_host_bridge_monitor
-from agent.host_bridge.monitor import claim_host_bridge_boot
 from agent.restart import RestartGate
 from agent.config_models import Config
 from bootstrap.cleanup import run_cleanup_steps
-from bootstrap.dashboard_api import build_dashboard_server
-from bootstrap.web_runtime import dashboard_socket_path, prepare_runtime_socket
 from bootstrap.runtime_readiness import RuntimeReadiness
 from bootstrap.tools import CoreRuntime, build_core_runtime
 from bootstrap.workspace_lock import WorkspaceInstanceLock
-from bootstrap.workspace_token import ensure_workspace_token
-from bus.event_bus import EventBus
-from bus.queue import MessageBus
 from agent.plugins.watcher import PluginWatcher
 from core.net.http import (
     SharedHttpResources,
@@ -33,32 +23,17 @@ from core.net.http import (
     configure_default_shared_http_resources,
 )
 from core.common.diagnostic_log import configure_logging
-from infra.control.socket import SocketAppServer, is_tcp_endpoint
 
 configure_logging()
 logging.getLogger("agent.plugins.manager").setLevel(
     os.environ.get("AKASHIC_PLUGIN_LOG_LEVEL", "INFO").upper()
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
 
 _run_cleanup_steps = run_cleanup_steps
-
-
-async def _noop_async() -> None:
-    return None
-
-
-def _release_workspace_lock(
-    lock: WorkspaceInstanceLock,
-) -> Callable[[], Awaitable[None]]:
-    async def release() -> None:
-        lock.release()
-
-    return release
 
 
 def _clear_readiness(
@@ -71,15 +46,7 @@ def _clear_readiness(
     return clear
 
 
-def _close_message_bus(bus: object | None) -> Callable[[], Awaitable[None]]:
-    """返回已初始化 MessageBus 的异步关闭动作。"""
-
-    if isinstance(bus, MessageBus):
-        return bus.aclose
-    return _noop_async
-
-
-def _raise_unexpected_task_errors(name: str, results: list[object]) -> None:
+def _raise_unexpected_task_errors(name: str, results: Iterable[object]) -> None:
     """记录并重新抛出任务停止时的首个非取消异常。"""
 
     first_error: BaseException | None = None
@@ -97,25 +64,6 @@ def _raise_unexpected_task_errors(name: str, results: list[object]) -> None:
             first_error = result
     if first_error is not None:
         raise first_error
-
-
-async def _run_primary_tasks(tasks: list[asyncio.Future[Any]]) -> None:
-    """监督 runtime tasks，并在失败或取消时等待兄弟任务收束。"""
-
-    try:
-        _ = await asyncio.gather(*tasks)
-    except asyncio.CancelledError:
-        # gather 已把取消传播给子任务；再次 cancel 会打断子任务的 finally。
-        if tasks:
-            _ = await asyncio.gather(*tasks, return_exceptions=True)
-        raise
-    except Exception:
-        for task in tasks:
-            if not task.done():
-                _ = task.cancel()
-        if tasks:
-            _ = await asyncio.gather(*tasks, return_exceptions=True)
-        raise
 
 
 def _stop_plugin_watcher(
@@ -149,37 +97,6 @@ def _wait_server_task(
     return wait
 
 
-def _remove_dashboard_socket(
-    server: uvicorn.Server | None,
-    task: asyncio.Task[None] | None,
-) -> Callable[[], Awaitable[None]]:
-    """Remove this host's Unix socket after its dashboard listener has stopped."""
-
-    async def remove() -> None:
-        if server is None:
-            return
-        if task is not None and not task.done():
-            raise RuntimeError("Dashboard server task is still running")
-        if not server.started:
-            return
-        if any(listener.is_serving() for listener in server.servers):
-            raise RuntimeError("Dashboard Unix socket is still serving")
-        uds = server.config.uds
-        if uds is None:
-            return
-        path = Path(uds)
-        try:
-            mode = path.lstat().st_mode
-        except FileNotFoundError:
-            return
-        if not stat.S_ISSOCK(mode):
-            raise RuntimeError(f"Dashboard socket path is not a socket: {path}")
-        # Python 3.12 closes the listener but leaves its Unix socket pathname.
-        path.unlink()
-
-    return remove
-
-
 class AppRuntime:
     def __init__(
         self,
@@ -200,24 +117,17 @@ class AppRuntime:
             )
         self.restart_gate = restart_gate
         self.readiness = readiness
-        self.host_bridge_status = HostBridgeStatus()
         self.http_resources = SharedHttpResources()
-        self.app_server: SocketAppServer | None = None
-        self.control_service: ControlService | None = None
         self.core: CoreRuntime | None = None
-        self.bus = None
-        self.event_bus: EventBus | None = None
-        self.dashboard_server: uvicorn.Server | None = None
-        self.dashboard_task: asyncio.Task[None] | None = None
+        self.web_shell: WebShellServer | None = None
+        self.web_shell_task: asyncio.Task[None] | None = None
         self.plugin_watcher: PluginWatcher | None = None
         self.plugin_watcher_task: asyncio.Task[None] | None = None
-        self.tasks: list[Awaitable[None]] = []
         self._shutdown = False
         self._started = False
         self._plugin_candidate_tasks: set[asyncio.Task[Any]] = set()
         self._plugin_reload_signal_installed = False
-        self._runtime_tasks: set[asyncio.Future[Any]] = set()
-        self._primary_task: asyncio.Future[Any] | None = None
+        self._shutdown_task: asyncio.Task[None] | None = None
         self._workspace_lock = WorkspaceInstanceLock(workspace)
 
     async def start(self) -> None:
@@ -227,79 +137,41 @@ class AppRuntime:
         if self.readiness is not None:
             self.readiness.mark_stage("workspace.locked")
         try:
-            claim = await claim_host_bridge_boot()
-            if claim is not None and self.readiness is not None:
-                self.readiness.mark_stage("host_bridge.owner")
             configure_default_shared_http_resources(self.http_resources)
             self.core = build_core_runtime(
                 self.config,
                 self.workspace,
                 self.http_resources,
                 restart_gate=self.restart_gate,
-                clear_stale_session_admissions=True,
-            )
-            self.bus = self.core.bus
-            event_bus = self.core.event_bus
-            self.event_bus = event_bus
-            manager = self.core.plugin_manager
-            manager.bind_endpoint_switcher(self._swap_plugin_endpoints)
-            self.dashboard_server = build_dashboard_server(
-                workspace=self.workspace,
-                plugin_manager=manager,
-                host_bridge_status=self.host_bridge_status.snapshot,
+                host_ready=(lambda: self.readiness.ready) if self.readiness else None,
             )
             await self.core.start()
             if self.readiness is not None:
                 self.readiness.mark_stage("core.ready")
-            app_server_endpoint: str | None = None
-            workspace_token: str | None = None
-            if self.config.app_server.enabled:
-                app_server_endpoint = resolve_app_server_endpoint(self.config.app_server.listen, self.workspace)
-                if is_tcp_endpoint(app_server_endpoint):
-                    workspace_token = ensure_workspace_token(self.workspace)
-            from bootstrap.app_server import build_control_service
-
-            self.control_service = build_control_service(
-                self.core, workspace_token=workspace_token,
-                boot_id=self.readiness.boot_id if self.readiness else None,
-                ready=(lambda: self.readiness.ready) if self.readiness else None,
-            )
-            if self.config.app_server.enabled:
-                assert app_server_endpoint is not None
-                self.app_server = SocketAppServer(
-                    app_server_endpoint,
-                    self.control_service,
-                    max_connections=self.config.app_server.max_connections,
-                    max_pending_requests=self.config.app_server.ingress_queue_size,
-                    max_message_bytes=self.config.app_server.max_message_bytes,
-                    outbound_queue_size=self.config.app_server.outbound_queue_size,
-                )
-                await self.app_server.start()
-
             plugin_manager = getattr(self.core, "plugin_manager", None)
             if self.readiness is not None:
                 self.readiness.mark_stage("services.ready")
 
-            # provider 已开放实际 binding；这里只触发传输 owner 的 pending 恢复。
-            await self.bus.recover_durable_inbounds()
-            if self.readiness is not None:
-                self.readiness.mark_stage("channels.ready")
             if plugin_manager is None:
                 raise RuntimeError("插件 Runtime 不可用")
-            host_bridge_monitor = build_host_bridge_monitor(self.host_bridge_status)
-            self.tasks = []
-            if host_bridge_monitor is not None:
-                self.tasks.append(host_bridge_monitor)
-            self.dashboard_server.config.uds = prepare_runtime_socket(
-                dashboard_socket_path(self.workspace)
-            )
-            self.dashboard_task = asyncio.create_task(
-                self.dashboard_server.serve(),
-                name="dashboard_server",
-            )
+            if os.environ.get("AKASHIC_SUPERVISED") != "1" and "AKASHIC_WEB_PORT" in os.environ:
+                from bootstrap.web_shell import create_web_shell_server
+                host = os.environ.get("AKASHIC_WEB_HOST", "127.0.0.1")
+                if host != "127.0.0.1" and os.environ.get("AKASHIC_WEB_ALLOW_NON_LOOPBACK") != "1":
+                    raise ValueError("公网 Web Shell 需要 AKASHIC_WEB_ALLOW_NON_LOOPBACK=1")
+                port = int(os.environ["AKASHIC_WEB_PORT"])
+                if not 1 <= port <= 65535:
+                    raise ValueError("AKASHIC_WEB_PORT 必须是 1 到 65535")
+                shell = create_web_shell_server(self.workspace, host=host, port=port)
+                self.web_shell = shell
+                self.web_shell_task = asyncio.create_task(shell.serve(), name="web_shell")
+                await asyncio.to_thread(shell.startup_event.wait, 5)
+                if not shell.started:
+                    raise RuntimeError("Web Shell 未完成启动")
             if plugin_manager is not None:
                 self.plugin_watcher = PluginWatcher(
                     plugin_manager,
+                    accepting=lambda: self.restart_gate is None or self.restart_gate.accepting,
                 )
                 self.plugin_watcher_task = asyncio.create_task(
                     self.plugin_watcher.run(),
@@ -318,47 +190,41 @@ class AppRuntime:
             raise
 
     async def run(self) -> None:
+        """监督宿主任务，退出时完成清理并保留原始错误。"""
         run_error: BaseException | None = None
         try:
+            # 1. 完整启动后监督实际宿主任务与进程停止请求。
             await self.start()
-            runtime_tasks = self._schedule_runtime_tasks()
-            if runtime_tasks:
-                self._primary_task = asyncio.create_task(
-                    _run_primary_tasks(runtime_tasks),
-                    name="primary_runtime",
-                )
-            else:
-                self._primary_task = None
-            self._runtime_tasks.clear()
+            assert self.core is not None
+            shutdown_task = asyncio.create_task(self.core.restart_gate.wait_shutdown(), name="process_shutdown")
+            self._shutdown_task = shutdown_task
             watched_tasks = {
                 task
                 for task in (
-                    self.dashboard_task,
+                    self.web_shell_task,
                     self.plugin_watcher_task,
+                    shutdown_task,
                 )
                 if task is not None
             }
-            supervised_tasks = set(watched_tasks)
-            if self._primary_task is not None:
-                supervised_tasks.add(self._primary_task)
-            if not supervised_tasks:
-                raise RuntimeError("没有可监督的宿主任务")
-
             # 实际宿主监督任务获得一次调度机会后仍存活，才对外发布 ready。
-            done, _ = await asyncio.wait(supervised_tasks, timeout=0)
+            done, _ = await asyncio.wait(watched_tasks, timeout=0)
             if not done:
                 if self.readiness is not None:
                     self.readiness.mark_ready()
                 done, _ = await asyncio.wait(
-                    supervised_tasks,
+                    watched_tasks,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
-            if self._primary_task is not None and self._primary_task in done:
-                await self._primary_task
+            if shutdown_task in done:
+                try:
+                    await shutdown_task
+                finally:
+                    self._shutdown_task = None
             else:
-                if self.dashboard_task is not None and self.dashboard_task in done:
-                    watched_task = self.dashboard_task
-                    self.dashboard_task = None
+                if self.web_shell_task is not None and self.web_shell_task in done:
+                    watched_task = self.web_shell_task
+                    self.web_shell_task = None
                 elif (
                     self.plugin_watcher_task is not None
                     and self.plugin_watcher_task in done
@@ -371,6 +237,7 @@ class AppRuntime:
         except (asyncio.CancelledError, Exception) as error:
             run_error = error
 
+        # 2. 清理全部资源；关闭失败作为原始错误的原因保留。
         shutdown_error: BaseException | None = None
         try:
             await self.shutdown()
@@ -384,50 +251,18 @@ class AppRuntime:
         if shutdown_error is not None:
             raise shutdown_error
 
-    def _schedule_runtime_tasks(self) -> list[asyncio.Future[Any]]:
-        pending = self.tasks
-        self.tasks = []
-        scheduled: list[asyncio.Future[Any]] = []
+    async def _cancel_shutdown_task(self) -> None:
+        """收束进程停止等待；取消正常结束，其他错误继续暴露。"""
+        task = self._shutdown_task
+        if task is None:
+            return
+        _ = task.cancel()
         try:
-            for awaitable in pending:
-                task = asyncio.ensure_future(awaitable)
-                scheduled.append(task)
-        except (asyncio.CancelledError, Exception):
-            self._runtime_tasks = set(scheduled)
-            self.tasks = pending[len(scheduled) :]
-            for awaitable in self.tasks:
-                if inspect.iscoroutine(awaitable):
-                    awaitable.close()
-            raise
-        self._runtime_tasks = set(scheduled)
-        return scheduled
-
-    async def _cancel_runtime_tasks(self) -> None:
-        results: list[object] = []
-        primary_task = self._primary_task
-        try:
-            if primary_task is not None:
-                _ = primary_task.cancel()
-                try:
-                    await primary_task
-                except (asyncio.CancelledError, Exception) as error:
-                    results.append(error)
-            elif self._runtime_tasks:
-                for task in self._runtime_tasks:
-                    _ = task.cancel()
-                results = await asyncio.gather(
-                    *self._runtime_tasks,
-                    return_exceptions=True,
-                )
+            results = await asyncio.gather(task, return_exceptions=True)
         finally:
-            self._runtime_tasks.clear()
-            for awaitable in self.tasks:
-                if inspect.iscoroutine(awaitable):
-                    awaitable.close()
-            self.tasks.clear()
-            self._primary_task = None
+            self._shutdown_task = None
 
-        _raise_unexpected_task_errors("primary runtime task", results)
+        _raise_unexpected_task_errors("process shutdown task", results)
 
     async def _cancel_plugin_candidate_tasks(self) -> None:
         for task in self._plugin_candidate_tasks:
@@ -444,28 +279,22 @@ class AppRuntime:
         _raise_unexpected_task_errors("plugin candidate task", results)
 
     async def _request_server_shutdown(self) -> None:
-        if self.dashboard_server is not None:
-            self.dashboard_server.should_exit = True
+        if self.web_shell is not None:
+            self.web_shell.should_exit = True
 
     async def shutdown(self) -> None:
         if self._shutdown:
             return
         self._shutdown = True
+        closing_root = None if self.core is None else self.core.plugin_manager.live_root
         try:
             self._remove_plugin_reload_signal()
+            # 已排空业务后先关闭入站连接；插件释放前保留数据库和 HTTP provider。
             await _run_cleanup_steps(
                 ("plugin_candidate_tasks.cancel", self._cancel_plugin_candidate_tasks),
-                ("runtime_tasks.cancel", self._cancel_runtime_tasks),
+                ("process_shutdown.cancel", self._cancel_shutdown_task),
                 ("servers.request_shutdown", self._request_server_shutdown),
-                (
-                    "dashboard_server.wait",
-                    _wait_server_task(self.dashboard_task),
-                ),
-                (
-                    "dashboard_socket.remove",
-                    _remove_dashboard_socket(self.dashboard_server, self.dashboard_task),
-                ),
-                ("message_bus.aclose", _close_message_bus(self.bus)),
+                ("web_shell.wait", _wait_server_task(self.web_shell_task)),
                 (
                     "plugin_watcher.stop",
                     _stop_plugin_watcher(
@@ -473,30 +302,20 @@ class AppRuntime:
                         self.plugin_watcher_task,
                     ),
                 ),
-                (
-                    "app_server.stop",
-                    self.app_server.stop if self.app_server else _noop_async,
-                ),
-                (
-                    "control_service.shutdown",
-                    (
-                        self.control_service.shutdown
-                        if self.control_service
-                        else _noop_async
-                    ),
-                ),
-                ("core.stop", self.core.stop if self.core else _noop_async),
+            )
+            if self.core is not None:
+                await self.core.stop()
+            await _run_cleanup_steps(
                 ("http_resources.aclose", self.http_resources.aclose),
                 (
                     "runtime_readiness.clear",
                     _clear_readiness(self.readiness),
                 ),
-                (
-                    "workspace_lock.release",
-                    _release_workspace_lock(self._workspace_lock),
-                ),
             )
+            if self._started and self.readiness is not None:
+                self.readiness.mark_closed(None if closing_root is None else closing_root.generation_id)
         finally:
+            self._workspace_lock.release()
             clear_default_shared_http_resources(self.http_resources)
 
     def _install_plugin_reload_signal(self) -> None:
@@ -517,10 +336,10 @@ class AppRuntime:
 
     def _schedule_plugin_candidate_scan(self) -> None:
         manager = getattr(self.core, "plugin_manager", None)
-        if manager is None or self._shutdown:
+        if manager is None or self._shutdown or (self.restart_gate is not None and not self.restart_gate.accepting):
             return
         if self.plugin_watcher is not None:
-            self.plugin_watcher.wake()
+            self.plugin_watcher.request_scan()
             return
         task = asyncio.create_task(
             manager.reconcile_changed(),
@@ -528,16 +347,6 @@ class AppRuntime:
         )
         self._plugin_candidate_tasks.add(task)
         task.add_done_callback(self._plugin_candidate_scan_done)
-
-    async def _disable_and_drain_plugin(self, plugin_id: str) -> str:
-        plugin_id = plugin_id.strip()
-        if not plugin_id:
-            raise ValueError("缺少插件 ID")
-        manager = getattr(self.core, "plugin_manager", None)
-        if manager is None:
-            raise RuntimeError("插件 Runtime 不可用")
-        await manager.reconcile_disabled_and_drain(plugin_id)
-        return f"插件已停用并排空: {plugin_id}"
 
     def _plugin_candidate_scan_done(self, task: asyncio.Task[Any]) -> None:
         self._plugin_candidate_tasks.discard(task)
@@ -549,15 +358,6 @@ class AppRuntime:
                 "plugin candidate scan failed",
                 exc_info=(type(error), error, error.__traceback__),
             )
-
-    async def _swap_plugin_endpoints(
-        self,
-        old_commands: tuple[tuple[str, str], ...],
-        new_commands: tuple[tuple[str, str], ...],
-    ) -> None:
-        # Installed channel plugins resolve COMMANDS inside each exact
-        # request scope.  There is no Core endpoint registry to mutate.
-        _ = old_commands, new_commands
 
 
 def build_app_runtime(

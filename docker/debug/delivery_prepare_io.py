@@ -11,14 +11,17 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from agent.plugin_composition import CompositionRoot, PluginRuntime
-from agent.plugin_composition.archive import PluginArchive
-from agent.plugin_composition.bindings import BINDINGS, Bindings
-from agent.plugin_composition.messages import MESSAGE_CATALOG, OWNER_STATE, OwnerState
+from plugins.ledger.contract import BINDINGS
+from plugins.ledger.bindings import Bindings
+from plugins.ledger.contract import MESSAGE_CATALOG, OWNER_STATE
+from plugins.ledger.services import OwnerState
 from agent.plugin_composition.tasks import TASKS, PluginTasks
-from agent.plugin_contracts.delivery import DELIVERY_GUARDED_START as DELIVERY
+from plugins.delivery.contract import (
+    DELIVERY_GUARDED_START as DELIVERY,
+)
 from plugins.delivery import plugin
-from session.log import MessageLog, OwnerTransaction
-from session.message import ContentPart, ContentReferences, Output
+from plugins.ledger.log import MessageLog, OwnerTransaction
+from plugins.ledger.contract import ContentPart, ContentReferences, Output
 
 
 async def check(directory: Path, action: str, cancel: bool) -> dict:
@@ -36,7 +39,7 @@ async def check(directory: Path, action: str, cancel: bool) -> dict:
 
     async def storage(ctx):
         for key, value in ((MESSAGE_CATALOG, log.catalog()), (OWNER_STATE, OwnerState(log)),
-                           (TASKS, tasks), (BINDINGS, Bindings(log, PluginArchive(directory / "archives"), root))):
+                           (TASKS, tasks), (BINDINGS, Bindings(log, root.context))):
             await ctx.provide(key, value)
 
     async def consumer(ctx):

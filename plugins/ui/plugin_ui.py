@@ -10,7 +10,7 @@ from typing import cast
 from uuid import uuid4
 
 from agent.plugin_composition import Context, CompositionError, Effect, FiberState
-from agent.plugin_composition.ui_slots import (
+from plugins.ui.contract import (
     UI_SLOTS, PLUGIN_UI_SLOTS, PluginUiAsset, PluginUiBinding, PluginUiDefinition,
     PluginUiDescriptor, PluginUiNavigation, PluginUiQueryHandler,
 )
@@ -64,7 +64,8 @@ class PluginUiSlots:
         # 1. Validate the public ABI before any registration becomes visible.
         if not isinstance(definition, PluginUiDefinition):
             raise TypeError("插件 Plugin UI 声明必须是 PluginUiDefinition")
-        _validate_sync_callable(query, "query")
+        if not callable(query):
+            raise TypeError("插件 Plugin UI query 必须可调用")
         if available is not None:
             _validate_sync_callable(available, "available")
         navigation = definition.navigation

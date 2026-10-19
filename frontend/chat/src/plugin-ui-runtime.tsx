@@ -3,11 +3,13 @@ import React, { useEffect, useMemo, useState, useSyncExternalStore } from "react
 import { createUuid as createRequestId } from "./browser-uuid.ts";
 import { PluginUiQueryQueue } from "./plugin-ui-query-queue";
 import { PluginUiResultCache } from "./plugin-ui-result-cache";
+import { openInWorkbench, subscribeWorkbenchIntents, workbenchAccepts, type WorkbenchIntentStatus } from "./shell-workbench";
 
 export type PluginUiSlotName =
   | "turn.before_reasoning"
   | "turn.before_tool"
   | "turn.after_answer"
+  | "message.attachment"
   | "drawer.panel"
   | "dashboard.main";
 
@@ -19,6 +21,8 @@ export interface PluginUiContext {
   block?: unknown;
   /** 挂载内的事实失效提示；不改变挂载身份。 */
   onInvalidate(callback: () => void): () => void;
+  /** 异步展示失败时交还宿主降级内容；不改变消息。 */
+  reportError(message: string): void;
   capabilities: {
     queryCacheModes?: readonly ("none" | "memory" | "immutable")[];
   };
@@ -27,6 +31,14 @@ export interface PluginUiContext {
     payload?: Record<string, unknown>,
     options?: PluginUiQueryOptions,
   ): Promise<Record<string, unknown>>;
+  /**
+   * 在右侧工具区打开：只在点击或键盘激活的处理函数里调用；没有接受者时得到 unhandled，插件回到自己的原有行为。
+   * accepts 的结果会随宿主广播变化，变化时经 onInvalidate 通知，插件在回调里重新判断是否显示入口。
+   */
+  workbench: {
+    accepts(name: string): boolean;
+    open(name: string, payload: unknown): Promise<WorkbenchIntentStatus>;
+  };
 }
 
 export interface PluginUiQueryOptions {
@@ -34,6 +46,7 @@ export interface PluginUiQueryOptions {
 }
 
 export interface PluginUiRenderer {
+  accepts?(block: unknown): boolean;
   prefetch?(context: PluginUiContext): Promise<void>;
   mount(host: HTMLElement, context: PluginUiContext): void | (() => void);
 }
@@ -66,12 +79,6 @@ export interface PluginUiResult {
   requestId: string;
   resultJson?: string;
   error?: string;
-}
-
-export interface PluginUiDashboardEntry {
-  id: string;
-  label: string;
-  description: string;
 }
 
 const definitions = new Map<string, {
@@ -125,6 +132,7 @@ const SLOT_NAMES = new Set<Exclude<PluginUiSlotName, "dashboard.main">>([
   "turn.before_tool",
   "turn.after_answer",
   "drawer.panel",
+  "message.attachment",
 ]);
 
 function emitChange() {
@@ -333,8 +341,9 @@ function parseDefinition(value: unknown, plugin: PluginUiCatalogItem): PluginUiD
 
 function isRenderer(value: unknown): value is PluginUiRenderer {
   if (!value || typeof value !== "object") return false;
-  const renderer = value as { mount?: unknown; prefetch?: unknown };
+  const renderer = value as { mount?: unknown; prefetch?: unknown; accepts?: unknown };
   return typeof renderer.mount === "function"
+    && (renderer.accepts === undefined || typeof renderer.accepts === "function")
     && (renderer.prefetch === undefined || typeof renderer.prefetch === "function");
 }
 
@@ -344,13 +353,16 @@ function hostPlugins(pluginName: string): PluginUiCatalogItem[] {
 }
 
 /** 宿主自身的导航按插件名组合能力；目录变化时返回新版本号以便重读。 */
-export function usePluginUiCatalogVersion(): { version: number; installed: (pluginName: string) => boolean } {
+export function usePluginUiCatalogVersion(): {
+  version: number; catalogRevision: string; installed: (pluginName: string) => boolean;
+} {
   const version = useSyncExternalStore(
     (listener) => { listeners.add(listener); return () => listeners.delete(listener); },
     () => registryVersion,
   );
   return {
     version,
+    catalogRevision: catalog.catalogRevision,
     installed: (pluginName) => hostPlugins(pluginName).length > 0,
   };
 }
@@ -361,48 +373,16 @@ export async function queryHostPlugin(
   method: string,
   payload: Record<string, unknown> = {},
   signal?: AbortSignal,
+  sessionId?: string,
 ): Promise<Record<string, unknown>> {
   const matches = hostPlugins(pluginName);
   if (matches.length > 1) throw new Error(`存在多个同名插件，无法选择: ${matches.map((plugin) => plugin.id).join(", ")}`);
   const plugin = matches[0];
   if (!plugin) throw new Error(`插件未安装或正在更新: ${pluginName}`);
   return queryWebPluginUi({
-    pluginId: plugin.id, pluginRevision: plugin.revision, method, payload, slot: "drawer.panel",
+    pluginId: plugin.id, pluginRevision: plugin.revision, method, payload, slot: "drawer.panel", sessionId,
     signal: signal ?? new AbortController().signal,
   });
-}
-
-export function usePluginUiDashboards(): PluginUiDashboardEntry[] {
-  useSyncExternalStore(
-    (listener) => { listeners.add(listener); return () => listeners.delete(listener); },
-    () => registryVersion,
-  );
-  return catalog.plugins.flatMap((plugin) => plugin.navigation
-    ? [{ id: plugin.id, ...plugin.navigation }]
-    : []);
-}
-
-export function PluginUiDashboard({ pluginId }: { pluginId: string }) {
-  useSyncExternalStore(
-    (listener) => { listeners.add(listener); return () => listeners.delete(listener); },
-    () => registryVersion,
-  );
-  const plugin = catalog.plugins.find((item) => item.id === pluginId);
-  if (!plugin?.navigation) return null;
-  if (catalog.error) return <div className="plugin-ui-host plugin-ui-host--error">{catalog.error}</div>;
-  const loaded = definitions.get(pluginId);
-  const definition = loaded?.revision === plugin.revision ? loaded.definition : undefined;
-  if (!definition?.dashboard) {
-    return <div className="plugin-ui-host plugin-ui-host--loading">正在加载插件界面…</div>;
-  }
-  return (
-    <MountedPlugin
-      pluginId={pluginId}
-      pluginRevision={plugin.revision}
-      renderer={definition.dashboard}
-      context={{ slot: "dashboard.main" }}
-    />
-  );
 }
 
 export function receivePluginUiResult(response: PluginUiResult) {
@@ -430,6 +410,47 @@ export function receivePluginUiResult(response: PluginUiResult) {
   }
 }
 
+type InlineSlotName = Exclude<PluginUiSlotName, "dashboard.main">;
+
+interface SlotMatch {
+  plugin: PluginUiCatalogItem;
+  renderer: PluginUiRenderer;
+  error?: string;
+}
+
+function useRegistryVersion(): number {
+  return useSyncExternalStore(
+    (listener) => { listeners.add(listener); return () => listeners.delete(listener); },
+    () => registryVersion,
+  );
+}
+
+// 目录或模块尚未就绪时，已挂载的展示保持原样。
+function slotWaiting(name: InlineSlotName): boolean {
+  return catalog.updating || !!catalog.error || catalog.plugins.some(plugin =>
+    plugin.slots.includes(name) && definitions.get(plugin.id)?.revision !== plugin.revision);
+}
+
+// 选出已加载且认领该 block 的 renderer；accepts 抛错只成为该插件的局部错误。
+function slotMatches(name: InlineSlotName, block: unknown, prefetch: boolean): SlotMatch[] {
+  return catalog.plugins.flatMap((plugin) => {
+    const loaded = definitions.get(plugin.id);
+    const renderer = loaded?.revision === plugin.revision
+      ? loaded.definition.slots[name]
+      : undefined;
+    let accepted = true;
+    let error: string | undefined;
+    try { accepted = !renderer?.accepts || renderer.accepts(block); }
+    catch (cause) { error = cause instanceof Error ? cause.message : String(cause); }
+    return renderer && accepted && (!prefetch || renderer.prefetch) ? [{ plugin, renderer, error }] : [];
+  });
+}
+
+/** 宿主据此决定附件交给插件插槽还是普通附件条；调用方需随目录版本重新渲染。 */
+export function pluginSlotAccepts(name: InlineSlotName, block: unknown): boolean {
+  return slotMatches(name, block, false).length > 0;
+}
+
 export function PluginUiSlot({
   name,
   sessionId,
@@ -438,56 +459,54 @@ export function PluginUiSlot({
   block,
   refreshToken,
   prefetch = false,
+  quiet = false,
+  fallback = null,
 }: {
-  name: Exclude<PluginUiSlotName, "dashboard.main">;
+  name: InlineSlotName;
   prefetch?: boolean;
   sessionId?: string;
   messageId?: string;
   turnId?: string;
   block?: unknown;
   refreshToken?: string | number;
+  /** 宿主另有降级展示时不显示目录更新和卸载提示。 */
+  quiet?: boolean;
+  fallback?: React.ReactNode;
 }) {
-  const version = useSyncExternalStore(
-    (listener) => { listeners.add(listener); return () => listeners.delete(listener); },
-    () => registryVersion,
-  );
-  const renderers = catalog.plugins.flatMap((plugin) => {
-    const loaded = definitions.get(plugin.id);
-    const renderer = loaded?.revision === plugin.revision
-      ? loaded.definition.slots[name]
-      : undefined;
-    return renderer && (!prefetch || renderer.prefetch) ? [{ plugin, renderer }] : [];
-  });
+  const version = useRegistryVersion();
+  const renderers = slotMatches(name, block, prefetch);
   // 目录加载失败时保留本页已经挂载的卡片；新页面不会执行旧模块。
   const previous = React.useRef<typeof renderers>([]);
   const hadRenderer = React.useRef(false);
   const contextKey = JSON.stringify([name, prefetch, sessionId, messageId, turnId, block]);
   const previousContext = React.useRef(contextKey);
-  const waiting = catalog.updating || !!catalog.error || catalog.plugins.some(plugin =>
-    plugin.slots.includes(name) && definitions.get(plugin.id)?.revision !== plugin.revision);
+  const waiting = slotWaiting(name);
   const keepPrevious = waiting && previousContext.current === contextKey && previous.current.length > 0
     && previous.current.every(({plugin}) => catalog.plugins.some(item => item.id === plugin.id));
   const shown = keepPrevious ? previous.current : renderers;
   if (!keepPrevious) { previous.current = renderers; previousContext.current = contextKey; }
   if (shown.length) hadRenderer.current = true;
-  const notice = waiting ? catalog.error ? `插件界面暂不可用：${catalog.error}` : "插件界面正在更新…"
+  const notice = quiet ? "" : waiting ? catalog.error ? `插件界面暂不可用：${catalog.error}` : "插件界面正在更新…"
     : !shown.length && hadRenderer.current ? "本页插件界面已卸载或不再提供此展示。" : "";
   return shown.length || notice ? (
     <div className={prefetch ? "plugin-ui-prefetch" : "plugin-ui-slot"} data-slot={name} data-version={version}>
       {notice && !prefetch && <p role="status">{notice} <button type="button" onClick={() => window.location.reload()}>刷新页面</button></p>}
-      {shown.map(({ plugin, renderer }) => (
+      {shown.map(({ plugin, renderer, error }) => error ? (
+        <div key={plugin.id}><p role="alert">插件界面错误：{error}</p>{fallback}</div>
+      ) : (
         <ViewportMountedPlugin
           key={`${plugin.id}:${plugin.revision}:${name}`}
           pluginId={plugin.id}
           pluginRevision={plugin.revision}
           renderer={renderer}
+          fallback={fallback}
           prefetch={prefetch}
           refreshToken={refreshToken}
           context={{ slot: name, sessionId, messageId, turnId, block }}
         />
       ))}
     </div>
-  ) : null;
+  ) : fallback;
 }
 
 function ViewportMountedPlugin(props: React.ComponentProps<typeof MountedPlugin>) {
@@ -513,15 +532,18 @@ function MountedPlugin({
   context,
   refreshToken,
   prefetch = false,
+  fallback,
 }: {
+  fallback?: React.ReactNode;
   pluginId: string;
   pluginRevision: string;
   renderer: PluginUiRenderer;
   prefetch?: boolean;
-  context: Omit<PluginUiContext, "query" | "capabilities" | "onInvalidate">;
+  context: Omit<PluginUiContext, "query" | "capabilities" | "onInvalidate" | "reportError" | "workbench">;
   refreshToken?: string | number;
 }) {
   const hostRef = React.useRef<HTMLDivElement>(null);
+  const [error, setError] = useState<string | null>(null);
   const ownerIdRef = React.useRef(createOwnerId());
   const invalidatorsRef = React.useRef<Set<() => void> | null>(null);
   const previousRefreshToken = React.useRef(refreshToken);
@@ -547,6 +569,14 @@ function MountedPlugin({
     const invalidators = new Set<() => void>();
     invalidatorsRef.current = invalidators;
     let cleanup: void | (() => void);
+    let live = true;
+    setError(null);
+    const stopIntents = subscribeWorkbenchIntents(() => {
+      for (const callback of invalidators) {
+        try { callback(); }
+        catch (error) { console.error(`[plugin-ui] invalidation failed: ${pluginId}`, error); }
+      }
+    });
     try {
       const queryContext: PluginUiContext = {
         slot, sessionId, messageId, turnId, block: stableBlock,
@@ -554,10 +584,15 @@ function MountedPlugin({
           invalidators.add(callback);
           return () => { invalidators.delete(callback); };
         },
+        reportError: (message) => { if (live) setError(message); },
         capabilities: { queryCacheModes: ["none", "memory", "immutable"] },
         query: (method, payload = {}, options = {}) => queryPlugin({
           pluginId, pluginRevision, ownerId, slot, sessionId, messageId, turnId, method, payload, options, prefetch,
         }),
+        workbench: {
+          accepts: workbenchAccepts,
+          open: (name, payload) => live ? openInWorkbench(name, sessionId ?? "", payload) : Promise.resolve("invalid"),
+        },
       };
       if (prefetch) {
         void renderer.prefetch!(queryContext).catch((error: unknown) => {
@@ -567,10 +602,11 @@ function MountedPlugin({
         cleanup = renderer.mount(host, queryContext);
       }
     } catch (error) {
-      host.textContent = error instanceof Error ? `插件界面错误：${error.message}` : "插件界面错误";
-      host.classList.add("plugin-ui-host--error");
+      setError(error instanceof Error ? error.message : String(error));
     }
     return () => {
+      live = false;
+      stopIntents();
       invalidators.clear();
       invalidatorsRef.current = null;
       releaseQueryOwner(ownerId);
@@ -582,7 +618,8 @@ function MountedPlugin({
       host.replaceChildren();
     };
   }, [messageId, pluginId, pluginRevision, renderer, sessionId, slot, stableBlock, turnId, prefetch]);
-  return <div ref={hostRef} className="plugin-ui-host" data-plugin={pluginId} />;
+  return <><div ref={hostRef} className="plugin-ui-host" data-plugin={pluginId} hidden={error !== null} />
+    {error !== null && <><p role="status">交互内容暂不可用：{error}</p>{fallback}</>}</>;
 }
 
 /** 页面缓存查询拥有独立请求，折叠只释放订阅，不打断已经发出的读取。 */

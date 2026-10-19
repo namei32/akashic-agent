@@ -6,15 +6,19 @@ from typing import Any, cast
 from pydantic import BaseModel
 from agent.plugin_composition import Context, ServiceKey
 from agent.plugin_composition.context import FiberHandle
-from agent.plugin_composition.models import MODEL_CATALOG, ModelCatalogSnapshot, ModelAvailability
-from agent.plugin_composition.messages import MESSAGE_CATALOG
+from plugins.models.contract import ModelCatalogSnapshot
+from plugins.models.contract import MODEL_CATALOG
+from plugins.ledger.contract import MESSAGE_CATALOG
 from agent.plugin_composition.plugin_config import PLUGIN_CONFIG
 from agent.plugin_composition.runtime_catalog import RUNTIME_CATALOG
-from agent.plugin_contracts.configuration import Configuration
-from agent.plugin_contracts.onboarding import ONBOARDING, Step
-from agent.plugin_contracts.delivery import DELIVERY_SENDERS, sender_key
-from agent.plugin_contracts.proactive import SEMANTIC_INTEREST
-from agent.plugin_contracts import Input
+from plugins.ui.contract import Configuration
+from plugins.onboarding.contract import ONBOARDING, Ability, PreviewLine, Step
+from plugins.delivery.contract import (
+    DELIVERY_SENDERS,
+    SenderDefinition,
+)
+from plugins.akasha.contract import SEMANTIC_INTEREST
+from plugins.ledger.contract import Input
 
 SETTINGS = ServiceKey[Configuration]("wake.settings.v1")
 
@@ -54,7 +58,7 @@ class Settings:
             fiber = next(item for item in own["composition"]["fibers"] if item["fiber_id"] == self.function.fiber_id)
             # 当前目标离线不阻止在设置中改选另一个可用目标。
             selected = config["delivery"]
-            selected_key = None if selected is None else sender_key(selected["channel"]).name
+            selected_key = None if selected is None else SenderDefinition.key(selected["channel"]).name
             missing = [key for key in fiber["missing_services"] if key != selected_key]
             selected_missing = selected_key in fiber["missing_services"]
             model = None if self.models is None else self.models()
@@ -68,7 +72,7 @@ class Settings:
             elif self.interest() is not None:
                 reason = self.interest() or "Akasha 不可用"
                 blocked = self.interest_decision is not None and self.interest_decision() is not True
-            elif model is None or selected_model is None or model.model(selected_model).availability != ModelAvailability.AVAILABLE:
+            elif model is None or selected_model is None or model.model(selected_model).availability != 'available':
                 reason = "请先选择默认聊天模型"
             elif not self.targets():
                 reason = "还没有可用发送目标，请先开启发送渠道并建立对话"
@@ -114,7 +118,11 @@ async def mount(ctx: Context, model: type[BaseModel], function: FiberHandle) -> 
         await child.effect(attach, label="model-readiness")
     await ctx.inject((MODEL_CATALOG,), models, name="model-status")
     async def contribute(child: Context):
-        await child.require(ONBOARDING).group(child, "proactive", "主动联系")
+        await child.require(ONBOARDING).group(child, "proactive", "Wake 主动联系", Ability(
+            pitch="在合适的时候主动找你",
+            benefit="有具体理由时它会先开口，比如你提过的事有了进展。消息发到你选择的聊天渠道。",
+            preview=(PreviewLine("Akashic · 主动消息", "你周三说想等那本书降价，现在电子版打五折了。"),),
+        ))
         await child.require(ONBOARDING).register(child, Step("configure", "Wake 主动联系", "proactive", "wake-settings", settings.read, (function.fiber_id,)))
     await ctx.inject((ONBOARDING,), contribute, name="onboarding")
     async def senders(child: Context):

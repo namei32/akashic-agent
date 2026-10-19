@@ -9,34 +9,46 @@ from pathlib import Path, PurePosixPath
 from types import FunctionType, ModuleType
 from uuid import uuid4
 
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
 from agent.plugin_composition import (
     RUNTIME_STARTING,
     Context,
     Effect,
     FiberState,
+    ServiceKey,
 )
+from agent.plugin_composition.requests import RequestContext
 from agent.plugin_composition.host import HOST_INFO
 from agent.plugin_composition.runtime_catalog import RUNTIME_CATALOG
-from agent.plugin_composition.ui import (
-    DASHBOARD_ROUTES,
+from plugins.ui.contract import (
     UI,
     WEB_UI,
+    Configuration,
     DashboardBinding,
     WebModuleDescriptor,
     WebUiCatalog,
 )
-from agent.plugin_composition.ui_slots import UI_SLOTS
-from agent.plugin_composition.workload_slots import WORKLOADS
+from plugins.ui.contract import UI_SLOTS
+from plugins.workloads.contract import WORKLOADS
 
-from .dashboard import DashboardResources, _core_routes, _require_routes_available
+from .dashboard import DashboardResources, _server_routes, _require_routes_available
+from .dashboard_app import create_dashboard_app
+from .dashboard_server import start_dashboard_server
+from .dashboard_host import LiveDashboardMiddleware
 from .plugin_ui import PluginUiSlots
-from .web import build_web_ui_catalog, resolve_web_module
+from .queries import LivePluginUiProvider
+from plugins.ui.contract import PLUGIN_UI, MESSAGE_DISPLAY
+from .message_display import project_message_rows
+from .web import build_web_ui_catalog, encode_web_ui_bootstrap, resolve_web_module
 
 api_version = 3
 name = "ui"
 version = "1.0.0"
 desc = "注册并封存插件的 Web 与 Dashboard UI"
-inject = (DASHBOARD_ROUTES, HOST_INFO, RUNTIME_CATALOG)
+inject = (HOST_INFO, RUNTIME_CATALOG)
+entrypoints = {"dashboard": "dashboard_server.main"}
 
 @dataclass
 class Registration:
@@ -50,12 +62,45 @@ class Registration:
     initialized: bool = False
 
 
+class ConfigRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    request_id: str = Field(min_length=1, max_length=128)
+    expected_input: str = Field(pattern=r"^[0-9a-f]{64}$")
+    values: dict[str, object]
+
+
 class Ui:
     """一个 Root 的唯一 UI 注册表；关闭不删除代码或插件数据。"""
 
-    def __init__(self, ctx: Context) -> None:
+    def __init__(self, ctx: Context, routes: tuple[object, ...]) -> None:
         self._ctx = ctx
+        self._routes = routes
         self._entries: dict[str, Registration] = {}
+
+    def register_configuration(
+        self, app: FastAPI, context: RequestContext,
+        key: ServiceKey[Configuration], prefix: str,
+    ) -> None:
+        """HTTP 边界只校验请求信封；插件解释字段、处理业务错误。"""
+        @app.get(prefix)
+        async def read():
+            return await context.require(key).read()
+
+        @app.post(prefix)
+        async def save(request: ConfigRequest):
+            try:
+                return await context.require(key).save(request.request_id, request.expected_input, request.values)
+            except ValidationError as error:
+                raise HTTPException(422, error.errors(include_input=False, include_url=False, include_context=False)) from error
+            except ValueError as error:
+                raise HTTPException(422, str(error)) from error
+
+        @app.get(prefix + "/receipts/{request_id}")
+        async def receipt(request_id: str):
+            try:
+                return context.require(key).receipt(request_id)
+            except KeyError as error:
+                raise HTTPException(404, "配置回执不存在") from error
 
     @property
     def root_instance_token(self) -> object:
@@ -120,7 +165,7 @@ class Ui:
             )
             build_web_ui_catalog(modules)
             if resources is not None:
-                occupied = list(_core_routes(self._ctx.require(DASHBOARD_ROUTES)))
+                occupied = list(_server_routes(self._routes))
                 for entry in self._entries.values():
                     if entry.binding is None:
                         continue
@@ -179,14 +224,13 @@ class Ui:
 
     async def bootstrap(self) -> bytes:
         async with self._ctx.runtime_scope():
-            self._ctx.require_runtime_owner(WEB_UI, self)
-            if self._ctx.require(RUNTIME_CATALOG)(self._ctx)["updating"]:
-                raise RuntimeError("插件配置正在应用，Web 目录尚未稳定")
-            return self.catalog().encode_bootstrap(self._ctx.generation_id)
+            self._ctx.require_runtime_identity(WEB_UI, self)
+            # catalog 只含已激活并初始化的贡献；无关管理操作不关闭读取。
+            return encode_web_ui_bootstrap(self.catalog(), self._ctx.generation_id)
 
     async def state(self) -> dict[str, str | bool]:
         async with self._ctx.runtime_scope():
-            self._ctx.require_runtime_owner(WEB_UI, self)
+            self._ctx.require_runtime_identity(WEB_UI, self)
             return {"snapshotId": self._ctx.generation_id, "catalogId": self.catalog().identity,
                     "updating": bool(self._ctx.require(RUNTIME_CATALOG)(self._ctx)["updating"])}
 
@@ -213,8 +257,21 @@ def _path(root: Path, relative_path: str, suffix: str) -> Path:
 
 
 async def apply(ctx: Context) -> None:
-    registry = Ui(ctx)
+    app = create_dashboard_app(ctx.runtime.plugin_dir / "static/dashboard")
+    registry = Ui(ctx, tuple(app.routes))
+    app.add_middleware(LiveDashboardMiddleware, context=ctx, registry=registry)
     await ctx.provide(UI, registry, binding_contributors=registry.contributors)
     await ctx.provide(WEB_UI, registry, binding_contributors=registry.contributors)
     slots = PluginUiSlots(ctx)
     await ctx.provide(UI_SLOTS, slots, binding_contributors=slots.contributors)
+    queries = LivePluginUiProvider(ctx, slots)
+    await ctx.effect(lambda: queries.aclose, label="ui.queries")
+    await ctx.provide(PLUGIN_UI, queries)
+
+    async def display(page, *, display_only: bool):
+        return await project_message_rows(ctx, page, display_only=display_only)
+
+    await ctx.provide(MESSAGE_DISPLAY, ctx.entrypoint(display))
+
+    if not ctx.require(HOST_INFO).validation:
+        await start_dashboard_server(ctx, app)

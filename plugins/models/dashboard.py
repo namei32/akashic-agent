@@ -3,14 +3,18 @@
 from fastapi import FastAPI
 
 from agent.plugin_composition import DashboardContext
-from agent.plugin_composition.models import MODEL_CATALOG, MODEL_CALL_STATS
+from plugins.models.contract import (
+    MODEL_CACHE_USAGE,
+    MODEL_CATALOG,
+    MODEL_CALL_STATS,
+)
 
 from .model_settings_http import BoundModelControl, create_model_settings_router
 from .selection import MODEL_SELECTION
 from .settings import MODEL_SETTINGS
 
 
-inject = (MODEL_CATALOG, MODEL_CALL_STATS, MODEL_SETTINGS, MODEL_SELECTION)
+inject = (MODEL_CATALOG, MODEL_CALL_STATS, MODEL_SETTINGS, MODEL_SELECTION, MODEL_CACHE_USAGE)
 
 
 def register(app: FastAPI, context: DashboardContext) -> None:
@@ -21,3 +25,7 @@ def register(app: FastAPI, context: DashboardContext) -> None:
         prefix="/api/dashboard/models",
     )
     app.router.routes.extend(router.routes)
+
+    @app.get("/api/dashboard/models/cache-usage")
+    async def cache_usage() -> dict[str, object]:
+        return await context.require(MODEL_CACHE_USAGE).overview()

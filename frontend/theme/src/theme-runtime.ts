@@ -11,6 +11,7 @@ export interface ThemeDefinition {
   colorScheme: ThemeColorScheme;
   material: Record<MaterialColorRole, string>;
   domain: Record<DomainColorRole, string>;
+  chart: Record<ChartColorRole, string>;
 }
 
 export interface ThemeSelection {
@@ -37,6 +38,9 @@ const DOMAIN_COLOR_ROLES = [
   "trace", "onTrace", "traceContainer", "onTraceContainer",
   "info", "onInfo", "infoContainer", "onInfoContainer",
 ] as const;
+
+const CHART_COLOR_ROLES = ["1", "2", "3", "4", "5", "6"] as const;
+export type ChartColorRole = (typeof CHART_COLOR_ROLES)[number];
 
 export type MaterialColorRole = (typeof MATERIAL_COLOR_ROLES)[number];
 export type DomainColorRole = (typeof DOMAIN_COLOR_ROLES)[number];
@@ -74,6 +78,7 @@ const THEME_COOKIE = "akashic_theme";
 const THEME_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const HEX_COLOR_PATTERN = /^#[0-9a-f]{6}(?:[0-9a-f]{2})?$/i;
 const THEME_EVENT = "akashic-theme-change";
+const THEME_CHANNEL_NAME = "akashic.theme-sync";
 
 /** Validate the bundled catalog once and expose immutable theme definitions. */
 function validateCatalog(value: unknown): { defaultThemeId: string; themes: ThemeDefinition[] } {
@@ -109,6 +114,7 @@ function validateCatalog(value: unknown): { defaultThemeId: string; themes: Them
       colorScheme: theme.colorScheme,
       material,
       domain,
+      chart: validateColorGroup(theme, "chart", CHART_COLOR_ROLES),
     } as ThemeDefinition;
   });
 
@@ -124,7 +130,7 @@ function validateCatalog(value: unknown): { defaultThemeId: string; themes: Them
 
 function validateColorGroup<Role extends string>(
   theme: Record<string, unknown>,
-  groupName: "material" | "domain",
+  groupName: "material" | "domain" | "chart",
   roles: readonly Role[],
 ): Record<Role, string> {
   const rawGroup = theme[groupName];
@@ -156,9 +162,11 @@ function rgbChannels(value: string): string {
   return `${Number.parseInt(value.slice(1, 3), 16)} ${Number.parseInt(value.slice(3, 5), 16)} ${Number.parseInt(value.slice(5, 7), 16)}`;
 }
 
-function themeCss(): string {
+/** 浏览器与离线预检使用同一份主题变量。 */
+export function themeCss(): string {
   return CATALOG.themes.map((theme) => {
     const declarations = MATERIAL_COLOR_ROLES.flatMap((role) => colorDeclarations("md-sys-color", role, theme.material[role]));
+    declarations.push(...CHART_COLOR_ROLES.map((role) => `--ak-chart-${role}:${theme.chart[role]}`));
     declarations.push(...DOMAIN_COLOR_ROLES.flatMap((role) => colorDeclarations("ak-sys-color", role, theme.domain[role])));
     for (const [legacyRole, [group, role]] of Object.entries(LEGACY_COLOR_ALIASES)) {
       const value = group === "material"
@@ -212,6 +220,9 @@ function applySelection(next: ThemeSelection): void {
   const theme = THEME_BY_ID.get(next.effectiveThemeId);
   if (!theme) throw new Error(`Theme catalog 缺少有效主题: ${next.effectiveThemeId}`);
   document.documentElement.dataset.theme = theme.id;
+  // markstream/shiki 与 tailwind darkMode:["class"] 都按根元素 .dark 判暗色；
+  // 与 data-theme 同步切换，否则暗色下代码块与 dark: 工具类永远落在亮色分支。
+  document.documentElement.classList.toggle("dark", theme.colorScheme === "dark");
   document.documentElement.style.colorScheme = theme.colorScheme;
   document.querySelector('meta[name="color-scheme"]')?.setAttribute("content", theme.colorScheme);
   window.dispatchEvent(new CustomEvent(THEME_EVENT));
@@ -236,8 +247,26 @@ function applySelectionWithCrossfade(next: ThemeSelection): void {
   void transition.ready.catch(() => {});
 }
 
+let themeChannel: BroadcastChannel | null = null;
+
+/** 外层 Shell 与 /chat iframe 是同源不同文档，主题在任一文档切换时经 BroadcastChannel
+    即时同步，不再等 focus 重读 cookie。接收方只 apply 不再广播，id 相同直接忽略，不会成环。 */
+function joinThemeChannel(): BroadcastChannel | null {
+  if (typeof BroadcastChannel === "undefined") return null;
+  if (themeChannel) return themeChannel;
+  themeChannel = new BroadcastChannel(THEME_CHANNEL_NAME);
+  themeChannel.addEventListener("message", (event) => {
+    if (typeof event.data !== "string" || !THEME_ID_PATTERN.test(event.data)) return;
+    const next = resolveSelection(event.data);
+    if (next.effectiveThemeId === selection.effectiveThemeId) return;
+    applySelection(next);
+  });
+  return themeChannel;
+}
+
 export function initializeTheme(): ThemeSelection {
   installThemeCss();
+  joinThemeChannel();
   applySelection(resolveSelection(readCookieTheme() ?? CATALOG.defaultThemeId));
   return selection;
 }
@@ -249,6 +278,7 @@ export function setTheme(requestedThemeId: string, persist = true): ThemeSelecti
   if (persist) {
     document.cookie = `${THEME_COOKIE}=${encodeURIComponent(requestedThemeId)}; Path=/; Max-Age=31536000; SameSite=Lax`;
   }
+  joinThemeChannel()?.postMessage(requestedThemeId);
   return next;
 }
 

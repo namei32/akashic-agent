@@ -8,11 +8,10 @@ from typing import Any, cast
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from agent.plugin_composition import Context
-from agent.plugin_composition.models import ToolCall as ModelToolCall
-from agent.plugin_contracts import ContentPart, json_value
-from agent.plugin_contracts.tools import (
-    TOOL_LOADING_PRESENTATION as TOOL_LOADING_PRESENTATION,
-)
+from plugins.models.contract import ToolCall as ModelToolCall
+from plugins.ledger.contract import ContentPart, json_value
+from core.common.frozen_json import freeze_json
+from plugins.tools.contract import TOOL_LOADING_PRESENTATION as TOOL_LOADING_PRESENTATION
 
 from ._tool_boundary import (
     TOOLS,
@@ -158,20 +157,23 @@ class ToolLoadingPresentation:
             ref for ref in view.refs if catalog.group_always_on(ref)
         ))
         self._groups = _groups(catalog, view)
+        self._schemas: tuple[Mapping[str, Any], ...] | None = None
 
     @property
     def schemas(self) -> tuple[Mapping[str, Any], ...]:
-        return (
-            *(_tool_schema(ref.description) for ref in self._direct.refs),
-            {
-                "type": "function",
-                "function": {
-                    "name": "tool_call",
-                    "description": "调用获授 view 中已经取得 schema 的工具。",
-                    "parameters": IndirectCall.model_json_schema(),
+        if self._schemas is None:
+            self._schemas = cast(tuple[Mapping[str, Any], ...], freeze_json((
+                *(_tool_schema(ref.description) for ref in self._direct.refs),
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "tool_call",
+                        "description": "调用获授 view 中已经取得 schema 的工具。",
+                        "parameters": IndirectCall.model_json_schema(),
+                    },
                 },
-            },
-        )
+            )))
+        return self._schemas
 
     @property
     def system_prompt(self) -> str:

@@ -8,9 +8,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
 
-from agent.plugin_composition.archive import sync_directory
+from agent.plugins.files import sync_directory
 from agent.plugins.artifacts import ArtifactPointer, ArtifactPointers, pointer_state_path, write_pointers
-from agent.plugins.manifest import load_plugin_manifest, write_plugin_manifest
+from agent.plugins.bundles import patch_rows, set_plugin_choice
 from infra.persistence.json_store import load_json
 
 _LEGACY_PLUGIN_UPDATES = """CREATE TABLE plugin_updates (
@@ -61,6 +61,18 @@ SCHEMA = {
 }
 
 
+CONTRACT_RESTART_SCHEMA = """CREATE TABLE plugin_contract_restarts (
+    update_id TEXT PRIMARY KEY REFERENCES plugin_updates(update_id)
+)"""
+
+
+def check_contract_restart_schema(conn: sqlite3.Connection) -> None:
+    """合同重启事实只按更新 ID 追加，不保存第二份输入或安装 phase。"""
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='plugin_contract_restarts'").fetchone()
+    if row is None or " ".join(str(row[0]).split()) != " ".join(CONTRACT_RESTART_SCHEMA.split()):
+        raise RuntimeError("合同重启 journal schema 缺失或未知；请先执行 Core migration")
+
+
 @dataclass(frozen=True)
 class UpdateRollback:
     update_id: str
@@ -73,6 +85,7 @@ class UpdateRollback:
     phase: Literal['armed', 'committed', 'rolled_back']
     reload_tx_id: str | None
     error: str
+    restart_required: bool
 
 
 def plugin_update_schema_state(conn: sqlite3.Connection) -> Literal["missing", "old", "new"]:
@@ -114,7 +127,8 @@ def pointer_value(pointers: ArtifactPointers | None) -> dict[str, str | None] | 
 def read(conn: sqlite3.Connection, update_id: str) -> UpdateRollback:
     row = conn.execute(
         "SELECT input_ref,plugin_id,plugin_base,previous_pointers_json,candidate_pointer,previous_enabled,"
-        "phase,reload_tx_id,error FROM plugin_updates WHERE update_id=?", (update_id,),
+        "phase,reload_tx_id,error,EXISTS(SELECT 1 FROM plugin_contract_restarts AS restart "
+        "WHERE restart.update_id=plugin_updates.update_id) FROM plugin_updates WHERE update_id=?", (update_id,),
     ).fetchone()
     if row is None:
         raise KeyError(f"插件更新不存在: {update_id}")
@@ -131,7 +145,7 @@ def read(conn: sqlite3.Connection, update_id: str) -> UpdateRollback:
         previous = ArtifactPointers(ArtifactPointer(cast(str | None, raw['stable'])), ArtifactPointer(cast(str | None, raw['latest'])))
     return UpdateRollback(
         update_id, row[0], row[1], Path(row[2]), previous, ArtifactPointer(row[4]),
-        None if row[5] is None else bool(row[5]), row[6], row[7], row[8],
+        None if row[5] is None else bool(row[5]), row[6], row[7], row[8], bool(row[9]),
     )
 
 
@@ -156,7 +170,7 @@ def arm(
 
 
 def set_input_ref(conn: sqlite3.Connection, *, update_id: str, input_ref: str) -> None:
-    """Fill the immutable runtime archive reference once, or reject drift."""
+    """只填充本次安装的输入身份一次，拒绝同一请求漂移。"""
     if not input_ref:
         raise ValueError("插件更新 input_ref 不能为空")
     if not check_schema(conn):
@@ -239,7 +253,7 @@ def commit(conn: sqlite3.Connection, tx_id: str, now: str) -> None:
     )
 
 
-def rollback(conn: sqlite3.Connection, update: UpdateRollback, plugins_home: Path, *, now: str, error: str) -> None:
+def rollback(conn: sqlite3.Connection, update: UpdateRollback, plugins_home: Path, *, workspace: Path, now: str, error: str) -> None:
     """核对旧/新状态后先恢复文件，再记录回退完成；中途死亡可再次执行。"""
     if update.phase != 'armed':
         raise RuntimeError("只有尚未提交的插件更新可以回退")
@@ -266,7 +280,7 @@ def rollback(conn: sqlite3.Connection, update: UpdateRollback, plugins_home: Pat
                 {'stable': update.candidate.path, 'latest': update.candidate.path})
     if current not in accepted:
         raise RuntimeError("插件指针已被其他操作改变，不能覆盖")
-    entries = load_plugin_manifest(plugins_home)
+    entries = {row.plugin: not row.disabled for row in patch_rows(workspace)}
     if entries.get(update.plugin_id) not in (update.previous_enabled, True):
         raise RuntimeError("插件启用状态已被其他操作改变，不能覆盖")
     # 1. 写回旧目标时由原 pointer owner 核验旧 artifact 仍然可用。
@@ -275,13 +289,39 @@ def rollback(conn: sqlite3.Connection, update: UpdateRollback, plugins_home: Pat
         sync_directory(expected_base)
     else:
         _ = write_pointers(expected_base, stable=update.previous.stable, latest=update.previous.latest)
-    if update.previous_enabled is None:
-        _ = entries.pop(update.plugin_id, None)
-    else:
-        entries[update.plugin_id] = update.previous_enabled
-    _ = write_plugin_manifest(entries, plugins_home=plugins_home)
+    set_plugin_choice(workspace, update.plugin_id, enabled=update.previous_enabled)
     # 2. 保留新 artifact 与全部 plugin-data；只更新本恢复点的完成事实。
     _ = conn.execute(
         "UPDATE plugin_updates SET phase='rolled_back',updated_at=?,error=? WHERE update_id=? AND phase='armed'",
         (now, error, update.update_id),
     )
+
+
+# 启动按磁盘结算无 runtime 记录的中断安装：指针换到候选即完成，未换即放弃；同制品重装以启用写入为提交点。
+def settle_orphan(conn: sqlite3.Connection, update: UpdateRollback, plugins_home: Path, *, workspace: Path, now: str) -> str:
+    if update.phase != 'armed' or update.reload_tx_id is not None:
+        raise RuntimeError("只有无 runtime 记录的中断安装可以按磁盘结算")
+    path = pointer_state_path(update.plugin_base)
+    missing = object()
+    current = load_json(path, default=missing, domain='plugin_update_rollback')
+    candidate = {'stable': update.candidate.path, 'latest': update.candidate.path}
+    enabled = {row.plugin: not row.disabled for row in patch_rows(workspace)}.get(update.plugin_id)
+    # 1. 同制品重装：指针前后相同，唯一留下的事实是启用写入；已写入即完成。
+    if pointer_value(update.previous) == candidate and current == candidate:
+        if enabled is not True:
+            rollback(conn, update, plugins_home, workspace=workspace, now=now, error="interrupted before enable")
+            return 'rolled_back'
+    # 2. 指针未变：提交点之前中断，记录放弃，磁盘原样保留。
+    elif (current is missing and update.previous is None) or current == pointer_value(update.previous):
+        rollback(conn, update, plugins_home, workspace=workspace, now=now, error="interrupted before pointer commit")
+        return 'rolled_back'
+    elif current != candidate:
+        raise RuntimeError(f"插件指针已被其他操作改变，不能结算: {update.plugin_id}")
+    # 3. 指针已是候选：提交点之后中断，补齐同一安装的启用选择。
+    if enabled is not True:
+        _ = set_plugin_choice(workspace, update.plugin_id, enabled=True)
+    _ = conn.execute(
+        "UPDATE plugin_updates SET phase='committed',updated_at=?,error='' WHERE update_id=? AND phase='armed'",
+        (now, update.update_id),
+    )
+    return 'committed'

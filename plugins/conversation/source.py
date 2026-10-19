@@ -3,8 +3,8 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, MutableMapping
 from typing import cast
 
-from agent.plugin_composition.models import ChatModelSelection
-from agent.plugin_contracts import Body, Input
+from plugins.models.contract import ChatModelSelection
+from plugins.ledger.contract import Body, Input
 
 
 SavedSelectionWriter = Callable[[MutableMapping[str, object], ChatModelSelection], None]

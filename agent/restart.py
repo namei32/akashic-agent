@@ -70,10 +70,26 @@ class RestartGate:
         self._drained.set()
         self._open_changed = asyncio.Event()
         self._committed = False
+        self._shutdown_requested = asyncio.Event()
+        self._shutdown_error: BaseException | None = None
+
+    def request_shutdown(self, error: BaseException | None = None) -> None:
+        """请求当前进程排空并结束；首次意图的失败原因传回外壳。"""
+        if not self.execution_enabled:
+            raise RestartRejectedError("当前 runtime 不允许停止效果")
+        if not self._shutdown_requested.is_set():
+            self._shutdown_error = error
+            self._shutdown_requested.set()
+
+    async def wait_shutdown(self) -> None:
+        """外壳等待停止意图；业务插件不持有外壳、Root 或退出回调。"""
+        await self._shutdown_requested.wait()
+        if self._shutdown_error is not None:
+            raise self._shutdown_error
 
     @property
     def accepting(self) -> bool:
-        return self._accepting
+        return self._accepting and not self._shutdown_requested.is_set()
 
     @property
     def permit_count(self) -> int:
@@ -81,12 +97,12 @@ class RestartGate:
 
     def check_open(self) -> None:
         """在持久接纳新 work 前核对 Core 的 admission 状态。"""
-        if not self._accepting:
+        if not self.accepting:
             raise RestartPendingError("runtime 正在等待重启，暂不接纳新 Root")
 
     async def wait_until_open(self) -> None:
         """等待一次 abort/reopen 通知，不保存任何来源或 Session 状态。"""
-        while not self._accepting:
+        while not self.accepting:
             changed = self._open_changed
             await changed.wait()
 
@@ -96,6 +112,10 @@ class RestartGate:
             raise RestartRejectedError("当前进程未由 supervisor 托管")
         if not self.execution_enabled:
             raise RestartRejectedError("当前 runtime 不允许重启效果")
+        self.prepare_stop(request_id)
+
+    def prepare_stop(self, request_id: str) -> None:
+        """关闭新工作准入；宿主停止不依赖 Supervisor 的重启管道。"""
         if not request_id or request_id.strip() != request_id:
             raise ValueError("restart request id 无效")
         if self._request_id is not None:
@@ -104,6 +124,16 @@ class RestartGate:
             raise RestartRejectedError("已有重启请求等待提交")
         self._request_id = request_id
         self._accepting = False
+
+    def check_stop(self, request_id: str) -> None:
+        """拒绝已取消或被后来请求替换的停止准备。"""
+        if self._request_id != request_id or self._accepting:
+            raise RestartRejectedError("停止准备已取消或被替换")
+
+    async def wait_drained(self, timeout_s: float) -> None:
+        """等待真实工作许可释放，超时由停止请求 owner 决定恢复准入。"""
+        async with asyncio.timeout(timeout_s):
+            await self._drained.wait()
 
     def acquire(self) -> ExternalRootPermit:
         """取得一个新外部 Root permit；prepare 后立即拒绝。"""

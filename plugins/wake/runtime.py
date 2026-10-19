@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from agent.plugin_composition.models import MODEL_CATALOG, ModelAvailability
+from plugins.models.contract import MODEL_CATALOG
 
 import asyncio
 import hashlib
@@ -11,15 +11,15 @@ from typing import cast
 from core.common.file_io import run_file_io
 
 from agent.plugin_composition import Context
-from agent.plugin_composition.bindings import BINDINGS
-from agent.plugin_composition.messages import (
+from plugins.ledger.contract import BINDINGS
+from plugins.ledger.contract import (
     MESSAGE_CATALOG,
     MessageReader,
     OwnerRecord,
 )
-from agent.plugin_composition.timers import TIMERS, TimerReceipt, TimerStatus
-from agent.plugin_contracts import Message, body_to_dict
-from agent.plugin_contracts.models import (
+from plugins.timer.contract import TIMERS, TimerReceipt, TimerStatus
+from plugins.ledger.contract import Message, body_to_dict
+from plugins.models.contract import (
     MODEL_SELECTION as MODEL_SELECTION,
     ModelSelection as ModelSelection,
 )
@@ -158,18 +158,6 @@ class Runtime:
             return config
         return Config.model_validate(config.model_dump(mode="python"))
 
-    def dashboard_view(self) -> DashboardView:
-        """Build a dashboard view from narrow read-only callbacks."""
-        catalog = self.ctx.require(MESSAGE_CATALOG)
-        history = self.ctx.require(DELIVERY_READ)
-
-        def read_message(session_id: str, message_id: str) -> Message | None:
-            return catalog.reader(session_id).get(message_id)
-
-        return DashboardView(
-            self.state.read_only(), self.source.read, read_message, history.status,
-        )
-
     async def capture(self, flow_id: str, admission: Admission, now: datetime) -> Request | None:
         """先固定归档程序、工具、出站目标与上下文，随后才允许领取领域条目。"""
         owner = admission.owner
@@ -239,7 +227,7 @@ class Runtime:
                 return reason
         catalog = self.ctx.require(MODEL_CATALOG).snapshot()
         model_id = catalog.role_bindings.get("default")
-        if model_id is None or catalog.model(model_id).availability != ModelAvailability.AVAILABLE:
+        if model_id is None or catalog.model(model_id).availability != 'available':
             return "默认聊天模型不可用"
         return None
 

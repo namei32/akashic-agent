@@ -1,4 +1,4 @@
-import { access, readdir } from "node:fs/promises";
+import { access, readdir, copyFile, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -99,3 +99,51 @@ await bundle({
   minify: true,
   outfile: resolve(pluginsRoot, "akasha/message_ui.js"),
 });
+
+// Models 的回答尾注经插件界面插槽挂载，与设置页 Web 模块分开打包。
+await bundle({
+  entryPoints: [resolve(repoRoot, "frontend/plugins/models/src/message-ui.js")],
+  bundle: true, format: "esm", target: "es2022", minify: true,
+  outfile: resolve(pluginsRoot, "models/message_ui.js"),
+});
+
+// 改动摘要经回答尾注插槽挂载，与“改动”标签的 Web 模块分开打包。
+await bundle({
+  entryPoints: [resolve(repoRoot, "frontend/plugins/workspace_changes/src/message-ui.js")],
+  bundle: true, format: "esm", target: "es2022", minify: true,
+  outfile: resolve(pluginsRoot, "workspace_changes/message_ui.js"),
+});
+
+// 网站卡片经消息附件插槽挂载，与“网站”标签的 Web 模块分开打包。
+await bundle({
+  entryPoints: [resolve(repoRoot, "frontend/plugins/sites/src/message-ui.ts")],
+  bundle: true, format: "esm", target: "es2022", minify: true,
+  outfile: resolve(pluginsRoot, "sites/message_ui.js"),
+});
+
+// 可视化使用同一份 frame 模板完成服务端预检与浏览器展示；图表工具包内联进模板，不另开脚本入口。
+const visualCharts = await bundle({
+  entryPoints: [resolve(repoRoot, "frontend/plugins/visuals/src/charts.ts")],
+  bundle: true, format: "iife", target: "es2022", minify: true, write: false,
+});
+const visualFrameSource = await readFile(resolve(repoRoot, "frontend/plugins/visuals/src/frame.html"), "utf8");
+if (visualFrameSource.split("/*visual-charts*/").length !== 2) throw new Error("visuals frame.html 必须恰有一处 /*visual-charts*/ 占位符");
+const visualFrame = visualFrameSource
+  .replace("/*visual-charts*/", () => visualCharts.outputFiles[0].text.trim().replaceAll("</script", "<\\/script"));
+await bundle({
+  entryPoints: [resolve(repoRoot, "frontend/plugins/visuals/src/plugin-ui.ts")],
+  bundle: true, format: "esm", target: "es2022", minify: true,
+  plugins: [{ name: "frame-template", setup(build) {
+    build.onResolve({ filter: /\.html\?raw$/ }, args => ({ path: resolve(args.resolveDir, args.path.slice(0, -4)), namespace: "frame" }));
+    build.onLoad({ filter: /.*/, namespace: "frame" }, async args => ({
+      contents: args.path.endsWith("frame.html") ? visualFrame : await readFile(args.path, "utf8"), loader: "text" }));
+  } }],
+  outfile: resolve(pluginsRoot, "visuals/message_ui.js"),
+});
+await writeFile(resolve(pluginsRoot, "visuals/frame.html"), visualFrame);
+await copyFile(resolve(repoRoot, "frontend/plugins/visuals/src/bootstrap.html"), resolve(pluginsRoot, "visuals/bootstrap.html"));
+
+const themeBuild = await bundle({ entryPoints: [resolve(repoRoot, "frontend/theme/src/theme-runtime.ts")],
+  bundle: true, format: "esm", platform: "node", write: false });
+const themeModule = await import(`data:text/javascript;base64,${Buffer.from(themeBuild.outputFiles[0].contents).toString("base64")}`);
+await writeFile(resolve(pluginsRoot, "visuals/preview-theme.css"), themeModule.themeCss());

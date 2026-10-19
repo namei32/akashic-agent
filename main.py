@@ -11,7 +11,6 @@
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import json
 import logging
@@ -20,9 +19,11 @@ import signal
 import sys
 import tomllib
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
+_DISTRIBUTION_COMMANDS = frozenset({"dashboard", "workload-controller"})
+_MANAGEMENT_COMMANDS = frozenset({"plugin-install", "plugin-status", "plugin-uninstall"})
 _DEFAULT_WORKSPACE = "~/.akashic/workspace"
 _PLUGIN_ROLLOUT_OWNER_TURN_ENV = "AKASHIC_PLUGIN_ROLLOUT_OWNER_TURN"
 _AGENT_INTERNAL_PLUGIN_COMMANDS = frozenset(
@@ -190,23 +191,13 @@ if __name__ == "__main__" and _run_lightweight_command():
     raise SystemExit(0)
 
 
-from agent.config import Config, resolve_app_server_endpoint
-from agent.control.client import ControlClient, RemoteControlError
-from agent.migrations import (
-    MigrationOutcome,
-    migrate_installation,
-)
-from agent.restart import RestartGate, SupervisorCommitChannel
-from agent.supervisor import RESTART_EXIT_CODE, run_supervisor
-from agent.plugins.doctor import format_plugin_doctor_report, run_plugin_doctor
-from agent.plugins.manifest import set_plugin_enabled
-from bootstrap.app import build_app_runtime
-from bootstrap.dashboard_api import run_dashboard_api
-from bootstrap.init_workspace import InitSummary, init_workspace
-from bootstrap.runtime_readiness import RuntimeReadiness
-from bootstrap.workspace_token import read_workspace_token
-from core.net.http import SharedHttpResources
-from infra.control.socket import is_tcp_endpoint
+from agent.config import Config
+from agent.plugins.entrypoints import invoke_plugin_command, invoke_distribution_command
+
+# 各命令的实现只在对应分支导入；插件命令客户端不加载迁移、重启、HTTP 与管理命令。
+if TYPE_CHECKING:
+    from agent.migrations import MigrationOutcome
+    from bootstrap.init_workspace import InitSummary
 
 _HELP = """\
 用法: python main.py [命令] [选项]
@@ -284,11 +275,11 @@ def _prepare_startup_migrations(
         "init",
         "supervise",
         "gateway",
-        "app-server",
-        "dashboard",
     }:
         return None
     if command in {"", "supervise"} and (not config_path.exists() or not workspace.exists()):
+        from bootstrap.init_workspace import init_workspace
+
         # 首次启动必须先建立空选择，迁移不能抢先把新目录变成旧 workspace。
         init_workspace(config_path=config_path, workspace=workspace)
     if command in {"init", "setup"} and not workspace.exists():
@@ -297,196 +288,19 @@ def _prepare_startup_migrations(
         return None
     if command == "gateway" and os.environ.get("AKASHIC_SUPERVISED") == "1":
         return None
+    from agent.migrations import migrate_installation
+
     outcome = migrate_installation(config_path, workspace)
     if outcome.state == "migrated":
         print(f"启动迁移完成: migrations={len(outcome.migrations)}")
     return outcome
 
 
-def _parse_csv_flag(value: str | None) -> list[str]:
-    if not value:
-        return []
-    return [item.strip() for item in value.split(",") if item.strip()]
-
-
-async def _request_runtime_control(
-    config_path: str,
-    workspace: Path,
-    method: str,
-    params: dict[str, object],
-) -> dict[str, object]:
-    """向当前 Gateway 发起一个 runtime-owned control 操作。"""
-
-    config = Config.load(config_path, workspace=workspace)
-    endpoint = resolve_app_server_endpoint(config.app_server.listen, workspace)
-    token = read_workspace_token(workspace) if is_tcp_endpoint(endpoint) else None
-    async with await ControlClient.connect(endpoint, workspace_token=token) as client:
-        result = await client.request(method, params)
-    if not isinstance(result, dict):
-        raise RuntimeError(f"{method} 响应无效")
-    return cast(dict[str, object], result)
-
-
-def _uninstall_via_runtime(
-    config_path: str,
-    plugin_id: str,
-    workspace: Path,
-) -> dict[str, object]:
-    if not Path(config_path).is_file():
-        raise RuntimeError("plugin-uninstall 需要正在运行的 Core 和有效配置")
-    config = Config.load(config_path, workspace=workspace)
-    endpoint = resolve_app_server_endpoint(
-        config.app_server.listen,
-        workspace,
-    )
-    return asyncio.run(_request_plugin_uninstall(endpoint, plugin_id, workspace))
-
-
-async def _request_plugin_uninstall(
-    endpoint: str, plugin_id: str, workspace: Path,
-) -> dict[str, object]:
-    """由应用 owner 停用、排空并卸载，控制连接只等待结果。"""
-    token = read_workspace_token(workspace) if is_tcp_endpoint(endpoint) else None
-    async with await ControlClient.connect(endpoint, workspace_token=token) as client:
-        result = await client.request("plugin/uninstall", {"plugin_id": plugin_id})
-        if not isinstance(result, dict):
-            raise RuntimeError("插件卸载响应无效")
-        return cast(dict[str, object], result)
-
-
-async def _wait_exec_result(client: ControlClient, session_id: str, input_id: str,
-                            *, json_events: bool) -> dict[str, object]:
-    """从当前结果的 seq 继续跟随；订阅建立期间的新消息仍能补读。"""
-    query: dict[str, object] = {"session_id": session_id, "input_id": input_id}
-    result = cast(dict[str, object], await client.request("programmatic/message/result", query))
-    if result["status"] != "open":
-        return result
-    async with await client.session_follow(session_id, after_seq=cast(int, result["through_seq"])) as feed:
-        async for event in feed.events():
-            if json_events:
-                print(json.dumps(event, ensure_ascii=False, separators=(",", ":")), flush=True)
-            if event["type"] == "messages.appended":
-                result = cast(dict[str, object], await client.request("programmatic/message/result", query))
-                if result["status"] != "open":
-                    return result
-    raise ConnectionError("消息订阅已关闭；使用原 Session 和 Input 身份恢复查询")
-
-
-async def _exec_until_stop(client: ControlClient, session_id: str, input_id: str,
-                           *, json_events: bool) -> tuple[dict[str, object], bool]:
-    """显式 SIGINT 提交 pause；普通连接关闭只停止本地读取。"""
-    interrupt = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    previous = signal.getsignal(signal.SIGINT)
-    native_handler = False
-    try:
-        loop.add_signal_handler(signal.SIGINT, interrupt.set)
-        native_handler = True
-    except NotImplementedError:
-        def on_sigint(_signal: int, _frame: object) -> None:
-            _ = loop.call_soon_threadsafe(interrupt.set)
-        _ = signal.signal(signal.SIGINT, on_sigint)
-    result_task = asyncio.create_task(_wait_exec_result(client, session_id, input_id,
-                                                       json_events=json_events), name="exec-result")
-    interrupt_task = asyncio.create_task(interrupt.wait(), name="exec-sigint")
-    stopped = False
-    try:
-        done, _ = await asyncio.wait((result_task, interrupt_task), return_when=asyncio.FIRST_COMPLETED)
-        if interrupt_task in done and not result_task.done():
-            stopped = True
-            _ = await client.request("programmatic/message/pause", {
-                "session_id": session_id, "message_id": uuid4().hex,
-            })
-        return await result_task, stopped
-    finally:
-        _ = result_task.cancel()
-        _ = interrupt_task.cancel()
-        _ = await asyncio.gather(result_task, interrupt_task, return_exceptions=True)
-        if native_handler:
-            _ = loop.remove_signal_handler(signal.SIGINT)
-        _ = signal.signal(signal.SIGINT, previous)
-
-
-async def run_exec(args: list[str], config_path: str, workspace: Path) -> int:
-    """通过普通程序来源提交 Message，按原 Input 的持久结果退出。"""
-    # 1. 每个可重试写入都有调用方身份；CLI 不接受来源或学习属性覆盖。
-    parser = argparse.ArgumentParser(prog="exec")
-    _ = parser.add_argument("prompt", nargs="?")
-    _ = parser.add_argument("--new", action="store_true")
-    _ = parser.add_argument("--session")
-    _ = parser.add_argument("--message-id")
-    _ = parser.add_argument("--resume")
-    _ = parser.add_argument("--persist-memory", action="store_true")
-    _ = parser.add_argument("--detach", action="store_true")
-    output = parser.add_mutually_exclusive_group()
-    _ = output.add_argument("--json", action="store_true")
-    _ = output.add_argument("--final-only", action="store_true")
-    for option in ("--endpoint", "--config", "--workspace"):
-        _ = parser.add_argument(option)
-    options = parser.parse_args(args[1:])
-    if not options.new and options.session is None:
-        raise ValueError("exec 需要 --new 或 --session ID")
-    if options.persist_memory and not options.new:
-        raise ValueError("--persist-memory 只能在 --new 准入时选择")
-    if options.detach and options.final_only:
-        raise ValueError("--detach 不能与 --final-only 一起使用")
-    if options.resume is not None:
-        if options.new or options.prompt is not None:
-            raise ValueError("--resume 只引用原 Session 的 Input，不接收新 prompt")
-    elif options.prompt is None:
-        raise ValueError("exec 缺少 prompt；使用 - 从 stdin 读取")
-    session_id = options.session or "programmatic:" + uuid4().hex
-    message_id = options.message_id or uuid4().hex
-    input_id = options.resume or message_id
-    endpoint = options.endpoint
-    if endpoint is None:
-        config = Config.load(config_path, workspace=workspace)
-        endpoint = resolve_app_server_endpoint(config.app_server.listen, workspace)
-    token = read_workspace_token(workspace) if is_tcp_endpoint(endpoint) else None
-    identity: dict[str, object] = {"session_id": session_id, "message_id": message_id, "input_id": input_id}
-    print(json.dumps({"type": "message.submitting", **identity}, ensure_ascii=False),
-          file=sys.stdout if options.json else sys.stderr, flush=True)
-
-    # 2. 先固定 Session 属性，再提交输入；ACK 不等默认回复。
-    async with await ControlClient.connect(endpoint, workspace_token=token) as client:
-        if options.new:
-            _ = await client.request("programmatic/session/admit", {
-                "session_id": session_id, "persist_memory": options.persist_memory,
-            })
-        if options.resume is not None:
-            receipt = await client.request("programmatic/message/resume", identity)
-        else:
-            prompt = sys.stdin.read() if options.prompt == "-" else options.prompt
-            receipt = await client.request("programmatic/message/send", {
-                "session_id": session_id, "message_id": message_id, "text": prompt,
-            })
-        if options.json:
-            print(json.dumps({"type": "message.accepted", "receipt": receipt}, ensure_ascii=False), flush=True)
-        if options.detach:
-            return 0
-
-        # 3. 完成、暂停、失败都来自日志；读取关闭不会伪造成功。
-        result, stopped = await _exec_until_stop(client, session_id, input_id, json_events=options.json)
-        if options.json:
-            print(json.dumps({"type": "message.result", **result}, ensure_ascii=False), flush=True)
-        elif result["status"] in {"complete", "quiet"}:
-            ending = cast(int, result["ending_seq"])
-            page = await client.message_read(session_id, after_seq=ending - 1, through_seq=ending, limit=1)
-            row = page["items"][0]
-            if row["id"] != result["ending_message_id"]:
-                raise RuntimeError("程序结果引用与读取的 Message 不一致")
-            print("\n".join(part["value"] for part in row["body"]["parts"] if part["kind"] == "text"))
-        else:
-            print(json.dumps(result, ensure_ascii=False), file=sys.stderr)
-        if stopped or result["status"] == "pause":
-            return 130
-        return 0 if result["status"] in {"complete", "quiet"} else 1
-
-
 async def inspect_modules(config_path: str, workspace: Path) -> None:
     import logging
     from bootstrap.cleanup import run_cleanup_steps
     from bootstrap.tools import build_core_runtime
+    from core.net.http import SharedHttpResources
 
     logging.getLogger().setLevel(logging.WARNING)
     config = Config.load(config_path, workspace=workspace)
@@ -506,6 +320,12 @@ async def inspect_modules(config_path: str, workspace: Path) -> None:
 
 
 async def serve(config_path: str, workspace: Path) -> int:
+    # Web shell 与 FastAPI 只属于 gateway；插件命令客户端不加载它们。
+    from agent.restart import RestartGate, SupervisorCommitChannel
+    from agent.supervisor import RESTART_EXIT_CODE
+    from bootstrap.app import build_app_runtime
+    from bootstrap.runtime_readiness import RuntimeReadiness
+
     commit_channel = SupervisorCommitChannel.from_environment()
     if commit_channel is not None:
         commit_channel.stage("gateway.starting")
@@ -535,11 +355,11 @@ async def serve(config_path: str, workspace: Path) -> int:
         if commit_channel is not None
         else None
     )
-    readiness = (
-        RuntimeReadiness(workspace, commit_channel.boot_id, commit_channel)
-        if commit_channel is not None
-        else None
-    )
+    readiness = None
+    if commit_channel is not None or os.environ.get("AKASHIC_DOCKER_RUNTIME") == "1":
+        boot_id = commit_channel.boot_id if commit_channel else uuid4().hex
+        os.environ["AKASHIC_BOOT_ID"] = boot_id
+        readiness = RuntimeReadiness(workspace, boot_id, commit_channel)
     runtime = build_app_runtime(
         config,
         workspace=workspace,
@@ -772,8 +592,6 @@ if __name__ == "__main__":
     config_path = "config.toml"
     workspace: Path
     force = "--force" in args
-    dashboard_host = "0.0.0.0"
-    dashboard_port = 2236
 
     try:
         config_value = _get_flag_value(args, "--config")
@@ -786,12 +604,6 @@ if __name__ == "__main__":
             Path(config_path),
             allow_default=bootstrap_command or supervisor_command,
         )
-        host_value = _get_flag_value(args, "--host")
-        port_value = _get_flag_value(args, "--port")
-        source_value = _get_flag_value(args, "--source")
-        marketplace_value = _get_flag_value(args, "--marketplace")
-        ref_value = _get_flag_value(args, "--ref")
-        sparse_value = _get_flag_value(args, "--sparse")
     except ValueError as exc:
         print(str(exc))
         sys.exit(1)
@@ -805,10 +617,6 @@ if __name__ == "__main__":
     if args and args[0] == "supervise" and not _supervisor_supported():
         print("supervise 仅支持 Linux 和 macOS", file=sys.stderr)
         sys.exit(2)
-    if host_value is not None:
-        dashboard_host = host_value
-    if port_value is not None:
-        dashboard_port = int(port_value)
 
     try:
         migration_outcome = _prepare_startup_migrations(
@@ -821,15 +629,17 @@ if __name__ == "__main__":
         sys.exit(1)
 
     if args and args[0] == "setup":
-        from bootstrap.setup_wizard import run_setup_wizard
+        from bootstrap.init_workspace import init_workspace
 
-        run_setup_wizard(
-            config_path=Path(config_path),
-            workspace=workspace,
-        )
+        summary = init_workspace(config_path=Path(config_path), workspace=workspace)
+        for note in summary.notes:
+            print(note)
+        print("初始化完成。安装插件组合并启动后，在 Web 页面完成初始配置。")
         sys.exit(0)
 
     if args and args[0] == "init":
+        from bootstrap.init_workspace import init_workspace
+
         summary = init_workspace(
             config_path=config_path,
             workspace=workspace,
@@ -838,95 +648,29 @@ if __name__ == "__main__":
         _print_init_summary(summary)
         sys.exit(0)
 
-    if args and args[0] == "plugin-install":
-        if not source_value:
-            print("plugin-install 缺少 --source")
-            sys.exit(1)
-        marketplace = marketplace_value or "local"
-        try:
-            result = asyncio.run(
-                _request_runtime_control(
-                    config_path,
-                    workspace,
-                    "plugin/install",
-                    {
-                        "source": source_value,
-                        "marketplace": marketplace,
-                        "ref": ref_value or "",
-                        "sparse": _parse_csv_flag(sparse_value),
-                        "update_id": _get_flag_value(args, "--update-id") or uuid4().hex,
-                    },
-                )
-            )
-        except (ValueError, RuntimeError, ConnectionError, OSError) as exc:
-            print(str(exc), file=sys.stderr)
-            sys.exit(1)
-        print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
-        sys.exit(0)
-
-    if args and args[0] == "plugin-status":
-        update_id = args[1] if len(args) > 1 and not args[1].startswith("--") else None
-        method = (
-            "plugin/status" if update_id is None else
-            "plugin/update"
-        )
-        try:
-            result = asyncio.run(_request_runtime_control(
-                config_path, workspace, method,
-                {} if update_id is None else {"update_id": update_id},
-            ))
-        except (ValueError, RuntimeError, ConnectionError, OSError) as exc:
-            print(str(exc), file=sys.stderr)
-            sys.exit(1)
-        print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
-        sys.exit(0)
-
     if args and args[0] in {"plugin-enable", "plugin-disable"}:
         if len(args) < 2 or args[1].startswith("--"):
             print(f"{args[0]} 缺少插件 ID")
             sys.exit(1)
         plugin_id = args[1]
         enabled = args[0] == "plugin-enable"
+        from agent.plugins.install import set_installed_plugin_enabled
+
         try:
-            manifest = set_plugin_enabled(plugin_id, enabled=enabled)
+            manifest = set_installed_plugin_enabled(plugin_id, enabled=enabled, workspace=workspace)
         except ValueError as exc:
             print(str(exc))
             sys.exit(1)
         print(f"插件已{'启用' if enabled else '禁用'}: {plugin_id}")
-        print(f"清单: {manifest}")
+        print(f"组合 patch: {manifest}")
         sys.exit(0)
-
-    if args and args[0] == "plugin-uninstall":
-        if len(args) < 2 or args[1].startswith("--"):
-            print("plugin-uninstall 缺少插件 ID")
-            sys.exit(1)
-        plugin_id = args[1]
-        try:
-            runtime_result = _uninstall_via_runtime(
-                config_path,
-                plugin_id,
-                workspace,
-            )
-            if "--json" in args:
-                print(
-                    json.dumps(
-                        runtime_result,
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    )
-                )
-            else:
-                print(json.dumps(runtime_result, ensure_ascii=False))
-            sys.exit(0)
-        except (ValueError, RuntimeError) as exc:
-            print(str(exc))
-            sys.exit(1)
-        raise AssertionError("plugin-uninstall 应在 runtime response 后退出")
 
     if args and args[0] == "plugin-doctor":
         target_plugin_id = ""
         if len(args) >= 2 and not args[1].startswith("--"):
             target_plugin_id = args[1]
+        from agent.plugins.doctor import format_plugin_doctor_report, run_plugin_doctor
+
         report = run_plugin_doctor(
             plugin_id=target_plugin_id,
             workspace=workspace,
@@ -943,6 +687,8 @@ if __name__ == "__main__":
         except ValueError as exc:
             print(str(exc), file=sys.stderr)
             sys.exit(2)
+        from agent.supervisor import run_supervisor
+
         sys.exit(
             run_supervisor(
                 config_path=Path(config_path),
@@ -954,31 +700,28 @@ if __name__ == "__main__":
     if args and args[0] == "gateway":
         sys.exit(asyncio.run(serve(config_path, workspace)))
 
-    if args and args[0] == "app-server":
-        if "--stdio" not in args:
-            print("app-server 当前必须指定 --stdio", file=sys.stderr)
-            sys.exit(2)
-        from bootstrap.app_server import run_stdio_app_server
-
-        config = Config.load(config_path, workspace=workspace)
-        asyncio.run(run_stdio_app_server(config, workspace))
-        sys.exit(0)
-
-    if args and args[0] == "exec":
+    if args and not args[0].startswith("--") and args[0] != "gateway":
+        command_args = list(args[1:])
+        for flag in ("--config", "--workspace"):
+            while flag in command_args:
+                index = command_args.index(flag)
+                del command_args[index:index + 2]
         try:
-            exit_code = asyncio.run(run_exec(args, config_path, workspace))
-        except (ValueError, ConnectionError, OSError, RemoteControlError) as exc:
+            if args[0] in _DISTRIBUTION_COMMANDS:
+                configured = os.environ.get("AKASHIC_PLUGIN_DISTRIBUTION")
+                result = invoke_distribution_command(args[0], tuple(command_args),
+                    distribution=Path(configured) if configured else None,
+                    workspace=workspace, config_path=Path(config_path))
+            else:
+                result = invoke_plugin_command(args[0], tuple(command_args),
+                    workspace=workspace, config_path=Path(config_path))
+            sys.exit(asyncio.run(result))
+        except (LookupError, ValueError) as exc:
             print(str(exc), file=sys.stderr)
+            if isinstance(exc, LookupError) and args[0] in _MANAGEMENT_COMMANDS:
+                print("管理命令需要运行中的 Gateway。用 plugin-doctor 查看实际 ID，运行 "
+                      "plugin-enable gateway@<marketplace> 后重启实例。", file=sys.stderr)
             sys.exit(2)
-        sys.exit(exit_code)
-
-    if args and args[0] == "dashboard":
-        run_dashboard_api(
-            workspace=workspace,
-            host=dashboard_host,
-            port=dashboard_port,
-        )
-        sys.exit(0)
 
     if "--inspect-modules" in args:
         asyncio.run(inspect_modules(config_path, workspace))
@@ -990,6 +733,8 @@ if __name__ == "__main__":
         )
         sys.exit(asyncio.run(serve(config_path, workspace)))
     else:
+        from agent.supervisor import run_supervisor
+
         sys.exit(
             run_supervisor(
                 config_path=Path(config_path),

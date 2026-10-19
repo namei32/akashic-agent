@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from core.common.diagnostic_log import log_timing
 import logging
 import mimetypes
 import os
@@ -11,7 +12,7 @@ from contextlib import aclosing, asynccontextmanager, suppress
 from typing import Any, cast
 from uuid import uuid4
 
-from agent.plugin_composition.channels import (
+from plugins.channels.contract import (
     AttachmentKind as V3AttachmentKind,
     AttachmentReadLease,
     AttachmentRef,
@@ -43,7 +44,7 @@ from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 from .services import AttachmentStorePort as AttachmentStore
 from .services import ArtifactStorePort as ChannelAttachmentArtifactStore
-from agent.plugin_composition.message_view import MessageDisplayReader, follow_messages
+from plugins.ui.contract import MessageDisplayReader, follow_messages
 from .services import (
     MessageCatalogPort as MessageCatalog,
     MessageConflict,
@@ -212,13 +213,20 @@ class WebChatChannel:
         self._messages: MessageCatalog | None = None
         self._message_scope: Callable[[], Any] | None = None
         self._reply_status: Callable[[str], AsyncGenerator[dict[str, object], None]] | None = None
+        self._session_activity: Callable[[], AsyncGenerator[dict[str, object], None]] | None = None
         self._message_display: MessageDisplayReader | None = None
+        self._jobs: Callable[[str], AsyncGenerator[dict[str, object], None]] | None = None
+        self._stop_job: Callable[[str, str], Awaitable[bool]] | None = None
         self._followers: dict[WebSocket, tuple[str, asyncio.Task[None]]] = {}
         self._stopping = False
         self._presentation_subscription: StreamSubscription | None = None
         self._client_sessions: dict[str, str] = {}
         self._turn_sessions: dict[str, str] = {}
         self._turn_contents: dict[str, str] = {}
+
+    def bind_session_activity(self, follow: Callable[[], AsyncGenerator[dict[str, object], None]]) -> None:
+        """每条连接只拥有一个通道级摘要订阅，与当前会话的正文跟随独立。"""
+        self._session_activity = follow
 
     def bind_message_readers(
         self, messages: MessageCatalog,
@@ -235,6 +243,8 @@ class WebChatChannel:
         scope: Callable[[], Any],
         *,
         reply_status: Callable[[str], AsyncGenerator[dict[str, object], None]] | None = None,
+        jobs: Callable[[str], AsyncGenerator[dict[str, object], None]] | None = None,
+        stop_job: Callable[[str, str], Awaitable[bool]] | None = None,
     ) -> None:
         """Bind a request scope factory instead of retaining a host provider."""
 
@@ -249,6 +259,12 @@ class WebChatChannel:
             if self._reply_status is not None and self._reply_status is not reply_status:
                 raise RuntimeError("Web reply status reader 不允许替换")
             self._reply_status = reply_status
+        if jobs is not None:
+            if self._jobs is not None and self._jobs != jobs:
+                raise RuntimeError("Web jobs reader 不允许替换")
+            self._jobs = jobs
+        if stop_job is not None:
+            self._stop_job = stop_job
 
     @asynccontextmanager
     async def _open_message_catalog(self) -> AsyncIterator[MessageCatalog]:
@@ -489,37 +505,60 @@ class WebChatChannel:
             if socket.application_state == WebSocketState.CONNECTED:
                 await socket.close()
 
-    async def handle_websocket(self, websocket: WebSocket) -> None:
+    async def handle_websocket(self, websocket: WebSocket, *, watch_sessions: bool = False) -> None:
         socket_id = self._socket_id(websocket)
         logger.info("[web_chat] websocket opened id=%s", socket_id)
         await websocket.accept()
         try:
             async with asyncio.TaskGroup() as tasks:
+                metadata_task = tasks.create_task(self._follow_metadata(websocket)) if watch_sessions else None
+                activity = None if self._session_activity is None else tasks.create_task(
+                    self._send_session_activity(websocket))
                 try:
                     while True:
                         payload = await websocket.receive_json()
                         if not isinstance(payload, dict):
                             await self._send_error(websocket, "", "消息格式必须是 JSON object")
                             continue
+                        if payload.get("type") == "message.send":
+                            log_timing("web.input.received")
                         _ = await self._handle_client_frame(websocket, cast(dict[str, Any], payload), tasks)
                 except WebSocketDisconnect as error:
                     logger.info("[web_chat] websocket disconnect id=%s code=%s reason=%s",
                                 socket_id, error.code, error.reason)
                 finally:
+                    if metadata_task is not None:
+                        metadata_task.cancel()
                     await self._cancel_follow(websocket)
+                    if activity is not None:
+                        activity.cancel()
         finally:
             await self._remove_connection(websocket)
             logger.info("[web_chat] websocket closed id=%s", socket_id)
 
-    def save_upload(self, data: bytes, filename: str) -> dict[str, Any]:
-        if len(data) > MAX_UPLOAD_BYTES:
-            raise UploadTooLargeError("上传内容超过 50MB 限制")
-        suffix = Path(filename).suffix
-        if not suffix:
-            guessed = mimetypes.guess_extension(mimetypes.guess_type(filename)[0] or "")
-            suffix = guessed or ".bin"
-        path = self._require_attachment_store().write_bytes(data, prefix="web_", suffix=suffix)
-        return self._upload_result(filename, path)
+    async def _follow_metadata(self, websocket: WebSocket) -> None:
+        """连接拥有目录订阅；通知只要求重读，不复制标题或绑定当前会话。"""
+        async with self._open_message_catalog() as messages:
+            changes = messages.follow_metadata()
+        async with aclosing(changes):
+            async for _ in changes:
+                await websocket.send_json({"type": "sessions.changed", "version": 2})
+    async def _send_session_activity(self, websocket: WebSocket) -> None:
+        """只发送变化的摘要；连接断开后由连接 scope 取消并排空。"""
+        assert self._session_activity is not None
+        # 1. 侧栏状态只是辅助信息：订阅失败只让它停止更新，不能拖垮收发消息的连接。
+        try:
+            async with aclosing(self._session_activity()) as frames:
+                async for frame in frames:
+                    await websocket.send_json({"type": "sessions.activity", **frame})
+        except Exception:
+            logger.exception("[web_chat] 会话活动订阅失败，侧栏状态停止更新")
+            # 2. 尽力通知客户端清掉可能残留的运行中标记；连接已断开时发送失败可忽略。
+            with suppress(Exception):
+                await websocket.send_json({
+                    "type": "sessions.activity", "version": 1, "snapshot": False,
+                    "available": False, "active": [], "heads": {}, "removed": [],
+                })
 
     async def save_upload_stream(
         self,
@@ -675,50 +714,6 @@ class WebChatChannel:
 
     def has_media(self, path: Path) -> bool:
         return str(path.resolve()) in self._media_paths
-
-    async def send(self, chat_id: str, message: str) -> None:
-        session_key = self._session_key(chat_id)
-        await self._broadcast(session_key, {
-            "type": "message.final",
-            "session_id": session_key,
-            "turn_id": "",
-            "content": message,
-            "media": [],
-            "metadata": {"source": "message_push"},
-        })
-
-    async def send_stream(self, chat_id: str, message: str) -> None:
-        await self.send(chat_id, message)
-
-    async def send_file(
-        self,
-        chat_id: str,
-        file_path: str,
-        name: str | None = None,
-    ) -> None:
-        session_key = self._session_key(chat_id)
-        content = name or Path(file_path).name
-        self.remember_media([file_path])
-        await self._broadcast(session_key, {
-            "type": "message.final",
-            "session_id": session_key,
-            "turn_id": "",
-            "content": content,
-            "media": [file_path],
-            "metadata": {"source": "message_push", "kind": "file"},
-        })
-
-    async def send_image(self, chat_id: str, image: str) -> None:
-        session_key = self._session_key(chat_id)
-        self.remember_media([image])
-        await self._broadcast(session_key, {
-            "type": "message.final",
-            "session_id": session_key,
-            "turn_id": "",
-            "content": "",
-            "media": [image],
-            "metadata": {"source": "message_push", "kind": "image"},
-        })
 
     async def deliver_v3(
         self,
@@ -899,11 +894,25 @@ class WebChatChannel:
             return await self._follow_session(websocket, request_id, payload, tasks)
         if frame_type == "message.send":
             return await self._send_user_message(websocket, request_id, payload)
+        if frame_type == "job.stop":
+            await self._request_job_stop(websocket, request_id, payload)
+            return ""
         if frame_type == "ping":
             await websocket.send_json({"type": "pong", "request_id": request_id})
             return ""
         await self._send_error(websocket, request_id, f"未知消息类型: {frame_type}")
         return ""
+
+    # 用户停止后台任务：只回答是否受理，行状态经 session.jobs 帧收敛（停止中 → 已停止）。
+    async def _request_job_stop(self, websocket: WebSocket, request_id: str, payload: dict[str, Any]) -> None:
+        try:
+            session_id = self._normalize_session_id(payload.get("session_id"))
+        except ValueError:
+            session_id = ""
+        job_id = payload.get("job_id")
+        accepted = (self._stop_job is not None and bool(session_id) and isinstance(job_id, str) and bool(job_id)
+                    and await self._stop_job(session_id, job_id))
+        await websocket.send_json({"type": "job.stop.result", "request_id": request_id, "accepted": accepted})
 
     async def _follow_session(
         self, websocket: WebSocket, request_id: str, payload: dict[str, Any], tasks: asyncio.TaskGroup,
@@ -965,6 +974,9 @@ class WebChatChannel:
 
         async with asyncio.TaskGroup() as tasks:
             _ = tasks.create_task(send_messages())
+            # 后台任务镜像可选：jobs 插件缺席时不发帧，前端按空列表处理。
+            if self._jobs is not None:
+                _ = tasks.create_task(send("session.jobs", self._jobs(session_id)))
             if self._reply_status is None:
                 await websocket.send_json({"type": "reply.status", "version": 2,
                     "session_id": session_id, "snapshot_id": None, "available": False, "items": []})
@@ -1155,6 +1167,7 @@ class WebChatChannel:
         try:
             connection_added = await self._add_connection(session_key, websocket)
             await adapter.admit_captured(runtime, raw)
+            log_timing("web.input.admitted", session_id=session_key, request_id=client_message_id)
         except BaseException as error:
             if previous_session is None:
                 self._client_sessions.pop(client_message_id, None)
@@ -1175,6 +1188,8 @@ class WebChatChannel:
             raise
         finally:
             adapter._finish_inbound()
+        # 显式确认已入账：客户端以此区分"已送达"和"只进了本地发送缓冲"，重复 id 的重发也会得到确认。
+        await websocket.send_json({"type": "message.accepted", "request_id": client_message_id, "session_id": session_key})
         return session_key
 
     async def _add_connection(self, session_key: str, websocket: WebSocket) -> bool:

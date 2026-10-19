@@ -11,18 +11,20 @@ from typing import cast
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from agent.plugin_composition.bindings import Bindings
-from agent.plugin_composition.models import BoundEmbeddingModel
-from agent.plugin_composition.messages import MessageCatalog, MessageEmbeddings
-from agent.plugin_contracts import ContentPart, ContentReferences, Message, Output, ToolCall, ToolResult
-from agent.plugin_contracts import json_value
+from plugins.ledger.contract import Bindings
+from plugins.models.contract import BoundEmbeddingModel
+from plugins.ledger.contract import MessageCatalog, MessageEmbeddings
+from plugins.ledger.contract import ContentPart, ContentReferences, Message, Output, ToolCall, ToolResult
+from plugins.ledger.contract import json_value
 from ._boundaries import CallSource, Result, TOOLS
 
 from .application.consumer import run_memory_job
 from .application.snapshot import read_memory
 from .domain.model import MemoryConfig
 from .learning import AKASHA_LEARNING, Learning, LearningConfig
-from .recalls import ProgramSource, Recall, RecallRecords, ToolSource, query_memory, render_materials
+from .scopes import MemoryDisabled
+from .contract import ProgramSource, Recall, ToolSource
+from .recalls import RecallRecords, query_memory, render_materials
 
 
 class RecallArguments(BaseModel):
@@ -131,6 +133,10 @@ class RecallTool:
         origin = None if source is None else ToolSource(
             session_id=source.messages[0].session_id, call_ref=source.call_ref,
         )
+        try:
+            _ = self._memory(None if origin is None else origin.session_id)
+        except MemoryDisabled as error:
+            return str(error)
         binding, model_id = self._select_learning()
         return PreparedRecall(**request.model_dump(), source=origin,
                               learning_binding=binding,
@@ -148,11 +154,17 @@ class RecallTool:
         # 1. 打开工具实际固定的学习规则；读副本也校验图的 embedding 空间。
         async with self._bindings.open(request.learning_binding, AKASHA_LEARNING) as (learning, metadata):
             rule = LearningConfig.model_validate(dict(metadata))
+            async def restore_embeddings(original: LearningConfig, texts: list[str]) -> list[list[float]]:
+                async with self._open_embedding(request.embedding_binding) as model:
+                    if (model.descriptor.identity, model.descriptor.dimensions) != (original.embedding_model, original.dimension):
+                        raise ValueError("补算向量不属于原学习模型空间")
+                    return [list(vector) for vector in (await model.embed(texts)).vectors]
             # 调用所在 Session 决定读取哪张图；显式程序没有 Session 时读 default 图。
             async with read_memory(
                 self._memory(None if request.source is None else request.source.session_id), catalog=self._catalog,
                 embeddings=self._embeddings, bindings=self._bindings, config=self._config,
                 embedding_space=(rule.embedding_model, rule.dimension),
+                restore_embeddings=restore_embeddings,
             ) as (cycle, state):
                 async with self._open_embedding(request.embedding_binding) as model:
                     if model.descriptor.identity != rule.embedding_model:

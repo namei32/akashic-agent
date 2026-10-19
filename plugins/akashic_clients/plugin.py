@@ -1,20 +1,19 @@
 from __future__ import annotations
 
-from agent.plugin_composition import (
-    CHANNELS,
-    ChannelCapability,
-    ChannelDefinition,
-    Context,
-    InboundIdentity,
-)
+from collections.abc import Iterator
+from contextlib import contextmanager
 
-from .capabilities import CLIENT_CAPABILITIES, INSPECTION_RPC_KEYS
-from agent.plugin_composition.models import MODEL_CALL_STATS
+from agent.plugin_composition import Context
+from plugins.channels.contract import CHANNELS, ChannelCapability, ChannelDefinition, InboundIdentity
+
+from .capabilities import CLIENT_CAPABILITIES, INSPECTION_RPC_KEYS, JOB_NOTICES, REPLY_STATUS, MCP_DETAIL, MCP_SERVERS
+from plugins.models.contract import MODEL_CALL_STATS
 from .channel import build_akashic_channel_factory
-from agent.plugin_composition.channels import CHANNEL_INPUT_V2 as CHANNEL_INPUT
+from plugins.channels.contract import CHANNEL_INPUT_V2 as CHANNEL_INPUT
 from .config import AkashicClientsConfig
 from .navigation import NavigationPreferences
-from agent.plugin_composition.messages import OWNER_STATE
+from .read_marks import ReadMarks
+from plugins.ledger.contract import OWNER_STATE, OwnerStore
 
 api_version = 3
 name = "akashic_clients"
@@ -34,6 +33,12 @@ async def apply(ctx: Context) -> None:
     if not config.enabled:
         return
 
+    @contextmanager
+    def read_store() -> Iterator[OwnerStore]:
+        """每次读写短借 owner；通知流等待期间不占住插件换代。"""
+        with ctx.call_scope():
+            yield ctx.require(OWNER_STATE).open(ctx)
+
     await ctx.require(CHANNELS).register(
         ctx,
         ChannelDefinition(
@@ -47,11 +52,12 @@ async def apply(ctx: Context) -> None:
                 }
             ),
             factory=build_akashic_channel_factory(
-                config, ctx.runtime.workspace,
+                ctx, config, ctx.runtime.workspace,
                 NavigationPreferences(lambda: ctx.require(OWNER_STATE).open(ctx)),
+                ReadMarks(read_store),
             ),
             inbound_identity=InboundIdentity.PROVIDER_MESSAGE_ID,
-            optional_services=frozenset((*INSPECTION_RPC_KEYS, MODEL_CALL_STATS)),
+            optional_services=frozenset((*INSPECTION_RPC_KEYS, MODEL_CALL_STATS, REPLY_STATUS, MCP_DETAIL, MCP_SERVERS, JOB_NOTICES)),
         ),
     )
 

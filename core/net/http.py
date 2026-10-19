@@ -3,6 +3,10 @@ from __future__ import annotations
 import asyncio
 import random
 import logging
+import math
+import time
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -13,6 +17,25 @@ import httpx
 
 
 logger = logging.getLogger(__name__)
+
+
+def retry_after_time(value: str | None) -> float | None:
+    """在收到响应时把秒数或 HTTP 日期转换成固定的下一次允许时间。"""
+    if value is None:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            date = parsedate_to_datetime(value)
+        except (ValueError, TypeError, OverflowError):
+            return None
+        if date.tzinfo is None:
+            date = date.replace(tzinfo=timezone.utc)
+        return max(time.time(), date.timestamp())
+    if not math.isfinite(seconds) or seconds < 0:
+        return None
+    return time.time() + seconds
 
 
 class HttpClient:
@@ -73,7 +96,7 @@ async def finish_response(lines: AsyncIterator[str]) -> None:
         logger.debug("响应已完成，尾流未结束，关闭连接: %s", type(error).__name__)
 
 
-HttpProfile = Literal["external_default", "feed_fetcher", "local_service"]
+HttpProfile = Literal["external_default", "local_service"]
 
 
 @dataclass(frozen=True)
@@ -264,7 +287,6 @@ class HttpRequester:
 @dataclass
 class SharedHttpResources:
     external_default: HttpRequester = field(init=False)
-    feed_fetcher: HttpRequester = field(init=False)
     local_service: HttpRequester = field(init=False)
     _clients: list[httpx.AsyncClient] = field(
         init=False,
@@ -273,27 +295,22 @@ class SharedHttpResources:
     _closed: bool = field(init=False, default=False)
 
     def __post_init__(self) -> None:
+        # 两个客户端的 TLS 信任配置相同，共用一次 CA 加载。
+        ssl_context = httpx.create_ssl_context()
         external_client = httpx.AsyncClient(
-            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10)
-        )
-        feed_client = httpx.AsyncClient(
-            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5)
+            verify=ssl_context,
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
         )
         local_client = httpx.AsyncClient(
-            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5)
+            verify=ssl_context,
+            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
         )
-        self._clients = [external_client, feed_client, local_client]
+        self._clients = [external_client, local_client]
         self.external_default = HttpRequester(
             client=external_client,
             retry_policy=RetryPolicy(max_attempts=3),
             default_timeout_s=30.0,
             default_budget=RequestBudget(total_timeout_s=45.0),
-        )
-        self.feed_fetcher = HttpRequester(
-            client=feed_client,
-            retry_policy=RetryPolicy(max_attempts=3, base_delay_s=0.2, max_delay_s=0.8),
-            default_timeout_s=15.0,
-            default_budget=RequestBudget(total_timeout_s=20.0),
         )
         self.local_service = HttpRequester(
             client=local_client,

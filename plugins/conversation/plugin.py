@@ -1,12 +1,14 @@
 from collections.abc import Awaitable, Callable, Mapping
 from typing import cast
+from core.common.file_io import run_file_io
+from core.common.diagnostic_log import log_timing
 
 from agent.plugin_composition import Context
-from agent.plugin_composition.artifacts import ARTIFACT_READ
-from agent.plugin_composition.bindings import BINDINGS
-from agent.plugin_composition.channels import ChannelInboundMessage
-from agent.plugin_composition.commands import COMMANDS
-from agent.plugin_composition.messages import (
+from plugins.ledger.contract import ARTIFACT_READ
+from plugins.ledger.contract import BINDINGS
+from plugins.channels.contract import ChannelInboundMessage
+from plugins.commands.contract import COMMANDS
+from plugins.ledger.contract import (
     MESSAGE_CATALOG,
     MESSAGE_WRITERS,
     OWNER_STATE,
@@ -15,13 +17,14 @@ from agent.plugin_composition.messages import (
     MessageReader,
     SessionAttributes,
 )
-from agent.plugin_composition.models import MODEL_CATALOG, ChatModelSelection
+from plugins.models.contract import ChatModelSelection
+from plugins.models.contract import MODEL_CATALOG
 from agent.plugin_composition.tasks import (
     RESTART_GATE,
     TASKS,
     Task,
 )
-from agent.plugin_contracts import (
+from plugins.ledger.contract import (
     Body,
     ContentPart,
     ContentReferences,
@@ -30,17 +33,19 @@ from agent.plugin_contracts import (
     Message,
     Output,
 )
-from agent.plugin_contracts.models import (
+from plugins.models.contract import (
     MODEL_SELECTION as MODEL_SELECTION,
     ModelSelection as ModelSelection,
 )
-from agent.plugin_contracts.sources import (
+from plugins.conversation.contract import (
     CHECK_ORIGIN as CHECK_ORIGIN,
     CONVERSATION_COMPLETE_V2 as CONVERSATION_COMPLETE,
+    ConversationCompleteV2 as ConversationComplete,
+)
+from plugins.sources.contract import (
     SOURCE_CHANGED_V3 as SOURCE_CHANGED,
     SOURCE_SESSION_V4 as SOURCE_SESSION,
     SOURCES_V5 as SOURCES,
-    ConversationCompleteV2 as ConversationComplete,
     CompletionProgram,
     SessionFactoryV4 as SessionFactory,
     SourceChangedV3 as SourceChanged,
@@ -111,6 +116,7 @@ async def apply(ctx: Context) -> None:
         )
 
     async def accept(session_id: str, message_id: str, message: ChannelInboundMessage) -> Message:
+        log_timing("input.received", session_id=session_id, request_id=message_id)
         command = message.content.strip().split(maxsplit=1)
         if command and command[0].split("@", 1)[0].lower() == "/stop":
             return await open(session_id).pause(message_id)
@@ -119,10 +125,17 @@ async def apply(ctx: Context) -> None:
             if not isinstance(retry, str) or not retry:
                 raise ValueError("重试必须引用已有 Input")
             return await open(session_id).resume(message_id, retry)
-        # 1. 带宽键的首条输入先接纳 Session；之后同一 scope 重复声明是幂等核对。
+        # 1. 每条首次输入都接纳 Session；省略维度的续聊保留已有固定属性。
         dimensions = session_dimensions(message.metadata)
-        if dimensions:
-            _ = await ctx.require(SESSION_ADMISSION).ensure_async(ctx, session_id, SessionAttributes.scoped(dimensions))
+        catalog = ctx.require(MESSAGE_CATALOG)
+        reader = catalog.reader(session_id)
+
+        def initial_attributes() -> SessionAttributes:
+            with reader.read_snapshot():
+                return reader.attributes if catalog.exists(session_id) else SessionAttributes()
+
+        attributes = SessionAttributes.scoped(dimensions) if dimensions else await run_file_io(initial_attributes)
+        _ = await ctx.require(SESSION_ADMISSION).ensure_async(ctx, session_id, attributes)
         # 2. 来源只核验已发布附件，不接管传输 lease 或派生另一份元数据。
         if message.attachments:
             artifacts = ctx.require(ARTIFACT_READ)
@@ -149,7 +162,9 @@ async def apply(ctx: Context) -> None:
                 "model_id": model_id.strip() or None, "reasoning_effort": effort.strip() or None,
             }),)
         # 3. Input 与全部引用原子提交；传输时间、handoff 和重复 ID 不进入正文。
-        return await open(session_id).accept(message_id, Input(parts))
+        accepted = await open(session_id).accept(message_id, Input(parts))
+        log_timing("input.committed", session_id=session_id, request_id=message_id, counts={"seq": accepted.seq})
+        return accepted
 
     @ctx.entrypoint
     async def command(task: Task, reader: MessageReader, source: str) -> Message | None:

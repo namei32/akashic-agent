@@ -32,7 +32,7 @@ if [[ "${1:-}" == "publish" ]]; then
     shift
     exec /opt/venv/bin/python /opt/akashic/source/scripts/install_plugin_distribution.py \
         --distribution /opt/akashic/distribution \
-        --profile /opt/akashic/distribution/profiles/default.json \
+        --bundle /opt/akashic/distribution/bundles/"${AKASHIC_PLUGIN_BUNDLE:-base}".toml \
         --workspace "$WORKSPACE" --plugins-home "$PLUGIN_HOME" --config "$CONFIG" \
         --publish "$@"
 fi
@@ -41,14 +41,15 @@ mkdir -p "$WORKSPACE" "$PLUGIN_HOME"
 
 /opt/venv/bin/python /opt/akashic/source/scripts/install_plugin_distribution.py \
     --distribution /opt/akashic/distribution \
-    --profile /opt/akashic/distribution/profiles/default.json \
+    --bundle /opt/akashic/distribution/bundles/"${AKASHIC_PLUGIN_BUNDLE:-base}".toml \
     --workspace "$WORKSPACE" \
     --plugins-home "$PLUGIN_HOME" \
     --config "$CONFIG" \
-    --ensure-profile \
+    --ensure-bundle \
     --receipt "$WORKSPACE/runtime/distribution-install.json"
 
-command="${1:-supervise}"
+command="${1:-gateway}"
+export AKASHIC_DOCKER_RUNTIME=1
 shift || true
 exec /opt/venv/bin/python /opt/akashic/source/main.py \
     "$command" \

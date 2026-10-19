@@ -5,11 +5,12 @@ import json
 import httpx
 import pytest
 
-from agent.plugin_composition import (
+from plugins.models.contract import (
     BoundModelDescriptor,
     CapabilitySources,
     ModelCapabilities,
     ModelRequest,
+    estimate_tokens,
 )
 from core.net.http import HttpClient
 from plugins.codex.responses import CodexResponses
@@ -62,13 +63,14 @@ async def test_frozen_request_can_be_estimated_and_sent(lite):
             capability_digest="test-capabilities",
         ),
         config={"use_responses_lite": lite},
+        client_version="0.160.0",
     )
     try:
         assert driver.estimate_context_tokens(request.messages, request.tools) == max(
-            1, len(json.dumps([messages, tools], ensure_ascii=False)) // 4,
+            1, estimate_tokens(request.messages, request.tools, chars_per_token=4),
         )
         assert driver.estimate_appended_message_tokens(request.messages) == max(
-            1, len(json.dumps(messages, ensure_ascii=False)) // 4,
+            1, estimate_tokens(request.messages, chars_per_token=4),
         )
         assert (await driver.complete(request)).content == "ok"
         assert len(sent) == 1

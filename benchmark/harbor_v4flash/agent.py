@@ -89,10 +89,12 @@ def _build_gateway_command() -> str:
     """生成继承题目镜像 WORKDIR 的 gateway 启动命令。"""
 
     return (
-        f"mkdir -p {_WORKSPACE} && "
+        f"env PYTHONPATH={_SOURCE_ROOT} PYTHONDONTWRITEBYTECODE=1 "
+        f"{RUNTIME_VENV_PATH}/bin/python -m benchmark.harbor_v4flash.prepare {_WORKSPACE} && "
         f"{_build_prompt_restore_command()} >/dev/null && "
         f"env PATH={GIT_MOUNT_PATH}/bin:$PATH "
         f"PYTHONPATH={_SOURCE_ROOT}:{_SOURCE_ROOT}/sdk/python/src "
+        f"AKASHIC_EXTRA_PLUGIN_DIRS={_SOURCE_ROOT}/plugins "
         "PYTHONDONTWRITEBYTECODE=1 "
         f"{RUNTIME_VENV_PATH}/bin/python {_SOURCE_ROOT}/main.py gateway "
         f"--config {_SOURCE_ROOT}/benchmark/harbor_v4flash/config.toml "

@@ -18,15 +18,13 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-import grpc
-from agent.host_bridge.client import HostBridgeShellProcessManager
-from agent.host_bridge.monitor import HostBridgeStatus, _monitor
-from agent.plugin_composition.archive import PluginArchive
-from agent.plugin_composition.bindings import BINDINGS
-from agent.plugin_composition.channels import CHANNEL_INPUT_V2 as CHANNEL_INPUT, ChannelInboundMessage
+from plugins.host_execution.bridge.client import HostBridgeShellProcessManager
+from plugins.host_execution.monitor import HostBridgeStatus, _monitor
+from plugins.ledger.contract import BINDINGS
+from plugins.channels.contract import CHANNEL_INPUT_V2 as CHANNEL_INPUT, ChannelInboundMessage
 from agent.plugin_composition.config_input import save_config
-from agent.plugin_contracts.tools import ALL_TOOLS, TOOLS
-from session.message import Output
+from plugins.tools.contract import ALL_TOOLS, TOOLS
+from plugins.ledger.contract import Output
 from tests.test_default_reply import application
 
 
@@ -42,14 +40,14 @@ def add_skills(sources: Path, *, files: int, always: bool) -> None:
     for source_name, target in (("assets", "assets"), ("standard_tools", "skill_probe")):
         shutil.copytree(ROOT / "plugins" / source_name, sources / target,
                         ignore=shutil.ignore_patterns("__pycache__"))
-    (sources / "skill_probe/plugin.py").write_text('''from agent.plugin_composition.assets import INSTALLED_ASSETS
-from ._materials_boundary import MATERIALS
+    (sources / "skill_probe/plugin.py").write_text('''from plugins.assets.contract import INSTALLED_ASSETS
+from plugins.context.contract import MATERIALS_V4
 from ._tool_boundary import TOOLS
 from .skills import register_skills
 api_version = 3
 name = "skill_probe"
 version = "1.0.0"
-inject = (TOOLS, MATERIALS, INSTALLED_ASSETS)
+inject = (TOOLS, MATERIALS_V4, INSTALLED_ASSETS)
 async def apply(ctx):
     await ctx.require(TOOLS).declare_group(ctx, always_on=True)
     await register_skills(ctx)
@@ -58,7 +56,7 @@ async def apply(ctx):
     bundle = sources / "skill_bundle"
     skill = bundle / "skills/local"
     skill.mkdir(parents=True)
-    (bundle / "plugin.py").write_text('''from agent.plugin_composition.assets import INSTALLED_ASSETS
+    (bundle / "plugin.py").write_text('''from plugins.assets.contract import INSTALLED_ASSETS
 api_version = 3
 name = "skill_bundle"
 version = "1.0.0"
@@ -84,7 +82,7 @@ async def check_lifecycle(base: Path, log, host) -> list[str]:
     tools = root.context.require(TOOLS)
     bindings = root.context.require(BINDINGS)
     ref = next(item for item in root.context.require(ALL_TOOLS)().refs if item.name == "load_skill")
-    # 1. 并发捕获保存同一内容身份，恢复工具可读取原正文。
+    # 1. 并发绑定保持同一注册身份，工具读取当前正文。
     identities = await asyncio.gather(*(tools.bind(ref, bindings) for _ in range(3)))
     assert len(set(identities)) == 1
     metadata = bindings.describe(identities[0], TOOLS)
@@ -97,44 +95,48 @@ async def check_lifecycle(base: Path, log, host) -> list[str]:
     started = asyncio.Event()
     release = threading.Event()
     loop = asyncio.get_running_loop()
-    save = PluginArchive.save
+    # fixture 是独立加载的插件模块，必须协调实际运行的 parser。
+    module = host._active_generations["skill_probe"].module_path
+    parser_type = sys.modules[f"{module}.skill_catalog"].SkillCatalogParser
+    parse = parser_type.parse
 
-    def held_save(archive, source, **kwargs):
+    def held_parse(parser, assets, *, workspace_dir):
         loop.call_soon_threadsafe(started.set)
         if not release.wait(30):
             raise TimeoutError("实验文件线程未被释放")
-        return save(archive, source, **kwargs)
+        return parse(parser, assets, workspace_dir=workspace_dir)
 
     before = log.read_bindings()
-    with patch.object(PluginArchive, "save", held_save), patch.object(bindings, "bind", wraps=bindings.bind) as commit:
-        capture = asyncio.create_task(tools.bind(ref, bindings))
-        disposal = None
-        try:
-            await asyncio.wait_for(started.wait(), 5)
-            capture.cancel()
-            await asyncio.sleep(0)
-            assert not capture.done()
-            owner = host._active_generations["skill_bundle"].fiber
-            disposal = asyncio.create_task(owner.dispose())
-            await asyncio.wait_for(owner._admission_closed.wait(), 5)
-            assert not disposal.done() and not capture.done()
-            release.set()
+    with patch.object(parser_type, "parse", held_parse):
+        async with tools.open(metadata) as tool:
+            capture = asyncio.create_task(tool.invoke("cancel-local-read", arguments))
+            disposal = None
             try:
-                await capture
-            except asyncio.CancelledError:
-                pass
-            else:
-                raise AssertionError("取消后仍提交了工具绑定")
-            await asyncio.wait_for(disposal, 30)
-            assert log.read_bindings() == before and commit.call_count == 0
-        finally:
-            release.set()
-            if not capture.done():
+                await asyncio.wait_for(started.wait(), 5)
                 capture.cancel()
-            await asyncio.gather(capture, return_exceptions=True)
-            if disposal is not None:
-                await disposal
-    results.append("cancel_drains_files_before_asset_disposal_without_binding_commit")
+                await asyncio.sleep(0)
+                assert not capture.done()
+                owner = host._active_generations["skill_bundle"].fiber
+                disposal = asyncio.create_task(owner.dispose())
+                await asyncio.wait_for(owner._admission_closed.wait(), 5)
+                assert not disposal.done() and not capture.done()
+                release.set()
+                try:
+                    await capture
+                except asyncio.CancelledError:
+                    pass
+                else:
+                    raise AssertionError("取消后仍提交了工具绑定")
+                await asyncio.wait_for(disposal, 30)
+                assert log.read_bindings() == before
+            finally:
+                release.set()
+                if not capture.done():
+                    capture.cancel()
+                await asyncio.gather(capture, return_exceptions=True)
+                if disposal is not None:
+                    await disposal
+    results.append("cancel_drains_live_skill_reads_before_asset_disposal")
     return results
 
 
@@ -148,7 +150,7 @@ async def run(base: Path, *, files: int, always: bool, max_lag: float) -> None:
     digest = "b" * 64
     bridge_log = (base / "bridge.log").open("w")
     bridge = await asyncio.create_subprocess_exec(
-        sys.executable, "-m", "agent.host_bridge.server", "--socket", str(socket),
+        sys.executable, "-m", "plugins.host_execution.bridge.server", "--socket", str(socket),
         "--token-file", str(token), "--lease-timeout", "60", "--artifact-root", str(base / "bridge-artifacts"),
         "--release-commit", commit, "--toolchain-digest", digest,
         "--runtime-checkout", str(ROOT), "--bridge-python", sys.executable,
@@ -166,8 +168,11 @@ async def run(base: Path, *, files: int, always: bool, max_lag: float) -> None:
               "changed_source_sha256": source_hashes, "cases": [], "passed": False}
     try:
         # 1. 只向本次创建的 UDS 声明 boot；不读取正式 token 或服务配置。
-        async with grpc.aio.insecure_channel(f"unix:{socket}") as channel:
-            await asyncio.wait_for(channel.channel_ready(), 15)
+        async with asyncio.timeout(15):
+            while not socket.exists():
+                if bridge.returncode is not None:
+                    raise RuntimeError((base / "bridge.log").read_text())
+                await asyncio.sleep(0.01)
         await client.claim_boot()
         environment = dict(AKASHIC_EXECUTION_MODE="host-bridge", AKASHIC_HOST_BRIDGE_SOCKET=str(socket),
                            AKASHIC_HOST_BRIDGE_TOKEN="local-only", AKASHIC_BOOT_ID="local-boot",
@@ -175,9 +180,11 @@ async def run(base: Path, *, files: int, always: bool, max_lag: float) -> None:
         with patch.dict(os.environ, environment):
             async with application(base / "app", replying=True,
                                    extra_sources=lambda path: add_skills(path, files=files, always=always)) as (log, host):
-                assert all(item["fiber_state"] == "active" for item in host.plugin_status()["plugins"])
+                plugins = host.plugin_status()["plugins"]
+                assert isinstance(plugins, list)
+                assert all(item["fiber_state"] == "active" for item in plugins)
                 status = HostBridgeStatus(state="checking")
-                tasks.append(asyncio.create_task(_monitor(socket, "local-boot", "local-only", commit, digest, status=status)))
+                tasks.append(asyncio.create_task(_monitor(HostBridgeShellProcessManager(socket, "local-boot", "local-only", commit, digest), status=status)))
                 lags = []
                 states = []
 

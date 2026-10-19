@@ -6,16 +6,20 @@ import asyncio
 from collections.abc import Mapping
 
 from agent.plugin_composition import Context
-from agent.plugin_composition.messages import MESSAGE_WRITERS, MessageReader
-from agent.plugin_composition.models import ModelError
+from plugins.ledger.contract import MESSAGE_WRITERS, MessageReader
+from plugins.models.contract import ModelError
 from agent.plugin_composition.tasks import Task
-from agent.plugin_contracts import Control, Message
-from agent.plugin_contracts.models import (
+from plugins.ledger.contract import Control, Message
+from plugins.models.contract import (
     MODEL_CONTENT as MODEL_CONTENT,
     ModelContent as ModelContent,
 )
-from agent.plugin_contracts.sources import SOURCE_CHECK_V2 as SOURCE_CHECK
-from agent.plugin_contracts.reply import REPLY_EXECUTE_V4 as REPLY_EXECUTE
+from plugins.sources.contract import (
+    SOURCE_CHECK_V2 as SOURCE_CHECK,
+)
+from plugins.reply_program.contract import (
+    REPLY_EXECUTE_V4 as REPLY_EXECUTE,
+)
 
 from .messages import HINTS, render
 from .request import STAGE_TOOLS, Request, WakeFailure, read_phase
@@ -69,8 +73,11 @@ async def run(ctx: Context, task: Task, reader: MessageReader, request: Request)
             ),
             prompt_hints=(HINTS[phase.stage],),
         )
-    except ModelError as error:
-        reason = WakeFailure(message=str(error), retryable=error.retryable).model_dump_json()
+    except (RuntimeError, TimeoutError) as error:
+        failure = ModelError.read(error)
+        if failure is None:
+            raise
+        reason = WakeFailure(message=str(error), retryable=failure.retryable).model_dump_json()
     # 此处只结算本层已知的失败；未知工具效果和存储错误保持原事实并向上传播。
     writer = ctx.require(MESSAGE_WRITERS).bind(ctx, author="wake", source="wake", body_types=(Control,), content={})(reader.session_id)
     task.on_close(writer.expire)

@@ -1,33 +1,36 @@
-"""长结果看过后收起；原始 Message 是唯一正文，回读只保存原文范围。"""
+"""工具原文持续展示；回读只保存原文范围。"""
 from __future__ import annotations
 
-import json
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
-from functools import partial
 from typing import cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from agent.plugin_composition import Context
-from agent.plugin_contracts import ContentPart, ContentReferences, Message, ToolResult, json_value
-from agent.plugin_contracts.content import CONTENT
-from agent.plugin_contracts.models import CONTENT_VIEWS, ContentTransform, RenderedContent
-from agent.plugin_contracts.tools import TOOLS, CallSource, ProviderBoundTool, Result
+from plugins.ledger.contract import ContentPart, ContentReferences, Message, ToolResult, json_value
+from plugins.content.contract import CONTENT
+from plugins.models.contract import CONTENT_VIEWS, ContentTransform, RenderedContent
+from plugins.tools.contract import TOOLS, CallSource, ProviderBoundTool, Result
+from plugins.ui.contract import ToolResultDisplayProvider
+from agent.plugin_composition import ServiceKey
 
 api_version = 3
 name = "content_view"
 version = "1.0.0"
-desc = "完整展示长工具结果后收起，并按原消息位置回读全文或指定范围"
+desc = "按原消息位置回读工具结果全文或指定范围"
 inject = (CONTENT, CONTENT_VIEWS, TOOLS)
 
 READ_KIND = "content_view.read"
 READ_TOOL = "read_content"
+READ_DISPLAY = ServiceKey[ToolResultDisplayProvider]("message.result_display:content_view.read")
 
 
 class Config(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    fold_after_chars: int = Field(default=8192, ge=1024, strict=True)
+    # 已有安装可能保存此键；只兼容读取，不再控制任何投影行为。
+    fold_after_chars: int = Field(default=8192, ge=1024, strict=True, deprecated=True,
+                                  description="已停用；工具结果始终完整展示")
 
 
 class ReadInput(BaseModel):
@@ -71,6 +74,15 @@ def read_text(messages: Mapping[str, Message], ref: ReadReference) -> str:
     if not 0 <= ref.start <= ref.end <= len(text):
         raise ValueError("回读范围超出原文；未返回部分结果")
     return text[ref.start:ref.end]
+
+
+async def display_read(part: ContentPart, read_message: Callable[[str], Awaitable[Message | None]]) -> object:
+    """只读原文范围；缺失引用明确展示原因，不重跑工具或改写历史。"""
+    ref = ReadReference.model_validate(json_value(part.value))
+    target = await read_message(ref.message_id)
+    if target is None:
+        return {"error": "引用的原始内容不可用", "reference": ref.model_dump()}
+    return read_text({target.message_id: target}, ref)
 
 
 class ReadContent:
@@ -120,8 +132,8 @@ class ReadContent:
 
 
 def prepare_view(messages: tuple[Message, ...], source: str, tools: frozenset[str],
-                 seen: frozenset[tuple[str, int]], *, fold_after_chars: int) -> ContentTransform:
-    """只收起已有完整展示回执的长结果；回读本身也遵守同一规则。"""
+                 seen: frozenset[tuple[str, int]]) -> ContentTransform:
+    """只展开回读引用；工具文本始终由基础投影完整展示。"""
     by_id = {message.message_id: message for message in messages}
 
     def render(message: Message, index: int) -> RenderedContent | None:
@@ -131,20 +143,6 @@ def prepare_view(messages: tuple[Message, ...], source: str, tools: frozenset[st
         if part.kind == READ_KIND:
             ref = ReadReference.model_validate(json_value(part.value))
             text = read_text(by_id, ref)
-        elif part.kind == "text":
-            text = cast(str, part.value)
-            ref = ReadReference(message_id=message.message_id, part_index=index, start=0, end=len(text))
-        else:
-            return None
-        if READ_TOOL in tools and (message.message_id, index) in seen and len(text) > fold_after_chars:
-            label = json.dumps({
-                "status": "本段内容已完整展示，原文保留；需要时调用 read_content",
-                "read_content": ref.model_dump(),
-                "characters": len(text),
-                "preview": text[:160],
-            }, ensure_ascii=False, separators=(",", ":"))
-            return RenderedContent(({"type": "text", "text": label},))
-        if part.kind == READ_KIND:
             return RenderedContent(({"type": "text", "text": text},), complete=True)
         return None
 
@@ -153,7 +151,8 @@ def prepare_view(messages: tuple[Message, ...], source: str, tools: frozenset[st
 
 async def apply(ctx: Context) -> None:
     """通过普通内容声明、投影注册和工具目录接入；不申请任何写入或存储权限。"""
-    config = Config.model_validate(ctx.config)
+    Config.model_validate(ctx.config)
+    await ctx.provide(READ_DISPLAY, display_read)
     await ctx.require(CONTENT).register(ctx, {"name": "read_content", "content": {READ_KIND: check_read}})
     catalog = ctx.require(TOOLS)
     await catalog.declare_group(ctx, always_on=True, description=desc)
@@ -164,11 +163,13 @@ async def apply(ctx: Context) -> None:
 
     await catalog.register(
         ctx, name=READ_TOOL,
-        description=("回读当前会话的工具结果。message_id/part_index 来自折叠引用；"
+        description=("回读当前会话的工具结果。message_id/part_index 指向已有工具结果；"
                      "省略 start/end 读取全文，或指定字符区间 [start,end)。"
                      "超出范围明确拒绝，不静默截断。不要重新执行原工具来找回结果。"),
         parameters=ReadInput.model_json_schema(), open=open_tool, idempotent=True, parallel=True,
     )
     await ctx.require(CONTENT_VIEWS).register(
-        ctx, name="tool_results", prepare=partial(prepare_view, fold_after_chars=config.fold_after_chars),
+        ctx, name="tool_results", prepare=prepare_view,
+        # 只展开 READ_KIND 回读块；其他消息恒返回 None，投影可缓存其分段。
+        dynamic_kinds=frozenset({READ_KIND}),
     )

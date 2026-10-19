@@ -1,12 +1,11 @@
 @import "../../theme/src/material-tokens.css";
 @import "../../theme/src/brand-tokens.css";
 @import "../../theme/src/paper-surface.css";
-@import "../../theme/src/product-band.css";
 
 :root {
   font-family: var(--ak-type-reading);
   font-synthesis: none;
-  letter-spacing: 0.02em; /* Open the compact WenKai body texture slightly. */
+  letter-spacing: normal;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   --radius: 0.75rem;

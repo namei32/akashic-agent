@@ -7,8 +7,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from agent.plugin_composition.messages import OwnerStore, OwnerTransaction
-from agent.plugin_contracts.message import ContentPart, Control
+from plugins.ledger.contract import OwnerStore, OwnerTransaction
+from plugins.ledger.contract import ContentPart, Control
 from .services import MessageCatalogPort, PluginUiProvider
 
 _KEY = "navigation:pins"
@@ -81,13 +81,14 @@ def session_pin_row(catalog: MessageCatalogPort, session_id: str) -> dict[str, o
     except KeyError:
         return None
     attributes = reader.attributes
-    if attributes.visibility != "listed" or any(name == "project" for name, _ in attributes.scope):
+    if reader.deleted or attributes.visibility != "listed" or any(name == "project" for name, _ in attributes.scope):
         return None
     first = first_page.messages[0] if first_page.messages else None
     text = "" if first is None or isinstance(first.body, Control) else "\n".join(
         str(part.value) for part in first.body.parts if isinstance(part, ContentPart) and part.kind == "text"
     )
-    return {"key": session_id, "first_message_content": text, "scope": dict(attributes.scope)}
+    return {"key": session_id, "first_message_content": text, "scope": dict(attributes.scope),
+            "title": reader.title}
 
 
 async def check_project_pin(provider: PluginUiProvider, project_id: str) -> None:

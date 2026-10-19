@@ -5,6 +5,7 @@ import argparse
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from typing import cast
 import hashlib
 import json
 import os
@@ -26,13 +27,13 @@ if args.output.exists():
 sys.path.insert(0, str(args.source))
 
 import httpx
-from agent.plugin_contracts.message import ContentPart, ContentReferences, Input
+from plugins.ledger.contract import ContentPart, ContentReferences, Input
 from plugins.akashic_clients.chat_api import create_chat_app
 from plugins.akashic_clients.navigation import NavigationPreferences, PinReference
 from plugins.akashic_clients.web_chat import WebChatChannel
-from agent.plugin_composition.ui_slots import PluginUiStaleRevision, PluginUiRpcExecutionError
+from plugins.ui.contract import PluginUiStaleRevision, PluginUiRpcExecutionError
 from plugins.projects.plugin import Projects
-from session.log import MessageLog, SessionAttributes
+from plugins.ledger.log import MessageLog, SessionAttributes
 
 checks: list[str] = []
 def check(condition: bool, description: str) -> None:
@@ -181,32 +182,38 @@ async def run(root: Path):
 
 
 async def composition(root_path: Path):
-    from agent.plugin_composition import CompositionRoot, PluginRuntime, CHANNELS, UI_SLOTS
-    from agent.plugin_composition.channels import ChannelFactoryContext
-    from agent.plugin_composition.messages import MESSAGE_CATALOG, OWNER_STATE, SESSION_ADMISSION, OwnerState, SessionAdmission
-    from agent.plugin_contracts.ui import PLUGIN_UI
-    from agent.plugins.plugin_ui import LivePluginUiProvider
+    from agent.plugin_composition import CompositionRoot, PluginRuntime
+    from plugins.channels.contract import CHANNELS
+    from plugins.ui.contract import UI_SLOTS
+    from plugins.channels.contract import ChannelFactoryContext
+    from plugins.ledger.services import OwnerState, SessionAdmission
+    from plugins.ledger.contract import MESSAGE_CATALOG, OWNER_STATE, SESSION_ADMISSION
+    from plugins.ui.contract import PLUGIN_UI
+    from plugins.ui.queries import LivePluginUiProvider
     from plugins.akashic_clients import plugin
     from plugins.projects import plugin as project_plugin
     from plugins.ui.plugin_ui import PluginUiSlots
 
     root = CompositionRoot("navigation-scenario")
     log = MessageLog(root_path / "composition.db")
-    provider = LivePluginUiProvider(root)
     declarations = []
     class Registrar:
         async def register(self, ctx, definition):
             declarations.append(definition)
     async def services(ctx):
         values = {CHANNELS: Registrar(), OWNER_STATE: OwnerState(log), MESSAGE_CATALOG: log.catalog(),
-                  PLUGIN_UI: provider, SESSION_ADMISSION: SessionAdmission(log)}
+                  SESSION_ADMISSION: SessionAdmission(log)}
         for key in plugin.inject:
-            await ctx.provide(key, values.get(key, object()))
+            if key != PLUGIN_UI:
+                await ctx.provide(key, values.get(key, object()))
         await ctx.provide(SESSION_ADMISSION, values[SESSION_ADMISSION])
     async def ui(ctx):
-        await ctx.provide(UI_SLOTS, PluginUiSlots(ctx))
-    await root.mount(services, name="storage")
+        slots = PluginUiSlots(ctx)
+        await ctx.provide(UI_SLOTS, slots)
+        await ctx.provide(PLUGIN_UI, LivePluginUiProvider(ctx, slots))
     await root.mount(ui, name="ui")
+    provider = cast(LivePluginUiProvider, root.context.require(PLUGIN_UI))
+    await root.mount(services, name="storage")
     await root.mount(project_plugin.apply, name="projects", inject=project_plugin.inject,
                      runtime=PluginRuntime("projects", "scenario", args.source / "plugins/projects", root_path, root_path, {}))
     contexts = []

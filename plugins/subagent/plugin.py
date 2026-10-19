@@ -14,8 +14,8 @@ from agent.plugin_composition import (
     RUNTIME_STOPPING,
     Context,
 )
-from agent.plugin_composition.bindings import BINDINGS
-from agent.plugin_composition.messages import (
+from plugins.ledger.contract import BINDINGS
+from plugins.ledger.contract import (
     MESSAGE_CATALOG,
     MESSAGE_WRITERS,
     OWNER_STATE,
@@ -23,9 +23,13 @@ from agent.plugin_composition.messages import (
     MessageReader,
 )
 from agent.plugin_composition.tasks import TASKS, Task
-from agent.plugin_contracts import Message
-from agent.plugin_contracts.sources import SOURCE_CHECK_V2 as SOURCE_CHECK
-from agent.plugin_contracts.reply import REPLY_EXECUTE_V4 as REPLY_EXECUTE
+from plugins.ledger.contract import Message
+from plugins.sources.contract import (
+    SOURCE_CHECK_V2 as SOURCE_CHECK,
+)
+from plugins.reply_program.contract import (
+    REPLY_EXECUTE_V4 as REPLY_EXECUTE,
+)
 
 from .inputs import (
     ALL_TOOLS,
@@ -74,7 +78,7 @@ workspace_files = ("memory/SELF.md", "memory/spawn_trace.jsonl")
 class Config(BaseModel):
     model_config = ConfigDict(extra="forbid")
     max_steps: int = Field(default=40, gt=0)
-    max_output_tokens: int = Field(default=4096, gt=0)
+    max_output_tokens: int | None = Field(default=None, gt=0)
 
 
 async def apply(ctx: Context) -> None:

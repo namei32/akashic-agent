@@ -28,7 +28,7 @@ from agent.plugin_composition.model import (
     resolve_declared_workspace_file,
     resolve_declared_workspace_root,
 )
-from agent.plugin_composition.ui import UI, DashboardBinding, DashboardRoute
+from plugins.ui.contract import UI, DashboardBinding, DashboardRoute
 
 
 class DashboardImportError(RuntimeError):
@@ -118,7 +118,7 @@ class DashboardResources:
             # 旧 generation 的 Fiber 已退役：scope 校验不能先经 ctx.require
             # 取服务（INACTIVE_SERVICE 会吞掉 runtime scope 拒绝）。直接以
             # 注册时的实际 Ui 实例证明 owner 归属。
-            ctx.require_runtime_owner(UI, self._registry)
+            ctx.require_runtime_identity(UI, self._registry)
             return ctx.require(key)
 
         dashboard_context = DashboardContext(
@@ -240,7 +240,7 @@ def _plugin_routes(routes: Sequence[object]) -> tuple[DashboardRoute, ...]:
     return typed
 
 
-def _core_routes(routes: tuple[object, ...]) -> tuple[DashboardRoute, ...]:
+def _server_routes(routes: tuple[object, ...]) -> tuple[DashboardRoute, ...]:
     return tuple(
         route for route in routes if isinstance(route, (APIRoute, WebSocketRoute))
     )

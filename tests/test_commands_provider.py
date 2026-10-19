@@ -3,12 +3,10 @@ import ast
 from pathlib import Path
 import shutil
 import pytest
-from agent.plugin_composition.archive import PluginArchive
-from agent.plugin_composition.bindings import BINDINGS
-from agent.plugin_composition.commands import COMMANDS, CommandResult
+from plugins.ledger.contract import BINDINGS
+from plugins.commands.contract import COMMANDS, CommandResult
 from agent.plugins.manager import PluginManager
-from bus.event_bus import EventBus
-from session.log import MessageLog
+from plugins.ledger.log import MessageLog
 from tests.fixtures.plugin_workspace import initialize_plugin_workspace
 
 def _write_source(path, source):
@@ -20,7 +18,7 @@ def _write_source(path, source):
 @pytest.mark.asyncio
 async def test_core_only_manager_does_not_supply_commands(tmp_path):
     initialize_plugin_workspace(tmp_path / "workspace")
-    host = PluginManager([], event_bus=EventBus(), workspace=tmp_path / "workspace",
+    host = PluginManager([], workspace=tmp_path / "workspace",
                          installed_cache_root=tmp_path / "home")
     try:
         await host.load_all()
@@ -54,7 +52,7 @@ async def apply(ctx):
     owner.mkdir()
     _write_source(owner / "plugin.py", '''
 from agent.plugin_composition import ServiceKey
-from agent.plugin_composition.commands import COMMANDS, CommandDefinition, CommandResult
+from plugins.commands.contract import COMMANDS, CommandDefinition, CommandResult
 api_version = 3
 name = "command_owner"
 version = "1.0.0"
@@ -65,11 +63,13 @@ async def apply(ctx):
     await ctx.require(COMMANDS).register(ctx, CommandDefinition(
         "probe", "show dependency", lambda call: CommandResult("success", value), read_only=True))
 ''')
-    log = MessageLog(tmp_path / "sessions.db")
+    shutil.copytree(Path(__file__).parents[1] / "plugins/ledger", source / "ledger",
+                    ignore=shutil.ignore_patterns("__pycache__"))
     workspace = tmp_path / "workspace"
     initialize_plugin_workspace(workspace)
-    host = PluginManager([source], event_bus=EventBus(), workspace=workspace,
-                         installed_cache_root=tmp_path / "home", message_log=log)
+    log = MessageLog(workspace / "sessions.db")
+    host = PluginManager([source], workspace=workspace,
+                         installed_cache_root=tmp_path / "home")
     try:
         await host.load_all()
         root = host.live_root
@@ -81,19 +81,14 @@ async def apply(ctx):
             registry = commands_context.require(COMMANDS).freeze()
             identity = registry.bind(bindings, "/probe")
         assert identity is not None
-        archive = PluginArchive(workspace / "runtime/plugin-archives", create=False)
-        root_ref = log.read_binding(identity)["root_ref"]
-        assert isinstance(root_ref, str)
-        descriptor = archive.read_descriptor(root_ref)
-        archive_refs = []
+        descriptor = log.read_binding(identity)
+        expected = {}
         for name in ("human_actions", "command_owner", "dependency"):
             generation = host.generation(name)
             assert generation is not None
-            archive_refs.append(generation.archive_ref)
-        components = descriptor["components"]
-        assert isinstance(components, tuple)
-        assert set(components) == set(archive_refs)
-        async with bindings.open(identity, COMMANDS) as (selected, metadata):
+            expected[name] = generation.generation_id
+        assert descriptor["origins"] == expected
+        async with commands_context.runtime_scope(), bindings.open(identity, COMMANDS) as (selected, metadata):
             assert selected is root.context.require(COMMANDS)
             assert metadata == {"name": "probe"}
             result = await selected.freeze().execute(

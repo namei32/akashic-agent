@@ -9,22 +9,25 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from agent.plugin_composition import (
-    CHAT_MODELS,
-    EMBEDDINGS,
-    MODEL_DRIVERS,
+from agent.plugin_composition import CompositionRoot
+from plugins.models.contract import (
+    EmbeddingResult,
+    LLMResponse,
+    ModelRequest,
+)
+from plugins.models.contract import (
     BoundModelDescriptor,
     CapabilitySources,
-    CompositionRoot,
     DriverConnection,
     DriverConnectionDescriptor,
-    EmbeddingResult,
     EmbeddingSpaceDescriptor,
-    LLMResponse,
     ModelCapabilities,
+)
+from plugins.models.contract import EMBEDDINGS
+from plugins.models.contract import (
+    CHAT_MODELS,
+    MODEL_DRIVERS,
     ModelDriverDefinition,
-    ModelKind,
-    ModelRequest,
 )
 from plugins.models.settings import (
     AddConnection,
@@ -273,7 +276,7 @@ async def _save_models(state: ModelsState) -> None:
         expected_revision=0,
         model_id=_CHAT_MODEL_ID,
         connection_id=_CONNECTION_ID,
-        kind=ModelKind.CHAT,
+        kind='chat',
         model="fixture-chat",
         capabilities=ModelCapabilities(
             context_window=8_192,
@@ -301,7 +304,7 @@ async def _save_models(state: ModelsState) -> None:
             expected_revision=receipt.revision,
             model_id=_EMBEDDING_MODEL_ID,
             connection_id=_CONNECTION_ID,
-            kind=ModelKind.EMBEDDING,
+            kind='embedding',
             model="fixture-embedding",
             capabilities=_embedding_capabilities(),
             capability_sources=_embedding_sources(),
@@ -333,10 +336,10 @@ def _embedding_sources() -> CapabilitySources:
 def _embedding_discovery():
     """Return a probe result accepted by the real embedding settings boundary."""
 
-    from agent.plugin_composition import DiscoveredModel
+    from plugins.models.contract import DiscoveredModel
 
     return DiscoveredModel(
-        kind=ModelKind.EMBEDDING,
+        kind='embedding',
         model="fixture-embedding",
         capabilities=_embedding_capabilities(),
         capability_sources=_embedding_sources(),

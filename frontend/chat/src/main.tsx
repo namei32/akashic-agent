@@ -3,6 +3,8 @@ import { createRoot } from "react-dom/client";
 import { initializeTheme, setTheme, startCrossPortThemeSync } from "../../theme/src/theme-runtime";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { DesktopChatApp } from "./desktop-chat-app";
+import { setShellRailActions } from "./shell-rail-actions";
+import { receiveWorkbenchQuote, setHostShortcuts, setWorkbenchIntents, settleWorkbenchIntent } from "./shell-workbench";
 import { WebUiErrorBoundary } from "./webui-error-boundary";
 
 export type { AgentBlock, ChatMessage, MessageAttachment, ThinkingBlock, ToolBlock } from "./chat-message";
@@ -20,6 +22,28 @@ if (embeddedShell) {
   window.addEventListener("message", (event: MessageEvent<unknown>) => {
     if (!parentOrigins.has(event.origin) || typeof event.data !== "object" || event.data === null) return;
     const message = event.data as Record<string, unknown>;
+    if (message.type === "akashic.rail-actions") {
+      setShellRailActions(message.actions);
+      return;
+    }
+    // 工具区的意图回执与引用只认直接父窗口。
+    if (event.source === window.parent && message.type === "akashic.workbench-intents") {
+      setWorkbenchIntents(message.names);
+      return;
+    }
+    if (event.source === window.parent && message.type === "akashic.workbench-intent-result") {
+      settleWorkbenchIntent(message);
+      return;
+    }
+    if (event.source === window.parent && message.type === "akashic.composer-quote") {
+      receiveWorkbenchQuote(message);
+      return;
+    }
+    if (message.type === "akashic.chat-tools") {
+      document.documentElement.dataset.shellTools = message.present === true ? "true" : "false";
+      setHostShortcuts(message.shortcuts);
+      return;
+    }
     if (message.type !== "akashic.theme" || typeof message.themeId !== "string") return;
     setTheme(message.themeId, false);
   });
