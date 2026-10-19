@@ -186,7 +186,9 @@ class CodexResponses:
             )
         if self._summary != "none" and not request.disable_reasoning:
             reasoning["summary"] = self._summary
-        if self._lite and not request.disable_reasoning:
+        # Lite requires this transport field even when setup probes suppress
+        # the optional reasoning effort and summary parameters.
+        if self._lite:
             reasoning["context"] = "all_turns"
         if reasoning:
             payload["reasoning"] = reasoning
@@ -228,6 +230,7 @@ async def _consume_stream(
 ) -> LLMResponse:
     content: list[str] = []
     thinking: list[str] = []
+    text_parts: dict[tuple[str, str, str], list[str]] = {}
     tool_args: dict[str, dict[str, str]] = {}
     new_items: list[dict[str, Any]] = []
     usage: ModelUsage | None = None
@@ -253,12 +256,14 @@ async def _consume_stream(
             if event_type == "response.output_text.delta" and isinstance(delta, str):
                 if delta:
                     progress.advance()
+                _text_part(text_parts, event).append(delta)
                 content.append(delta)
                 delta_seen = True
                 await _emit(request.on_delta, {"content_delta": delta})
             elif event_type == "response.output_text.done":
                 advanced = await _append_done(
-                    content, event.get("text"), request.on_delta, "content_delta",
+                    content, _text_part(text_parts, event), event.get("text"),
+                    request.on_delta, "content_delta",
                 )
                 if advanced:
                     progress.advance()
@@ -269,12 +274,17 @@ async def _consume_stream(
             } and isinstance(delta, str):
                 if delta:
                     progress.advance()
+                _text_part(text_parts, event).append(delta)
                 thinking.append(delta)
                 delta_seen = True
                 await _emit(request.on_delta, {"thinking_delta": delta})
-            elif event_type == "response.reasoning_summary_text.done":
+            elif event_type in {
+                "response.reasoning_summary_text.done",
+                "response.reasoning_text.done",
+            }:
                 advanced = await _append_done(
-                    thinking, event.get("text"), request.on_delta, "thinking_delta",
+                    thinking, _text_part(text_parts, event), event.get("text"),
+                    request.on_delta, "thinking_delta",
                 )
                 if advanced:
                     progress.advance()
@@ -383,18 +393,35 @@ async def _emit(
         raise _CallbackError(exc) from exc
 
 
+def _text_part(
+    parts: dict[tuple[str, str, str], list[str]],
+    event: Mapping[str, Any],
+) -> list[str]:
+    # Text done events finalize one content/summary part, not the whole response.
+    family = str(event.get("type") or "").rsplit(".", 1)[0]
+    item_id = event.get("item_id")
+    item = f"id:{item_id}" if item_id else f"index:{event.get('output_index', 0)}"
+    index_field = (
+        "summary_index" if family == "response.reasoning_summary_text" else "content_index"
+    )
+    key = (family, item, str(event.get(index_field, 0)))
+    return parts.setdefault(key, [])
+
+
 async def _append_done(
     target: list[str],
+    part: list[str],
     done: object,
     callback: Callable[[dict[str, str]], Awaitable[None]] | None,
     key: str,
 ) -> bool:
-    current = "".join(target)
+    current = "".join(part)
     if isinstance(done, str):
         if not done.startswith(current):
             raise TransportError("Codex Responses done text 与已接收 delta 冲突")
         suffix = done[len(current) :]
         if suffix:
+            part.append(suffix)
             target.append(suffix)
             await _emit(callback, {key: suffix})
             return True

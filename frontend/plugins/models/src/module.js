@@ -1178,7 +1178,8 @@ export function activate(ctx) {
               type: "start_auth",
               driver_id: entry.id,
               connection_id: connectionId,
-              input: {...input, auth_identity: connection?.authIdentity ?? connectionId},
+              // Login fields belong to the provider; OAuth returns its own account identity.
+              input: {...input},
             });
             if (!receipt.attemptId) throw new Error(`${entry.label} 登录没有返回 attempt ID`);
             await auth.add(receipt.attemptId);

@@ -25,7 +25,7 @@ async def discover(
     descriptor: DriverConnectionDescriptor,
     credential: CredentialHandle,
 ) -> tuple[DiscoveredModel, ...]:
-    """Load the complete visible Codex catalog for one connection."""
+    """Load the version-negotiated visible Codex catalog for one connection."""
 
     payload = await _catalog_request(descriptor, credential)
     raw_models = payload.get("models")

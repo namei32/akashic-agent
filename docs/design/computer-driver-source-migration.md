@@ -1,5 +1,7 @@
 # Computer 驱动源码迁移
 
+> 2026-10-07：仓库中的 `benchmark/`（Harbor／Computer 评测 harness）已按用户要求移除。下文评测路径和成绩保留为历史证据，不再作为当前仓库的运行入口。
+
 - 状态：implementation，用户已确认开始。
 - 初始基线：`6a15444009c807994d33691e0b756167880fad5d`；交付分支已同步 `origin/main@dcc8c8a23c526133e3883628945bfd9f8632a814`。
 - Worktree：`/mnt/data/coding/akasic-agent-worktrees/computer-driver-source`。
