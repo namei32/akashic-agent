@@ -8,12 +8,12 @@ from importlib import import_module
 from pydantic import BaseModel, Field
 
 from agent.plugin_composition import RUNTIME_STARTED, RUNTIME_STOPPING, Context
-from agent.plugin_composition.models import CHAT_MODELS
+from plugins.models.contract import CHAT_MODELS
 from agent.plugin_composition.plugin_config import PLUGIN_CONFIG
-from agent.plugin_composition.ui import UI
-from agent.plugin_contracts import ContentPart
-from agent.plugin_contracts.proactive import EVENTMAIL_ALERT_SOURCE
-from agent.plugin_contracts.tools import TOOLS, Result
+from plugins.ui.contract import UI
+from plugins.ledger.contract import ContentPart
+from plugins.eventmail.contract import EVENTMAIL_ALERT_SOURCE
+from plugins.tools.contract import TOOLS, Result
 from core.common.file_io import run_file_io
 
 from .config import Config
@@ -23,7 +23,7 @@ from .store import Store, encoded
 
 api_version = 3
 name = "lol_tracker"
-version = "1.0.0"
+version = "1.0.2"
 desc = "查询关注玩家的国服英雄联盟战绩，生成每日分析并交由 Wake 推送"
 inject = (PLUGIN_CONFIG, TOOLS, CHAT_MODELS)
 
@@ -82,7 +82,11 @@ async def apply(ctx: Context) -> None:
 
     async def ui(child: Context):
         await child.require(UI).register(child, web="web_module.js",
-            dashboard=lambda: import_module(".dashboard", __package__), requires=("shell.pages.v1",))
+            dashboard=lambda: import_module(".dashboard", __package__),
+            requires=("shell.settings-plugins.v1",),
+            contract_digests={
+                "shell.settings-plugins.v1": "1823b19c778297893495ca9193d688e24c99d079effbaf5ecf0d1148ae0a1aa2",
+            })
 
     await ctx.inject((UI, SETTINGS, RUNTIME), ui, name="ui")
     worker = None

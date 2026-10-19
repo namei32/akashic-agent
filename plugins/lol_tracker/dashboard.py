@@ -3,11 +3,11 @@ from datetime import UTC, datetime, timedelta
 from fastapi import HTTPException, Query
 from pydantic import BaseModel, Field
 
-from agent.plugin_contracts.configuration import register_routes
+from plugins.ui.contract import UI
 
 from .settings import RUNTIME, SETTINGS
 
-inject = (SETTINGS, RUNTIME)
+inject = (UI, SETTINGS, RUNTIME)
 
 
 class ReportRequest(BaseModel):
@@ -16,7 +16,7 @@ class ReportRequest(BaseModel):
 
 
 def register(app, context):
-    register_routes(app, context, SETTINGS, "/api/dashboard/lol_tracker/config")
+    context.require(UI).register_configuration(app, context, SETTINGS, "/api/dashboard/lol_tracker/config")
 
     @app.get("/api/dashboard/lol_tracker/status")
     async def status():

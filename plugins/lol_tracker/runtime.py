@@ -11,7 +11,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from agent.plugin_composition import Context
-from agent.plugin_composition.models import CHAT_MODELS, ModelError, ModelRequest
+from plugins.models.contract import CHAT_MODELS, ModelError, ModelRequest
 from core.common.file_io import run_file_io
 
 from .analysis import ANALYSIS_PROMPT, metrics, render
@@ -106,7 +106,9 @@ class Runtime:
                     if not response.content or response.tool_calls:
                         raise ValueError("分析模型未返回有效正文")
                     body += "\n\n赛后分析\n" + response.content.strip()
-                except (ModelError, ValueError, TimeoutError) as exc:
+                except (RuntimeError, ValueError, TimeoutError) as exc:
+                    if isinstance(exc, RuntimeError) and ModelError.read(exc) is None:
+                        raise
                     error = type(exc).__name__
                     body += "\n\nAI 分析暂不可用，以上保留可核验的战绩数据。"
             await run_file_io(lambda: self.store.finish(identity, body, error))
@@ -156,7 +158,7 @@ class Runtime:
                 try:
                     async with self.ctx.runtime_scope():
                         await self.tick(datetime.now(UTC))
-                except (OSError, ValueError, RuntimeError, sqlite3.Error, ModelError) as exc:
+                except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
                     self.error = str(exc)[:300] or type(exc).__name__
                 await asyncio.sleep(60)
         finally:

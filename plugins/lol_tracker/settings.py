@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from agent.plugin_composition import Context, ServiceKey
 from agent.plugin_composition.plugin_config import PLUGIN_CONFIG
-from agent.plugin_contracts.configuration import Configuration
+from plugins.ui.contract import Configuration
 
 from .config import Config
 from .runtime import Runtime
