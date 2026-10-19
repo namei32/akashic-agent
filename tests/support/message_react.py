@@ -3,7 +3,12 @@ import asyncio
 from collections.abc import Mapping
 from contextlib import asynccontextmanager, nullcontext
 from typing import Any
-from agent.plugin_composition.models import BoundModelDescriptor, CapabilitySources, ModelCapabilities, ToolCall as ModelToolCall
+from plugins.models.contract import ToolCall as ModelToolCall
+from plugins.models.contract import (
+    BoundModelDescriptor,
+    CapabilitySources,
+    ModelCapabilities,
+)
 from agent.plugin_composition.tasks import Task, Tasks
 from plugins.content.plugin import _decode_text, check_text
 from plugins.context.api import Materials, check_summary, material_data
@@ -17,13 +22,14 @@ from plugins.react.plugin import react
 from plugins.tools.execution import ToolExecution, MessageReply, Result
 from plugins.tools.abandon import follow_abandon, reject_start
 from plugins.tools.menu import NativePresentation, ToolMenu, ToolCallDecode
-from session.log import MessageLog, OwnerTransaction
-from session.message import CallRef, Control, Input, Output, ToolCall, ToolResult
+from plugins.ledger.log import MessageLog
+from plugins.ledger.contract import OwnerTransaction
+from plugins.ledger.contract import CallRef, Control, Input, Output, ToolCall, ToolResult
 
 @asynccontextmanager
 async def runtime(tmp_path, complete, invoke, *, max_steps=4, authorize_hook=None,
                   reducer=None, material_source=None, estimate=None, preview_state=None, terminal_tools=frozenset(),
-                  state_owner=None, model_max_attempts=1, parallel_ids=frozenset(), max_parallel_calls=1):
+                  state_owner=None, model_max_attempts=1, parallel_ids=frozenset(), max_parallel_calls=1, tool_schemas=None):
     log = MessageLog(tmp_path / "sessions.db")
     store = ModelsStore(tmp_path / "models.db", tmp_path / "backups")
     store.initialize()
@@ -76,6 +82,8 @@ async def runtime(tmp_path, complete, invoke, *, max_steps=4, authorize_hook=Non
 
         @property
         def schemas(self) -> tuple[Mapping[str, Any], ...]:
+            if tool_schemas is not None:
+                return tool_schemas()
             return ({"type": "function", "function": {
                 "name": "example", "parameters": {"type": "object"},
             }},)
@@ -112,10 +120,11 @@ async def runtime(tmp_path, complete, invoke, *, max_steps=4, authorize_hook=Non
             finally:
                 reply.writer.expire()
 
-        def check_start(self, transaction: OwnerTransaction) -> None:
-            if not self.task.active or transaction.source_changed(
-                log.reader("s"), "conversation", self.task.boundary_hint,
-            ):
+        def check_start(self, transaction: OwnerTransaction | None) -> None:
+            reader = log.reader("s")
+            changed = (reader.source_changed("conversation", self.task.boundary_hint) if transaction is None
+                       else transaction.source_changed(reader, "conversation", self.task.boundary_hint))
+            if not self.task.active or changed:
                 raise asyncio.CancelledError
 
         def check_call(self, call: ToolCall) -> None:

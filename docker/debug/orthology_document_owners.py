@@ -6,12 +6,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from agent.plugin_composition import CompositionRoot
-from agent.plugin_composition.channel_io import unavailable
-from agent.plugin_composition.messages import MESSAGE_CATALOG
-from session.log import MessageCatalog, MessageLog
+from plugins.ledger.contract import unavailable
+from plugins.ledger.contract import MESSAGE_CATALOG
+from plugins.ledger.log import MessageCatalog, MessageLog
 from agent.plugin_composition.model import FiberState, PluginRuntime
-from agent.plugin_contracts.context import CONTEXT, MATERIALS_V4 as MATERIALS
-from agent.plugin_contracts.inspection import DOCUMENTS, Document
+from plugins.context.contract import CONTEXT, MATERIALS_V4 as MATERIALS
+from plugins.runtime_inspection.contract import DOCUMENTS, Document
 from plugins.context import plugin as context
 from plugins.markdown_memory import plugin as memory
 from plugins.prompt import plugin as prompt
@@ -21,8 +21,9 @@ from plugins.runtime_inspection import plugin as inspection
 async def check(workspace: Path) -> None:
     root = CompositionRoot("document-owner-scenario")
     log = MessageLog(workspace / "sessions.db")
-    def runtime(name, files=(), config=None):
-        return PluginRuntime(name, name, workspace, workspace / name, workspace, config or {}, workspace_files=files)
+    def runtime(name, files=(), config=None, roots=()):
+        return PluginRuntime(name, name, workspace, workspace / name, workspace, config or {},
+                             workspace_roots=roots, workspace_files=files)
     try:
         await root.mount(context.apply, name="context", runtime=runtime("context", config={
             "prompt_sources": {"default_prompt": "prompt", "markdown_memory": "markdown_memory"},
@@ -34,7 +35,8 @@ async def check(workspace: Path) -> None:
         persona = await root.mount(prompt.apply, name="prompt", inject=prompt.inject,
                                    runtime=runtime("prompt", prompt.workspace_files))
         profiles = await root.mount(memory.apply, name="memory", inject=memory.inject,
-                                    runtime=runtime("markdown_memory", memory.workspace_files))
+                                    runtime=runtime("markdown_memory", memory.workspace_files,
+                                                    roots=memory.workspace_roots))
         assert persona.state is FiberState.ACTIVE and profiles.state is FiberState.ACTIVE
         observer = await root.mount(inspection.apply, name="inspection", runtime=runtime("inspection"))
         documents = root.context.require(DOCUMENTS)

@@ -43,7 +43,7 @@
   align-items: center;
   gap: 10px;
   border: 0;
-  border-radius: 6px;
+  border-radius: 8px;
   padding-block: 6px;
   padding-inline: 14px 12px;
   color: inherit;
@@ -51,12 +51,12 @@
   font: inherit;
   text-align: start;
   text-decoration: none;
-  transition: background-color 150ms cubic-bezier(0.2, 0, 0, 1), scale 150ms cubic-bezier(0.2, 0, 0, 1);
+  transition: background-color var(--ak-sys-duration-short) var(--ak-sys-motion-standard), scale var(--ak-sys-duration-short) var(--ak-sys-motion-standard);
 }
 
 .conversation-destination:hover,
 .conversation-destination:focus-visible {
-  background: color-mix(in oklch, var(--ak-ink-primary) 5%, transparent);
+  background: color-mix(in oklab, var(--ak-ink-primary) 5%, transparent);
 }
 
 .conversation-destination.active {
@@ -149,10 +149,10 @@
 
 .conversation-navigation__heading {
   color: var(--ak-color-text-secondary);
-  font-size: 0.875rem;
+  font-size: var(--chat-type-section, 0.8125rem);
   font-weight: 650;
-  line-height: 1.1;
-  letter-spacing: 0.02em;
+  line-height: 1rem;
+  letter-spacing: normal;
 }
 
 .conversation-navigation__heading--section {
@@ -182,23 +182,23 @@
   display: grid;
   width: 100%;
   min-height: 64px;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: 16px minmax(0, 1fr) auto;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   border: 0;
-  border-radius: 6px;
+  border-radius: 8px;
   padding-block: 8px;
-  padding-inline: 14px 12px;
+  padding-inline: 10px 12px;
   color: inherit;
   background: transparent;
   font: inherit;
   text-align: start;
-  transition: background-color 150ms cubic-bezier(0.2, 0, 0, 1), scale 150ms cubic-bezier(0.2, 0, 0, 1);
+  transition: background-color var(--ak-sys-duration-short) var(--ak-sys-motion-standard), scale var(--ak-sys-duration-short) var(--ak-sys-motion-standard);
 }
 
 .conversation-session:hover,
 .conversation-session:focus-visible {
-  background: color-mix(in oklch, var(--ak-ink-primary) 5%, transparent);
+  background: color-mix(in oklab, var(--ak-ink-primary) 5%, transparent);
 }
 
 .conversation-session:active {
@@ -221,8 +221,7 @@
   opacity: 0.7;
 }
 
-.conversation-session.unavailable .conversation-session__copy small,
-.conversation-session.unavailable .conversation-session__state {
+.conversation-session.unavailable .conversation-session__copy small {
   color: var(--ak-color-status-warning);
 }
 
@@ -244,12 +243,35 @@
 
 .conversation-session__title strong {
   flex: 1;
-  overflow: hidden;
+  min-width: 0;
   font-size: 0.9375rem;
   font-weight: 600;
   line-height: 1.4;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+}
+
+/* 行内重命名：输入框沿用标题排版，只以发丝底线标示编辑态。 */
+.conversation-session.editing {
+  cursor: default;
+}
+
+.conversation-session.editing:active {
+  scale: none;
+}
+
+.conversation-session-title-input {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-block-end: 1px solid var(--ak-ink-secondary, currentColor);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 0.9375rem;
+  font-weight: 600;
+  line-height: 1.4;
+  outline: none;
 }
 
 .conversation-session__title time {
@@ -261,30 +283,15 @@
 }
 
 .conversation-session small {
-  overflow: hidden;
+  min-width: 0;
   font-size: 0.75rem;
   line-height: 1.35;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .conversation-session.active .conversation-session__title time,
 .conversation-session.active .conversation-session__copy small {
   color: var(--ak-ink-secondary);
   opacity: 1;
-}
-
-.conversation-session__state {
-  display: grid;
-  /* 下限 22px 稳住 Check/dot；不设死 width，避免两位数/99+ 未读角标被压扁。 */
-  min-width: 22px;
-  justify-self: end;
-  place-items: center;
-  color: var(--ak-ink-primary);
-}
-
-.conversation-session.active .conversation-session__state {
-  color: var(--ak-ink-primary);
 }
 
 .conversation-navigation__actions {
@@ -299,7 +306,7 @@
   align-items: center;
   gap: 12px;
   border: 0;
-  border-radius: 6px;
+  border-radius: 8px;
   padding-block: 8px;
   padding-inline: 14px;
   color: var(--ak-ink-secondary);
@@ -309,7 +316,7 @@
   font-weight: 500;
   line-height: 1.35;
   text-align: start;
-  transition: background-color 150ms cubic-bezier(0.2, 0, 0, 1), scale 150ms cubic-bezier(0.2, 0, 0, 1);
+  transition: background-color var(--ak-sys-duration-short) var(--ak-sys-motion-standard), scale var(--ak-sys-duration-short) var(--ak-sys-motion-standard);
 }
 
 .conversation-navigation__action:hover,
@@ -346,5 +353,73 @@
   .conversation-session,
   .conversation-navigation__action {
     transition-duration: 0.01ms;
+  }
+}
+
+/* 两行会话：状态槽位对齐标题行，而不是落在标题与预览之间。 */
+.conversation-session > .session-status-slot {
+  align-self: start;
+  margin-block-start: 2px;
+}
+
+/* 时间分组标签：比分组标题更轻，只是列表里的一段留白和一行小字，不加线不加底。 */
+.conversation-session-group {
+  padding: 14px 10px 4px;
+  color: var(--chat-faint, var(--ak-color-text-secondary));
+  font-size: 0.75rem;
+  line-height: 1rem;
+}
+
+.conversation-session-group:first-child {
+  padding-block-start: 2px;
+}
+
+/* 一行标题放不下时右缘 28px 渐隐，代替省略号；行悬停或键盘聚焦 0.35s 后以 30px/s 往返滚出尾部（参考 Memoh 的 marquee）。
+   只动画 --marquee-pos 一个量：位移与两侧渐隐都是它的函数，滚动与渐隐同步；越界部分被 clamp 钉住，就是两端的停顿。 */
+.marquee {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.marquee__content {
+  display: inline-block;
+  white-space: nowrap;
+}
+
+/* 位移与遮罩只给放不下的标题：放得下的行不建合成层，文字保持普通灰度抗锯齿。 */
+.marquee.is-truncated > .marquee__content {
+  transform: translateX(clamp(calc(-1 * var(--marquee-travel, 0px)), calc(-1 * var(--marquee-pos, 0px)), 0px));
+}
+
+.marquee.is-truncated {
+  mask-image: linear-gradient(to right,
+    transparent,
+    #000 min(var(--marquee-pos, 0px), 12px),
+    #000 calc(100% - min(var(--marquee-travel) - var(--marquee-pos, 0px), 28px)),
+    transparent);
+}
+
+@property --marquee-pos {
+  syntax: "<length>";
+  inherits: true;
+  initial-value: 0px;
+}
+
+@keyframes marquee-pingpong {
+  0%, 100% { --marquee-pos: -6px; }
+  50% { --marquee-pos: calc(var(--marquee-travel, 0px) + 6px); }
+}
+
+@media (hover: hover) and (prefers-reduced-motion: no-preference) {
+  :is(
+    .conversation-session-row:hover,
+    .conversation-session:focus-visible,
+    .project-session:is(:hover, :focus-visible),
+    .project-group__open:is(:hover, :focus-visible),
+    .conversation-heading h1:hover,
+    .turn-rail__list button:is(:hover, :focus-visible)
+  ) .marquee.is-truncated.is-animatable:not(.is-still) {
+    animation: marquee-pingpong var(--marquee-duration, 4s) linear 0.35s infinite;
   }
 }

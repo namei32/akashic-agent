@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict
 from typing import Annotated, Any, Literal, Protocol
 
@@ -15,20 +15,18 @@ from pydantic import (
     model_validator,
 )
 
-from agent.plugin_composition.model_settings_http import ModelControlUnavailable
-from agent.plugin_composition.models import (
-    MODEL_CATALOG,
-    MODEL_CALL_STATS,
-    AuthenticationError,
+from plugins.models.contract import ModelControlUnavailable
+from plugins.models.contract import (
     ChatModelSelection,
     CapabilitySources,
-    DriverUnavailableError,
     DiscoveredModel,
-    ModelCallStats,
     ModelCapabilities,
     ModelCatalogSnapshot,
+)
+from plugins.models.contract import (
+    AuthenticationError,
+    DriverUnavailableError,
     ModelError,
-    ModelKind,
     ModelTimeoutError,
     ModelUnavailableError,
     QuotaError,
@@ -36,8 +34,13 @@ from agent.plugin_composition.models import (
     RevisionConflictError,
     TransportError,
 )
+from plugins.models.contract import (
+    MODEL_CATALOG,
+    MODEL_CALL_STATS,
+    ModelCallStats,
+)
 from agent.plugin_composition.model import ServiceKey
-from agent.plugin_composition.rpc import RpcMethod
+from plugins.gateway.contract import RpcMethod
 
 from .settings import (
     AddConnection,
@@ -58,6 +61,11 @@ from .settings import (
     VerifyModel,
 )
 from .selection import MODEL_SELECTION
+
+# 模型失败值由标准异常承载；未知程序错误由映射入口原样抛出。
+# Only discover/command accept an HTTPException as an RPC error envelope.
+_MODEL_ERRORS = (RuntimeError, TimeoutError, ValueError)
+_HTTP_MODEL_ERRORS = (HTTPException, *_MODEL_ERRORS)
 
 
 class ModelControl(Protocol):
@@ -320,6 +328,16 @@ def _validation_detail(error: ValueError | ValidationError) -> object:
     return [{"type": "json_invalid", "msg": "JSON 无效"}]
 
 
+async def _read_payload[Payload: BaseModel](
+    request: Request, payload_type: type[Payload],
+) -> Payload:
+    """Validate JSON without reflecting credentials or validation context."""
+    try:
+        return payload_type.model_validate(await request.json())
+    except (ValueError, ValidationError) as error:
+        raise HTTPException(status_code=422, detail=_validation_detail(error)) from error
+
+
 def _rpc_ok(body: Mapping[str, object]) -> dict[str, object]:
     return {"status": 200, "body": dict(body)}
 
@@ -336,25 +354,29 @@ def _http_error(error: Exception, *, operation: str) -> HTTPException:
 
     if isinstance(error, HTTPException):
         return error
-    if operation == "call_stats" and isinstance(error, KeyError):
-        return HTTPException(status_code=404, detail="模型调用不存在")
-    if isinstance(error, RevisionConflictError):
+    if operation in {"call_stats", "catalog"}:
+        if operation == "call_stats" and isinstance(error, KeyError):
+            return HTTPException(status_code=404, detail="模型调用不存在")
+        if ModelError.matches(error, ModelControlUnavailable):
+            return HTTPException(status_code=503, detail=str(error))
+        raise error
+    if ModelError.matches(error, RevisionConflictError):
         return HTTPException(status_code=409, detail=str(error))
-    if isinstance(error, AuthenticationError):
+    if ModelError.matches(error, AuthenticationError):
         return HTTPException(status_code=401, detail=str(error))
-    if isinstance(error, RateLimitError):
+    if ModelError.matches(error, RateLimitError):
         return HTTPException(status_code=429, detail=str(error))
-    if isinstance(error, QuotaError):
+    if ModelError.matches(error, QuotaError):
         return HTTPException(status_code=402, detail=str(error))
-    if isinstance(error, (ModelControlUnavailable, DriverUnavailableError)):
+    if ModelError.matches(error, DriverUnavailableError, ModelControlUnavailable):
         return HTTPException(status_code=503, detail=str(error))
-    if isinstance(error, ModelUnavailableError):
+    if ModelError.matches(error, ModelUnavailableError):
         return HTTPException(status_code=409, detail=str(error))
-    if isinstance(error, ModelTimeoutError):
+    if ModelError.matches(error, ModelTimeoutError):
         return HTTPException(status_code=504, detail=str(error))
-    if isinstance(error, TransportError):
+    if ModelError.matches(error, TransportError):
         return HTTPException(status_code=502, detail=str(error))
-    if isinstance(error, (ModelError, ValueError)):
+    if (ModelError.matches(error) or isinstance(error, ValueError)):
         return HTTPException(status_code=422, detail=str(error))
     raise error
 
@@ -372,6 +394,13 @@ async def _discover_body(
     payload: ConnectionInput,
 ) -> dict[str, object]:
     models = await control.discover(_add_connection(payload))
+    return {"models": [_discovered_payload(model) for model in models]}
+
+
+async def _discover_saved_body(
+    control: ModelControl, payload: SavedDiscoveryPayload,
+) -> dict[str, object]:
+    models = await control.discover_saved(payload.connection_id, payload.expected_revision)
     return {"models": [_discovered_payload(model) for model in models]}
 
 
@@ -396,171 +425,96 @@ def create_model_settings_router(
     async def call_stats(call_id: str) -> dict[str, object]:
         try:
             return await _call_stats_body(control, call_id)
-        except (KeyError, ModelControlUnavailable) as error:
+        except (KeyError, RuntimeError) as error:
             raise _http_error(error, operation="call_stats") from error
 
     @router.get("/catalog")
     async def catalog() -> dict[str, object]:
         try:
             return await _catalog_body(control)
-        except ModelControlUnavailable as error:
+        except RuntimeError as error:
             raise _http_error(error, operation="catalog") from error
 
     @router.post("/discover")
     async def discover(request: Request) -> dict[str, object]:
-        try:
-            payload = ConnectionInput.model_validate(await request.json())
-        except (ValueError, ValidationError) as error:
-            raise HTTPException(status_code=422, detail=_validation_detail(error)) from error
+        payload = await _read_payload(request, ConnectionInput)
         try:
             return await _discover_body(control, payload)
-        except (
-            HTTPException,
-            AuthenticationError,
-            RateLimitError,
-            QuotaError,
-            ModelControlUnavailable,
-            DriverUnavailableError,
-            ModelUnavailableError,
-            ModelTimeoutError,
-            TransportError,
-            ModelError,
-            ValueError,
-        ) as error:
+        except _HTTP_MODEL_ERRORS as error:
             raise _http_error(error, operation="discover") from error
 
     @router.post("/discover_saved")
     async def discover_saved(request: Request) -> dict[str, object]:
+        payload = await _read_payload(request, SavedDiscoveryPayload)
         try:
-            payload = SavedDiscoveryPayload.model_validate(await request.json())
-        except (ValueError, ValidationError) as error:
-            raise HTTPException(status_code=422, detail=_validation_detail(error)) from error
-        try:
-            models = await control.discover_saved(payload.connection_id, payload.expected_revision)
-            return {"models": [_discovered_payload(model) for model in models]}
-        except (RevisionConflictError, AuthenticationError, RateLimitError, QuotaError,
-                ModelControlUnavailable, DriverUnavailableError, ModelUnavailableError,
-                ModelTimeoutError, TransportError, ModelError, ValueError) as error:
+            return await _discover_saved_body(control, payload)
+        except _MODEL_ERRORS as error:
             raise _http_error(error, operation="discover") from error
 
     @router.post("/probe_embedding")
     async def probe_embedding(request: Request) -> dict[str, object]:
-        try:
-            payload = EmbeddingProbePayload.model_validate(await request.json())
-        except (ValueError, ValidationError) as error:
-            raise HTTPException(status_code=422, detail=_validation_detail(error)) from error
+        payload = await _read_payload(request, EmbeddingProbePayload)
         try:
             return await _embedding_probe_body(control, payload)
-        except (RevisionConflictError, ModelControlUnavailable, ModelError, ValueError) as error:
+        except _MODEL_ERRORS as error:
             raise _http_error(error, operation="discover") from error
 
     @router.post("/command")
     async def command(request: Request) -> dict[str, object]:
-        try:
-            payload = CommandParams.model_validate(await request.json()).root
-        except (ValueError, ValidationError) as error:
-            raise HTTPException(status_code=422, detail=_validation_detail(error)) from error
+        payload = (await _read_payload(request, CommandParams)).root
         try:
             return await _command_body(control, payload)
-        except (
-            HTTPException,
-            RevisionConflictError,
-            AuthenticationError,
-            RateLimitError,
-            QuotaError,
-            ModelControlUnavailable,
-            DriverUnavailableError,
-            ModelUnavailableError,
-            ModelTimeoutError,
-            TransportError,
-            ModelError,
-            ValueError,
-        ) as error:
+        except _HTTP_MODEL_ERRORS as error:
             raise _http_error(error, operation="command") from error
 
     return router
 
 
+def _rpc_method[Payload: BaseModel](
+    payload_type: type[Payload],
+    invoke: Callable[[Payload], Awaitable[dict[str, object]]],
+    *,
+    errors: tuple[type[Exception], ...],
+    operation: str,
+) -> RpcMethod:
+    """Adapt one typed operation, preserving its exact error boundary."""
+    async def handle(params: BaseModel) -> object:
+        assert isinstance(params, payload_type)
+        try:
+            return _rpc_ok(await invoke(params))
+        except errors as error:
+            return _rpc_error(_http_error(error, operation=operation))
+
+    return RpcMethod(payload_type, handle)
+
+
 def rpc_methods(control: ModelControl) -> dict[str, RpcMethod]:
     """Publish model HTTP operations as plugin-owned RPC methods."""
-
-    async def call_stats(params: BaseModel) -> object:
-        assert isinstance(params, CallStatsParams)
-        try:
-            return _rpc_ok(await _call_stats_body(control, params.call_id))
-        except (KeyError, ModelControlUnavailable) as error:
-            return _rpc_error(_http_error(error, operation="call_stats"))
-
-    async def catalog(params: BaseModel) -> object:
-        assert isinstance(params, EmptyParams)
-        try:
-            return _rpc_ok(await _catalog_body(control))
-        except ModelControlUnavailable as error:
-            return _rpc_error(_http_error(error, operation="catalog"))
-
-    async def discover(params: BaseModel) -> object:
-        assert isinstance(params, ConnectionInput)
-        try:
-            return _rpc_ok(await _discover_body(control, params))
-        except (
-            HTTPException,
-            AuthenticationError,
-            RateLimitError,
-            QuotaError,
-            ModelControlUnavailable,
-            DriverUnavailableError,
-            ModelUnavailableError,
-            ModelTimeoutError,
-            TransportError,
-            ModelError,
-            ValueError,
-        ) as error:
-            return _rpc_error(_http_error(error, operation="discover"))
-
-    async def discover_saved(params: BaseModel) -> object:
-        assert isinstance(params, SavedDiscoveryPayload)
-        try:
-            models = await control.discover_saved(params.connection_id, params.expected_revision)
-            return _rpc_ok({"models": [_discovered_payload(model) for model in models]})
-        except (RevisionConflictError, AuthenticationError, RateLimitError, QuotaError,
-                ModelControlUnavailable, DriverUnavailableError, ModelUnavailableError,
-                ModelTimeoutError, TransportError, ModelError, ValueError) as error:
-            return _rpc_error(_http_error(error, operation="discover"))
-
-    async def probe_embedding(params: BaseModel) -> object:
-        assert isinstance(params, EmbeddingProbePayload)
-        try:
-            return _rpc_ok(await _embedding_probe_body(control, params))
-        except (RevisionConflictError, ModelControlUnavailable, ModelError, ValueError) as error:
-            return _rpc_error(_http_error(error, operation="discover"))
-
-    async def command(params: BaseModel) -> object:
-        assert isinstance(params, CommandParams)
-        try:
-            return _rpc_ok(await _command_body(control, params.root))
-        except (
-            HTTPException,
-            RevisionConflictError,
-            AuthenticationError,
-            RateLimitError,
-            QuotaError,
-            ModelControlUnavailable,
-            DriverUnavailableError,
-            ModelUnavailableError,
-            ModelTimeoutError,
-            TransportError,
-            ModelError,
-            ValueError,
-        ) as error:
-            return _rpc_error(_http_error(error, operation="command"))
-
     return {
-        "models/call_stats": RpcMethod(CallStatsParams, call_stats),
-        "models/catalog": RpcMethod(EmptyParams, catalog),
-        "models/discover": RpcMethod(ConnectionInput, discover),
-        "models/discover_saved": RpcMethod(SavedDiscoveryPayload, discover_saved),
-        "models/probe_embedding": RpcMethod(EmbeddingProbePayload, probe_embedding),
-        "models/command": RpcMethod(CommandParams, command),
+        "models/call_stats": _rpc_method(
+            CallStatsParams, lambda params: _call_stats_body(control, params.call_id),
+            errors=(KeyError, RuntimeError), operation="call_stats",
+        ),
+        "models/catalog": _rpc_method(
+            EmptyParams, lambda params: _catalog_body(control),
+            errors=(RuntimeError,), operation="catalog",
+        ),
+        "models/discover": _rpc_method(
+            ConnectionInput, lambda params: _discover_body(control, params),
+            errors=_HTTP_MODEL_ERRORS, operation="discover",
+        ),
+        "models/discover_saved": _rpc_method(
+            SavedDiscoveryPayload, lambda params: _discover_saved_body(control, params),
+            errors=_MODEL_ERRORS, operation="discover",
+        ),
+        "models/probe_embedding": _rpc_method(
+            EmbeddingProbePayload, lambda params: _embedding_probe_body(control, params),
+            errors=_MODEL_ERRORS, operation="discover",
+        ),
+        "models/command": _rpc_method(
+            CommandParams, lambda params: _command_body(control, params.root),
+            errors=_HTTP_MODEL_ERRORS, operation="command",
+        ),
     }
 
 
@@ -647,7 +601,7 @@ def _add_model(payload: ModelInput) -> AddModel:
         expected_revision=payload.expected_revision,
         model_id=payload.model_id,
         connection_id=payload.connection_id,
-        kind=ModelKind(payload.kind),
+        kind=payload.kind,
         model=payload.model,
         capabilities=ModelCapabilities(
             **{
@@ -666,6 +620,32 @@ def _add_model(payload: ModelInput) -> AddModel:
     )
 
 
+def _capabilities_payload(capabilities: ModelCapabilities) -> dict[str, object]:
+    return {
+        "contextWindow": capabilities.context_window,
+        "maxOutputTokens": capabilities.max_output_tokens,
+        "inputModalities": list(capabilities.input_modalities),
+        "supportsToolCalls": capabilities.supports_tool_calls,
+        "supportsParallelToolCalls": capabilities.supports_parallel_tool_calls,
+        "supportedReasoningEfforts": list(capabilities.supported_reasoning_efforts),
+        "embeddingDimensions": capabilities.embedding_dimensions,
+        "embeddingNormalization": capabilities.embedding_normalization,
+    }
+
+
+def _capability_sources_payload(sources: CapabilitySources) -> dict[str, object]:
+    return {
+        "contextWindow": sources.context_window,
+        "maxOutputTokens": sources.max_output_tokens,
+        "inputModalities": sources.input_modalities,
+        "toolCalls": sources.tool_calls,
+        "parallelToolCalls": sources.parallel_tool_calls,
+        "reasoningEfforts": sources.reasoning_efforts,
+        "embeddingDimensions": sources.embedding_dimensions,
+        "embeddingNormalization": sources.embedding_normalization,
+    }
+
+
 def _catalog_payload(snapshot: ModelCatalogSnapshot) -> dict[str, object]:
     return {
         "revision": snapshot.revision,
@@ -675,7 +655,7 @@ def _catalog_payload(snapshot: ModelCatalogSnapshot) -> dict[str, object]:
                 "name": item.name,
                 "driverId": item.driver_id,
                 "authIdentity": item.auth_identity,
-                "availability": item.availability.value,
+                "availability": item.availability,
             }
             for item in snapshot.connections
         ],
@@ -683,40 +663,12 @@ def _catalog_payload(snapshot: ModelCatalogSnapshot) -> dict[str, object]:
             {
                 "id": item.model_id,
                 "connectionId": item.connection_id,
-                "kind": item.kind.value,
+                "kind": item.kind,
                 "model": item.model,
                 "defaultReasoningEffort": item.default_reasoning_effort,
-                "availability": item.availability.value,
-                "capabilities": {
-                    "contextWindow": item.capabilities.context_window,
-                    "maxOutputTokens": item.capabilities.max_output_tokens,
-                    "inputModalities": list(item.capabilities.input_modalities),
-                    "supportsToolCalls": item.capabilities.supports_tool_calls,
-                    "supportsParallelToolCalls": (
-                        item.capabilities.supports_parallel_tool_calls
-                    ),
-                    "supportedReasoningEfforts": list(
-                        item.capabilities.supported_reasoning_efforts
-                    ),
-                    "embeddingDimensions": (item.capabilities.embedding_dimensions),
-                    "embeddingNormalization": (
-                        item.capabilities.embedding_normalization
-                    ),
-                },
-                "capabilitySources": {
-                    "contextWindow": item.capability_sources.context_window,
-                    "maxOutputTokens": item.capability_sources.max_output_tokens,
-                    "inputModalities": item.capability_sources.input_modalities,
-                    "toolCalls": item.capability_sources.tool_calls,
-                    "parallelToolCalls": (item.capability_sources.parallel_tool_calls),
-                    "reasoningEfforts": item.capability_sources.reasoning_efforts,
-                    "embeddingDimensions": (
-                        item.capability_sources.embedding_dimensions
-                    ),
-                    "embeddingNormalization": (
-                        item.capability_sources.embedding_normalization
-                    ),
-                },
+                "availability": item.availability,
+                "capabilities": _capabilities_payload(item.capabilities),
+                "capabilitySources": _capability_sources_payload(item.capability_sources),
             }
             for item in snapshot.models
         ],
@@ -731,31 +683,11 @@ def _discovered_payload(model: DiscoveredModel) -> dict[str, object]:
     """Project an unsaved provider model without inventing a registry ID."""
 
     return {
-        "kind": model.kind.value if model.kind is not None else None,
+        "kind": model.kind if model.kind is not None else None,
         "model": model.model,
         "defaultReasoningEffort": model.default_reasoning_effort,
-        "capabilities": {
-            "contextWindow": model.capabilities.context_window,
-            "maxOutputTokens": model.capabilities.max_output_tokens,
-            "inputModalities": list(model.capabilities.input_modalities),
-            "supportsToolCalls": model.capabilities.supports_tool_calls,
-            "supportsParallelToolCalls": model.capabilities.supports_parallel_tool_calls,
-            "supportedReasoningEfforts": list(
-                model.capabilities.supported_reasoning_efforts
-            ),
-            "embeddingDimensions": model.capabilities.embedding_dimensions,
-            "embeddingNormalization": model.capabilities.embedding_normalization,
-        },
-        "capabilitySources": {
-            "contextWindow": model.capability_sources.context_window,
-            "maxOutputTokens": model.capability_sources.max_output_tokens,
-            "inputModalities": model.capability_sources.input_modalities,
-            "toolCalls": model.capability_sources.tool_calls,
-            "parallelToolCalls": model.capability_sources.parallel_tool_calls,
-            "reasoningEfforts": model.capability_sources.reasoning_efforts,
-            "embeddingDimensions": model.capability_sources.embedding_dimensions,
-            "embeddingNormalization": model.capability_sources.embedding_normalization,
-        },
+        "capabilities": _capabilities_payload(model.capabilities),
+        "capabilitySources": _capability_sources_payload(model.capability_sources),
         "driverConfig": _json_value(model.driver_config),
     }
 

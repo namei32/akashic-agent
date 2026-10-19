@@ -13,9 +13,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from agent.plugin_contracts.json_store import atomic_save_json
+from infra.persistence.json_store import atomic_save_json
 from core.common.file_io import run_file_io
-from agent.plugin_contracts.timekit import parse_iso as _parse_iso
+from core.common.timekit import parse_iso as _parse_iso
 from .schedule import ScheduledJob, SCHEDULE_MAX_ACTIVE_JOBS, is_cron_expr, next_cron_fire
 
 _T = TypeVar("_T")
@@ -52,8 +52,13 @@ class Fire:
         return fire_key(self.job)
 
     @property
-    def session_id(self) -> str:
+    def source(self) -> str:
+        """每次触发独占目标会话里的一个来源；过程、恢复与竞争都只认它。"""
         return "scheduler:" + self.key
+
+    @property
+    def input_id(self) -> str:
+        return "scheduler-input:" + self.key
 
     @property
     def notification_id(self) -> str:
@@ -98,8 +103,8 @@ class JobStore:
     def load(self) -> list[ScheduledJob]:
         return list(self.read().jobs.values())
 
+    # 原子 replace 保证读到完整一版；只允许缺失文件表示空状态。
     def read(self) -> ScheduleState:
-        """原子 replace 保证读到完整一版；只允许缺失文件表示空状态。"""
         try:
             text = self.path.read_text(encoding="utf-8")
         except FileNotFoundError:
@@ -123,7 +128,7 @@ class JobStore:
             raise ValueError(f"job_store schema 无效，请先迁移：path={self.path}")
         raw = cast(dict[str, Any], raw)
         if (set(raw) != {"version", "jobs", "operations", "fires"}
-                or type(raw["version"]) is not int or raw["version"] != 2):
+                or type(raw["version"]) is not int or raw["version"] != 3):
             raise ValueError(f"job_store schema 无效，请先迁移：path={self.path}")
         jobs = self.decode_jobs(raw["jobs"])
         operations: dict[str, Operation] = {}
@@ -189,7 +194,7 @@ class JobStore:
             self._validate_job(job, index=index)
             data.append(self.encode_job(job))
         value: dict[str, object] = {
-            "version": 2, "jobs": data,
+            "version": 3, "jobs": data,
             "operations": {key: operation.model_dump(mode="json") for key, operation in state.operations.items()},
             "fires": {key: {"job": self.encode_job(fire.job), "status": fire.status, "error": fire.error}
                       for key, fire in state.fires.items()},
@@ -301,15 +306,17 @@ class JobStore:
         await self._change(update)
 
     async def recover(self, now: datetime) -> ScheduleState:
-        """已有触发先恢复；尚未触发的旧周期跳到未来，过期 one-shot 逻辑失效。"""
+        """已有触发先恢复；尚未触发的旧周期跳到未来，过期 one-shot 逻辑失效。
+        任务仍指向已结算的触发（例如升级迁移结算的旧触发）时同样推进，否则它不会再触发。"""
         now = aware(now)
         def update(state: ScheduleState) -> ScheduleState:
             for identity, job in state.jobs.items():
-                if not job.enabled or aware(job.fire_at) > now or fire_key(job) in state.fires:
+                fire = state.fires.get(fire_key(job))
+                if not job.enabled or aware(job.fire_at) > now or fire is not None and fire.status == "pending":
                     continue
                 if job.trigger == "every":
                     state.jobs[identity] = replace(job, fire_at=advance(job, now))
-                elif (now - aware(job.fire_at)).total_seconds() > 300:
+                elif fire is not None or (now - aware(job.fire_at)).total_seconds() > 300:
                     state.jobs[identity] = replace(job, enabled=False)
             return state
         return await self._change(update)
@@ -358,19 +365,23 @@ class JobStore:
         self._validate_job_schedule(job, index=index)
 
     def _validate_job_identity(self, job: ScheduledJob, *, index: int) -> None:
-        """校验任务身份、渠道和 IANA 时区。"""
+        """校验任务身份、动作、渠道和 IANA 时区。"""
 
         # 1. 校验基础字段和枚举
         if job.trigger not in ("at", "after", "every"):
             raise self._schema_error(index, "trigger 无效")
-        if job.tier not in ("instant", "soft"):
-            raise self._schema_error(index, "tier 无效")
+        if job.action not in ("notify", "run"):
+            raise self._schema_error(index, "action 无效")
+        if job.context not in ("none", "session"):
+            raise self._schema_error(index, "context 无效")
         if type(job.id) is not str or not job.id:
             raise self._schema_error(index, "id 无效")
         if type(job.channel) is not str or not job.channel:
             raise self._schema_error(index, "channel 无效")
         if type(job.chat_id) is not str or not job.chat_id:
             raise self._schema_error(index, "chat_id 无效")
+        if type(job.session_id) is not str or not job.session_id:
+            raise self._schema_error(index, "session_id 无效")
         if type(job.timezone) is not str or not job.timezone:
             raise self._schema_error(index, "timezone 无效")
         try:
@@ -381,17 +392,11 @@ class JobStore:
             ) from e
 
     def _validate_job_payload(self, job: ScheduledJob, *, index: int) -> None:
-        """校验消息载荷、运行计数和可选字段类型。"""
+        """校验任务正文、运行计数和可选字段类型。"""
 
         # 2. 校验消息、计数和可选字段类型
-        if job.tier == "instant" and (type(job.message) is not str or not job.message):
-            raise self._schema_error(index, "instant 任务缺少 message")
-        if job.tier == "soft" and (type(job.prompt) is not str or not job.prompt):
-            raise self._schema_error(index, "soft 任务缺少 prompt")
-        if job.message is not None and type(job.message) is not str:
-            raise self._schema_error(index, "message 类型无效")
-        if job.prompt is not None and type(job.prompt) is not str:
-            raise self._schema_error(index, "prompt 类型无效")
+        if type(job.text) is not str or not job.text.strip():
+            raise self._schema_error(index, "任务缺少 text")
         if job.name is not None and type(job.name) is not str:
             raise self._schema_error(index, "name 类型无效")
         if type(job.run_count) is not int or job.run_count < 0:

@@ -1,57 +1,20 @@
 "use client";
 
 import {
-  Command,
-  CommandEmpty,
-  CommandGroup,
-  CommandInput,
-  CommandItem,
-  CommandList,
-  CommandSeparator,
-} from "@/components/ui/command";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import {
-  HoverCard,
-  HoverCardContent,
-  HoverCardTrigger,
-} from "@/components/ui/hover-card";
-import {
   InputGroup,
   InputGroupAddon,
   InputGroupButton,
   InputGroupTextarea,
 } from "@/components/ui/input-group";
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { Spinner } from "@/components/ui/spinner";
-import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
-import type { ChatStatus, FileUIPart, SourceDocumentUIPart } from "ai";
-import {
-  CornerDownLeftIcon,
-  ImageIcon,
-  Monitor,
-  PlusIcon,
-  SquareIcon,
-  XIcon,
-} from "lucide-react";
+import type { FileUIPart } from "ai";
 import { nanoid } from "nanoid";
 import type {
-  ChangeEvent,
   ChangeEventHandler,
   ClipboardEventHandler,
   ComponentProps,
@@ -59,9 +22,7 @@ import type {
   FormEventHandler,
   HTMLAttributes,
   KeyboardEventHandler,
-  PropsWithChildren,
   ReactNode,
-  RefObject,
 } from "react";
 import {
   Children,
@@ -74,711 +35,203 @@ import {
   useState,
 } from "react";
 
-// ============================================================================
-// Helpers
-// ============================================================================
+/** 输入卡里的附件：本地 Blob URL 加选择时就知道的字节数（卡片上显示大小）。 */
+export type PromptInputFile = FileUIPart & { id: string; sizeBytes?: number };
 
-const captureScreenshot = async (): Promise<File | null> => {
-  if (
-    typeof navigator === "undefined" ||
-    !navigator.mediaDevices?.getDisplayMedia
-  ) {
-    return null;
-  }
-
-  let stream: MediaStream | null = null;
-  const video = document.createElement("video");
-  video.muted = true;
-  video.playsInline = true;
-
-  try {
-    stream = await navigator.mediaDevices.getDisplayMedia({
-      audio: false,
-      video: true,
-    });
-
-    video.srcObject = stream;
-
-    // Video element uses callback-based API, wrapping in Promise is necessary
-    // oxlint-disable-next-line eslint-plugin-promise(avoid-new)
-    await new Promise<void>((resolve, reject) => {
-      // oxlint-disable-next-line eslint-plugin-unicorn(prefer-add-event-listener)
-      video.onloadedmetadata = () => resolve();
-      // oxlint-disable-next-line eslint-plugin-unicorn(prefer-add-event-listener)
-      video.onerror = () => reject(new Error("Failed to load screen stream"));
-    });
-
-    await video.play();
-
-    const width = video.videoWidth;
-    const height = video.videoHeight;
-    if (!width || !height) {
-      return null;
-    }
-
-    const canvas = document.createElement("canvas");
-    canvas.width = width;
-    canvas.height = height;
-    const context = canvas.getContext("2d");
-    if (!context) {
-      return null;
-    }
-
-    context.drawImage(video, 0, 0, width, height);
-    // canvas.toBlob uses callback-based API, wrapping in Promise is necessary
-    // oxlint-disable-next-line eslint-plugin-promise(avoid-new)
-    const blob = await new Promise<Blob | null>((resolve) => {
-      canvas.toBlob(resolve, "image/png");
-    });
-    if (!blob) {
-      return null;
-    }
-
-    const timestamp = new Date()
-      .toISOString()
-      .replaceAll(/[:.]/g, "-")
-      .replace("T", "_")
-      .replace("Z", "");
-
-    return new File([blob], `screenshot-${timestamp}.png`, {
-      lastModified: Date.now(),
-      type: "image/png",
-    });
-  } finally {
-    if (stream) {
-      for (const track of stream.getTracks()) {
-        track.stop();
-      }
-    }
-    video.pause();
-    video.srcObject = null;
-  }
-};
-
-// ============================================================================
-// Provider Context & Types
-// ============================================================================
+/** 拒收原因：单个超过大小上限，或这条消息的附件数已满。 */
+export type RejectReason = "size" | "count";
 
 export interface AttachmentsContext {
-  files: (FileUIPart & { id: string })[];
-  add: (files: File[] | FileList) => void;
+  files: PromptInputFile[];
+  /** 返回实际入列的个数：满额或超限时可能为 0。 */
+  add: (files: File[] | FileList) => number;
   remove: (id: string) => void;
-  clear: () => void;
   openFileDialog: () => void;
-  fileInputRef: RefObject<HTMLInputElement | null>;
 }
-
-export interface TextInputContext {
-  value: string;
-  setInput: (v: string) => void;
-  clear: () => void;
-}
-
-export interface PromptInputControllerProps {
-  textInput: TextInputContext;
-  attachments: AttachmentsContext;
-  /** INTERNAL: Allows PromptInput to register its file textInput + "open" callback */
-  __registerFileInput: (
-    ref: RefObject<HTMLInputElement | null>,
-    open: () => void
-  ) => void;
-}
-
-const PromptInputController = createContext<PromptInputControllerProps | null>(
-  null
-);
-const ProviderAttachmentsContext = createContext<AttachmentsContext | null>(
-  null
-);
-
-export const usePromptInputController = () => {
-  const ctx = useContext(PromptInputController);
-  if (!ctx) {
-    throw new Error(
-      "Wrap your component inside <PromptInputProvider> to use usePromptInputController()."
-    );
-  }
-  return ctx;
-};
-
-// Optional variants (do NOT throw). Useful for dual-mode components.
-const useOptionalPromptInputController = () =>
-  useContext(PromptInputController);
-
-export const useProviderAttachments = () => {
-  const ctx = useContext(ProviderAttachmentsContext);
-  if (!ctx) {
-    throw new Error(
-      "Wrap your component inside <PromptInputProvider> to use useProviderAttachments()."
-    );
-  }
-  return ctx;
-};
-
-const useOptionalProviderAttachments = () =>
-  useContext(ProviderAttachmentsContext);
-
-export type PromptInputProviderProps = PropsWithChildren<{
-  initialInput?: string;
-}>;
-
-/**
- * Optional global provider that lifts PromptInput state outside of PromptInput.
- * If you don't use it, PromptInput stays fully self-managed.
- */
-export const PromptInputProvider = ({
-  initialInput: initialTextInput = "",
-  children,
-}: PromptInputProviderProps) => {
-  // ----- textInput state
-  const [textInput, setTextInput] = useState(initialTextInput);
-  const clearInput = useCallback(() => setTextInput(""), []);
-
-  // ----- attachments state (global when wrapped)
-  const [attachmentFiles, setAttachmentFiles] = useState<
-    (FileUIPart & { id: string })[]
-  >([]);
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
-  // oxlint-disable-next-line eslint(no-empty-function)
-  const openRef = useRef<() => void>(() => {});
-
-  const add = useCallback((files: File[] | FileList) => {
-    const incoming = Array.from(files);
-    if (incoming.length === 0) {
-      return;
-    }
-
-    setAttachmentFiles((prev) => [
-      ...prev,
-      ...incoming.map((file) => ({
-        filename: file.name,
-        id: nanoid(),
-        mediaType: file.type,
-        type: "file" as const,
-        url: URL.createObjectURL(file),
-      })),
-    ]);
-  }, []);
-
-  const remove = useCallback((id: string) => {
-    setAttachmentFiles((prev) => {
-      const found = prev.find((f) => f.id === id);
-      if (found?.url) {
-        URL.revokeObjectURL(found.url);
-      }
-      return prev.filter((f) => f.id !== id);
-    });
-  }, []);
-
-  const clear = useCallback(() => {
-    setAttachmentFiles((prev) => {
-      for (const f of prev) {
-        if (f.url) {
-          URL.revokeObjectURL(f.url);
-        }
-      }
-      return [];
-    });
-  }, []);
-
-  // Keep a ref to attachments for cleanup on unmount (avoids stale closure)
-  const attachmentsRef = useRef(attachmentFiles);
-
-  useEffect(() => {
-    attachmentsRef.current = attachmentFiles;
-  }, [attachmentFiles]);
-
-  // Cleanup blob URLs on unmount to prevent memory leaks
-  useEffect(
-    () => () => {
-      for (const f of attachmentsRef.current) {
-        if (f.url) {
-          URL.revokeObjectURL(f.url);
-        }
-      }
-    },
-    []
-  );
-
-  const openFileDialog = useCallback(() => {
-    openRef.current?.();
-  }, []);
-
-  const attachments = useMemo<AttachmentsContext>(
-    () => ({
-      add,
-      clear,
-      fileInputRef,
-      files: attachmentFiles,
-      openFileDialog,
-      remove,
-    }),
-    [attachmentFiles, add, remove, clear, openFileDialog]
-  );
-
-  const __registerFileInput = useCallback(
-    (ref: RefObject<HTMLInputElement | null>, open: () => void) => {
-      fileInputRef.current = ref.current;
-      openRef.current = open;
-    },
-    []
-  );
-
-  const controller = useMemo<PromptInputControllerProps>(
-    () => ({
-      __registerFileInput,
-      attachments,
-      textInput: {
-        clear: clearInput,
-        setInput: setTextInput,
-        value: textInput,
-      },
-    }),
-    [textInput, clearInput, attachments, __registerFileInput]
-  );
-
-  return (
-    <PromptInputController.Provider value={controller}>
-      <ProviderAttachmentsContext.Provider value={attachments}>
-        {children}
-      </ProviderAttachmentsContext.Provider>
-    </PromptInputController.Provider>
-  );
-};
-
-// ============================================================================
-// Component Context & Hooks
-// ============================================================================
 
 const LocalAttachmentsContext = createContext<AttachmentsContext | null>(null);
 
 export const usePromptInputAttachments = () => {
-  // Prefer local context (inside PromptInput) as it has validation, fall back to provider
-  const provider = useOptionalProviderAttachments();
-  const local = useContext(LocalAttachmentsContext);
-  const context = local ?? provider;
+  const context = useContext(LocalAttachmentsContext);
   if (!context) {
     throw new Error(
-      "usePromptInputAttachments must be used within a PromptInput or PromptInputProvider"
+      "usePromptInputAttachments must be used within a PromptInput"
     );
   }
   return context;
 };
 
-// ============================================================================
-// Referenced Sources (Local to PromptInput)
-// ============================================================================
-
-export interface ReferencedSourcesContext {
-  sources: (SourceDocumentUIPart & { id: string })[];
-  add: (sources: SourceDocumentUIPart[] | SourceDocumentUIPart) => void;
-  remove: (id: string) => void;
-  clear: () => void;
-}
-
-export const LocalReferencedSourcesContext =
-  createContext<ReferencedSourcesContext | null>(null);
-
-export const usePromptInputReferencedSources = () => {
-  const ctx = useContext(LocalReferencedSourcesContext);
-  if (!ctx) {
-    throw new Error(
-      "usePromptInputReferencedSources must be used within a LocalReferencedSourcesContext.Provider"
-    );
-  }
-  return ctx;
-};
-
-export type PromptInputActionAddAttachmentsProps = ComponentProps<
-  typeof DropdownMenuItem
-> & {
-  label?: string;
-};
-
-export const PromptInputActionAddAttachments = ({
-  label = "Add photos or files",
-  ...props
-}: PromptInputActionAddAttachmentsProps) => {
-  const attachments = usePromptInputAttachments();
-
-  const handleSelect = useCallback(
-    (e: Event) => {
-      e.preventDefault();
-      attachments.openFileDialog();
-    },
-    [attachments]
-  );
-
-  return (
-    <DropdownMenuItem {...props} onSelect={handleSelect}>
-      <ImageIcon className="mr-2 size-4" /> {label}
-    </DropdownMenuItem>
-  );
-};
-
-export type PromptInputActionAddScreenshotProps = ComponentProps<
-  typeof DropdownMenuItem
-> & {
-  label?: string;
-};
-
-export const PromptInputActionAddScreenshot = ({
-  label = "Take screenshot",
-  onSelect,
-  ...props
-}: PromptInputActionAddScreenshotProps) => {
-  const attachments = usePromptInputAttachments();
-
-  const handleSelect = useCallback(
-    async (event: Event) => {
-      onSelect?.(event);
-      if (event.defaultPrevented) {
-        return;
-      }
-
-      try {
-        const screenshot = await captureScreenshot();
-        if (screenshot) {
-          attachments.add([screenshot]);
-        }
-      } catch (error) {
-        if (
-          error instanceof DOMException &&
-          (error.name === "NotAllowedError" || error.name === "AbortError")
-        ) {
-          return;
-        }
-        throw error;
-      }
-    },
-    [onSelect, attachments]
-  );
-
-  return (
-    <DropdownMenuItem {...props} onSelect={handleSelect}>
-      <Monitor className="mr-2 size-4" />
-      {label}
-    </DropdownMenuItem>
-  );
-};
-
 export interface PromptInputMessage {
   text: string;
-  files: FileUIPart[];
+  files: Omit<PromptInputFile, "id">[];
 }
 
 export type PromptInputProps = Omit<
   HTMLAttributes<HTMLFormElement>,
   "onSubmit" | "onError"
 > & {
-  // e.g., "image/*" or leave undefined for any
-  accept?: string;
   multiple?: boolean;
-  // When true, accepts drops anywhere on document. Default false (opt-in).
-  globalDrop?: boolean;
-  // Render a hidden input with given name and keep it in sync for native form posts. Default false.
-  syncHiddenInput?: boolean;
-  // Minimal constraints
-  maxFiles?: number;
-  // bytes
+  /** 附件归属（会话草稿键）；变化时当前附件存到旧键名下，换出新键的那一份。 */
+  attachmentKey?: string;
+  /** 单个附件上限（字节）；超出的文件不入列，交给 onRejectFiles 提示。 */
   maxFileSize?: number;
-  onError?: (err: {
-    code: "max_files" | "max_file_size" | "accept";
-    message: string;
-  }) => void;
+  /** 一条消息最多带几个附件；多出的不入列。 */
+  maxFiles?: number;
+  onRejectFiles?: (files: File[], reason: RejectReason) => void;
+  /** 可返回剩余草稿此后归属的键（新会话首次被接纳时拿到的会话 ID），未发出的附件随之迁过去。 */
   onSubmit: (
     message: PromptInputMessage,
     event: FormEvent<HTMLFormElement>
-  ) => void | Promise<void>;
+  ) => void | Promise<void | string | undefined>;
 };
 
+/** 管理当前表单的附件，发送成功后才释放对应的 Blob URL。 */
 export const PromptInput = ({
   className,
-  accept,
   multiple,
-  globalDrop,
-  syncHiddenInput,
-  maxFiles,
+  attachmentKey = "",
   maxFileSize,
-  onError,
+  maxFiles = Number.POSITIVE_INFINITY,
+  onRejectFiles,
   onSubmit,
   children,
   ...props
 }: PromptInputProps) => {
-  // Try to use a provider controller if present
-  const controller = useOptionalPromptInputController();
-  const usingProvider = !!controller;
-  const controllerRef = useRef(controller);
-  controllerRef.current = controller;
-
-  // Refs
+  // 1. 当前表单拥有附件；提交中只隐藏本次发送持有的文件。
   const inputRef = useRef<HTMLInputElement | null>(null);
   const formRef = useRef<HTMLFormElement | null>(null);
   const submittingRef = useRef(false);
   const [submittedFileIds, setSubmittedFileIds] = useState<string[]>([]);
+  // 提交中的附件属于上一条消息，不占下一份草稿的名额。
+  const submittedRef = useRef<string[]>([]);
 
-  // ----- Local attachments (only used when no provider)
-  const [items, setItems] = useState<(FileUIPart & { id: string })[]>([]);
-  const files = usingProvider ? controller.attachments.files : items;
-
-  // ----- Local referenced sources (always local to PromptInput)
-  const [referencedSources, setReferencedSources] = useState<
-    (SourceDocumentUIPart & { id: string })[]
-  >([]);
-
-  // Keep a ref to files for cleanup on unmount (avoids stale closure)
+  const [files, setFiles] = useState<PromptInputFile[]>([]);
+  // 附件与草稿一样按会话保留：切走时存到旧会话名下，切回时取出，不跟到别的会话里被发出去。
+  // carry：new: 草稿首次被接纳后，它的附件归属换成真实会话，键随后变过去时不算切会话。
+  const [parked, setParked] = useState<{ key: string; others: ReadonlyMap<string, PromptInputFile[]>; carry: { from: string; to: string } | null }>(
+    () => ({ key: attachmentKey, others: new Map(), carry: null }));
+  if (parked.key !== attachmentKey) {
+    const owner = parked.carry?.from === parked.key ? parked.carry.to : parked.key;
+    const others = new Map(parked.others);
+    if (files.length) others.set(owner, [...(others.get(owner) ?? []), ...files]);
+    const restored = others.get(attachmentKey) ?? [];
+    others.delete(attachmentKey);
+    setParked({ key: attachmentKey, others, carry: null });
+    setFiles(restored);
+  } else if (parked.others.has(attachmentKey)) {
+    // 接纳晚于切换时，迁到当前键名下的附件直接接回输入卡。
+    const others = new Map(parked.others);
+    const waiting = others.get(attachmentKey) ?? [];
+    others.delete(attachmentKey);
+    setParked({ ...parked, others });
+    setFiles([...waiting, ...files]);
+  }
+  // 卸载时读取最新附件（含存起来的），避免闭包持有旧列表而漏掉 Blob URL。
   const filesRef = useRef(files);
+  const parkedRef = useRef(parked.others);
 
   useEffect(() => {
     filesRef.current = files;
-  }, [files]);
+    parkedRef.current = parked.others;
+  }, [files, parked]);
 
-  const openFileDialogLocal = useCallback(() => {
+  const openFileDialog = useCallback(() => {
     inputRef.current?.click();
   }, []);
 
-  const matchesAccept = useCallback(
-    (f: File) => {
-      if (!accept || accept.trim() === "") {
-        return true;
-      }
-
-      const patterns = accept
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean);
-
-      return patterns.some((pattern) => {
-        if (pattern.endsWith("/*")) {
-          // e.g: image/* -> image/
-          const prefix = pattern.slice(0, -1);
-          return f.type.startsWith(prefix);
-        }
-        return f.type === pattern;
-      });
-    },
-    [accept]
-  );
-
-  const addLocal = useCallback(
+  // 2. 选择、粘贴和拖拽共用同一条附件入列路径。
+  const add = useCallback(
     (fileList: File[] | FileList) => {
-      const incoming = [...fileList];
-      const accepted = incoming.filter((f) => matchesAccept(f));
-      if (incoming.length && accepted.length === 0) {
-        onError?.({
-          code: "accept",
-          message: "No files match the accepted types.",
-        });
-        return;
-      }
-      const withinSize = (f: File) =>
-        maxFileSize ? f.size <= maxFileSize : true;
-      const sized = accepted.filter(withinSize);
-      if (accepted.length > 0 && sized.length === 0) {
-        onError?.({
-          code: "max_file_size",
-          message: "All files exceed the maximum size.",
-        });
-        return;
-      }
-
-      setItems((prev) => {
-        const capacity =
-          typeof maxFiles === "number"
-            ? Math.max(0, maxFiles - prev.length)
-            : undefined;
-        const capped =
-          typeof capacity === "number" ? sized.slice(0, capacity) : sized;
-        if (typeof capacity === "number" && sized.length > capacity) {
-          onError?.({
-            code: "max_files",
-            message: "Too many files. Some were not added.",
-          });
-        }
-        const next: (FileUIPart & { id: string })[] = [];
-        for (const file of capped) {
-          next.push({
-            filename: file.name,
-            id: nanoid(),
-            mediaType: file.type,
-            type: "file",
-            url: URL.createObjectURL(file),
-          });
-        }
-        return [...prev, ...next];
-      });
+      // 超限文件在选择时就拒掉：等到发送才被服务端 413，用户已经写完话、还会被引导去"重试"一个必然失败的上传。
+      // 只剔除超限的那几个，其余照常入列（Desktop 同样部分接收）。
+      const all = Array.from(fileList);
+      const sized = maxFileSize === undefined ? all : all.filter((file) => file.size <= maxFileSize);
+      if (sized.length < all.length) onRejectFiles?.(all.filter((file) => !sized.includes(file)), "size");
+      const room = Math.max(0, maxFiles - filesRef.current.filter((file) => !submittedRef.current.includes(file.id)).length);
+      const incoming = sized.slice(0, room);
+      if (incoming.length < sized.length) onRejectFiles?.(sized.slice(room), "count");
+      if (!incoming.length) return 0;
+      // Blob URL 在 updater 外创建：updater 可能被 React 重复调用，里面建的 URL 会有一份无人释放。
+      const next: PromptInputFile[] = incoming.map((file) => ({
+        filename: file.name,
+        id: nanoid(),
+        mediaType: file.type,
+        sizeBytes: file.size,
+        type: "file",
+        url: URL.createObjectURL(file),
+      }));
+      setFiles((prev) => [...prev, ...next]);
+      return next.length;
     },
-    [matchesAccept, maxFiles, maxFileSize, onError]
+    [maxFileSize, maxFiles, onRejectFiles]
   );
 
-  const removeLocal = useCallback(
-    (id: string) =>
-      setItems((prev) => {
+  // 发送成功时本次附件可能已随切换会话存到别处，两边一起移除。
+  const remove = useCallback(
+    (id: string) => {
+      setFiles((prev) => {
         const found = prev.find((file) => file.id === id);
         if (found?.url) {
           URL.revokeObjectURL(found.url);
         }
         return prev.filter((file) => file.id !== id);
-      }),
-    []
-  );
-
-  // Wrapper that validates files before calling provider's add
-  const addWithProviderValidation = useCallback(
-    (fileList: File[] | FileList) => {
-      const incoming = [...fileList];
-      const accepted = incoming.filter((f) => matchesAccept(f));
-      if (incoming.length && accepted.length === 0) {
-        onError?.({
-          code: "accept",
-          message: "No files match the accepted types.",
-        });
-        return;
-      }
-      const withinSize = (f: File) =>
-        maxFileSize ? f.size <= maxFileSize : true;
-      const sized = accepted.filter(withinSize);
-      if (accepted.length > 0 && sized.length === 0) {
-        onError?.({
-          code: "max_file_size",
-          message: "All files exceed the maximum size.",
-        });
-        return;
-      }
-
-      const currentCount = files.length;
-      const capacity =
-        typeof maxFiles === "number"
-          ? Math.max(0, maxFiles - currentCount)
-          : undefined;
-      const capped =
-        typeof capacity === "number" ? sized.slice(0, capacity) : sized;
-      if (typeof capacity === "number" && sized.length > capacity) {
-        onError?.({
-          code: "max_files",
-          message: "Too many files. Some were not added.",
-        });
-      }
-
-      if (capped.length > 0) {
-        controller?.attachments.add(capped);
-      }
+      });
+      setParked((prev) => {
+        if (![...prev.others.values()].some((list) => list.some((file) => file.id === id))) return prev;
+        const others = new Map<string, PromptInputFile[]>();
+        for (const [key, list] of prev.others) {
+          const found = list.find((file) => file.id === id);
+          if (found?.url) URL.revokeObjectURL(found.url);
+          const rest = list.filter((file) => file.id !== id);
+          if (rest.length) others.set(key, rest);
+        }
+        return { ...prev, others };
+      });
     },
-    [matchesAccept, maxFileSize, maxFiles, onError, files.length, controller]
-  );
-
-  const clearAttachments = useCallback(
-    () =>
-      usingProvider
-        ? controller?.attachments.clear()
-        : setItems((prev) => {
-            for (const file of prev) {
-              if (file.url) {
-                URL.revokeObjectURL(file.url);
-              }
-            }
-            return [];
-          }),
-    [usingProvider, controller]
-  );
-
-  const clearReferencedSources = useCallback(
-    () => setReferencedSources([]),
     []
   );
 
-  const add = usingProvider ? addWithProviderValidation : addLocal;
-  const remove = usingProvider ? controller.attachments.remove : removeLocal;
-  const openFileDialog = usingProvider
-    ? controller.attachments.openFileDialog
-    : openFileDialogLocal;
+  // 把 from 名下尚未发出的附件交给 to：键还没变就记下 carry，已经变了就直接迁移停放的那份。
+  const adopt = useCallback((from: string, to: string) => {
+    setParked((prev) => {
+      const others = new Map(prev.others);
+      const moving = others.get(from);
+      if (moving) {
+        others.delete(from);
+        others.set(to, [...(others.get(to) ?? []), ...moving]);
+      }
+      return { key: prev.key, others, carry: prev.key === from ? { from, to } : prev.carry };
+    });
+  }, []);
 
-  // Let provider know about our hidden file input so external menus can call openFileDialog()
   useEffect(() => {
-    if (!usingProvider) {
-      return;
-    }
-    controller.__registerFileInput(inputRef, () => inputRef.current?.click());
-  }, [usingProvider, controller]);
+    const target = formRef.current;
+    if (!target) return;
 
-  // Note: File input cannot be programmatically set for security reasons
-  // The syncHiddenInput prop is no longer functional
-  // 必要 effect：清空隐藏 input 的 DOM 值（DOM 操作），不可改为渲染期计算
-  useEffect(() => {
-    if (syncHiddenInput && inputRef.current && files.length === 0) {
-      inputRef.current.value = "";
-    }
-  }, [files, syncHiddenInput]);
-
-  // Attach drop handlers on nearest form and document (opt-in)
-  useEffect(() => {
-    const form = formRef.current;
-    if (!form) {
-      return;
-    }
-    if (globalDrop) {
-      // when global drop is on, let the document-level handler own drops
-      return;
-    }
-
-    const onDragOver = (e: DragEvent) => {
-      if (e.dataTransfer?.types?.includes("Files")) {
-        e.preventDefault();
+    const onDragOver = (event: DragEvent) => {
+      if (event.dataTransfer?.types?.includes("Files")) event.preventDefault();
+    };
+    const onDrop = (event: DragEvent) => {
+      if (event.dataTransfer?.types?.includes("Files")) event.preventDefault();
+      if (event.dataTransfer?.files && event.dataTransfer.files.length > 0) {
+        add(event.dataTransfer.files);
       }
     };
-    const onDrop = (e: DragEvent) => {
-      if (e.dataTransfer?.types?.includes("Files")) {
-        e.preventDefault();
-      }
-      if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
-        add(e.dataTransfer.files);
-      }
-    };
-    form.addEventListener("dragover", onDragOver);
-    form.addEventListener("drop", onDrop);
+    target.addEventListener("dragover", onDragOver);
+    target.addEventListener("drop", onDrop);
     return () => {
-      form.removeEventListener("dragover", onDragOver);
-      form.removeEventListener("drop", onDrop);
+      target.removeEventListener("dragover", onDragOver);
+      target.removeEventListener("drop", onDrop);
     };
-  }, [add, globalDrop]);
-
-  useEffect(() => {
-    if (!globalDrop) {
-      return;
-    }
-
-    const onDragOver = (e: DragEvent) => {
-      if (e.dataTransfer?.types?.includes("Files")) {
-        e.preventDefault();
-      }
-    };
-    const onDrop = (e: DragEvent) => {
-      if (e.dataTransfer?.types?.includes("Files")) {
-        e.preventDefault();
-      }
-      if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
-        add(e.dataTransfer.files);
-      }
-    };
-    document.addEventListener("dragover", onDragOver);
-    document.addEventListener("drop", onDrop);
-    return () => {
-      document.removeEventListener("dragover", onDragOver);
-      document.removeEventListener("drop", onDrop);
-    };
-  }, [add, globalDrop]);
+  }, [add]);
 
   useEffect(
     () => () => {
-      if (!usingProvider) {
-        for (const f of filesRef.current) {
-          if (f.url) {
-            URL.revokeObjectURL(f.url);
-          }
-        }
+      for (const file of [...filesRef.current, ...[...parkedRef.current.values()].flat()]) {
+        if (file.url) URL.revokeObjectURL(file.url);
       }
     },
-    [usingProvider]
+    []
   );
 
   const handleChange: ChangeEventHandler<HTMLInputElement> = useCallback(
@@ -786,7 +239,7 @@ export const PromptInput = ({
       if (event.currentTarget.files) {
         add(event.currentTarget.files);
       }
-      // Reset input value to allow selecting files that were previously removed
+      // 清空选择器，允许再次选择刚移除的同名文件。
       event.currentTarget.value = "";
     },
     [add]
@@ -795,33 +248,14 @@ export const PromptInput = ({
   const attachmentsCtx = useMemo<AttachmentsContext>(
     () => ({
       add,
-      clear: clearAttachments,
-      fileInputRef: inputRef,
       files: files.filter((item) => !submittedFileIds.includes(item.id)),
       openFileDialog,
       remove,
     }),
-    [files, submittedFileIds, add, remove, clearAttachments, openFileDialog]
+    [files, submittedFileIds, add, remove, openFileDialog]
   );
 
-  const refsCtx = useMemo<ReferencedSourcesContext>(
-    () => ({
-      add: (incoming: SourceDocumentUIPart[] | SourceDocumentUIPart) => {
-        const array = Array.isArray(incoming) ? incoming : [incoming];
-        setReferencedSources((prev) => [
-          ...prev,
-          ...array.map((s) => ({ ...s, id: nanoid() })),
-        ]);
-      },
-      clear: clearReferencedSources,
-      remove: (id: string) => {
-        setReferencedSources((prev) => prev.filter((s) => s.id !== id));
-      },
-      sources: referencedSources,
-    }),
-    [referencedSources, clearReferencedSources]
-  );
-
+  // 3. 本次发送与下一份草稿分开；失败保留附件，由调用者显示原因。
   const handleSubmit: FormEventHandler<HTMLFormElement> = useCallback(
     async (event) => {
       event.preventDefault();
@@ -829,48 +263,41 @@ export const PromptInput = ({
       submittingRef.current = true;
 
       const form = event.currentTarget;
-      const text = usingProvider
-        ? controller.textInput.value
-        : (() => {
-            const formData = new FormData(form);
-            return (formData.get("message") as string) || "";
-          })();
+      const formData = new FormData(form);
+      const text = (formData.get("message") as string) || "";
 
       // 提交中的附件由本次发送持有；编辑器仍可接收下一份草稿。
       const submitted = files.map(({ id, ...file }) => ({ id, file }));
-      setSubmittedFileIds(submitted.map((item) => item.id));
-      if (!usingProvider) {
-        form.reset();
-      }
+      const submittedKey = attachmentKey;
+      submittedRef.current = submitted.map((item) => item.id);
+      setSubmittedFileIds(submittedRef.current);
+      form.reset();
 
       try {
         // 原 Blob URL 直接交给上传 owner，成功后才释放，不做 Base64 往返转换。
-        await onSubmit({ files: submitted.map((item) => item.file), text }, event);
+        const owner = await onSubmit({ files: submitted.map((item) => item.file), text }, event);
         for (const item of submitted) remove(item.id);
-        if (controllerRef.current?.textInput.value === text) controllerRef.current.textInput.clear();
-        const sentSources = new Set(referencedSources.map((item) => item.id));
-        setReferencedSources((current) => current.filter((item) => !sentSources.has(item.id)));
+        if (typeof owner === "string" && owner !== submittedKey) adopt(submittedKey, owner);
       } catch {
         // 发送者显示失败原因；原附件保留供重试，不清除后来输入的内容。
       } finally {
         submittingRef.current = false;
+        submittedRef.current = [];
         setSubmittedFileIds([]);
       }
     },
-    [usingProvider, controller, files, referencedSources, onSubmit, remove]
+    [files, onSubmit, remove, adopt, attachmentKey]
   );
 
-  // Render with or without local provider
-  const inner = (
-    <>
+  return (
+    <LocalAttachmentsContext.Provider value={attachmentsCtx}>
       <input
-        accept={accept}
-        aria-label="Upload files"
+        aria-label="选择要上传的文件"
         className="hidden"
         multiple={multiple}
         onChange={handleChange}
         ref={inputRef}
-        title="Upload files"
+        title="选择要上传的文件"
         type="file"
       />
       <form
@@ -881,19 +308,6 @@ export const PromptInput = ({
       >
         <InputGroup className="overflow-hidden">{children}</InputGroup>
       </form>
-    </>
-  );
-
-  const withReferencedSources = (
-    <LocalReferencedSourcesContext.Provider value={refsCtx}>
-      {inner}
-    </LocalReferencedSourcesContext.Provider>
-  );
-
-  // Always provide LocalAttachmentsContext so children get validated add function
-  return (
-    <LocalAttachmentsContext.Provider value={attachmentsCtx}>
-      {withReferencedSources}
     </LocalAttachmentsContext.Provider>
   );
 };
@@ -909,22 +323,32 @@ export const PromptInputBody = ({
 
 export type PromptInputTextareaProps = ComponentProps<
   typeof InputGroupTextarea
->;
+> & {
+  /** 粘贴的纯文本达到这个 UTF-8 字节数就转成附件（按住 Shift 粘贴照常插入）。 */
+  pasteAsFile?: { bytes: number; filename: string; onConverted?: (lines: number) => void };
+};
+
+// 外接键盘的平板会报告精细指针或悬停能力，此时仍按回车发送。
+export const touchOnly = () => window.matchMedia("(hover: none) and (pointer: coarse)").matches;
 
 export const PromptInputTextarea = ({
-  onChange,
   onKeyDown,
+  onKeyUp,
+  onBlur,
   className,
   placeholder = "What would you like to know?",
+  pasteAsFile,
   ...props
 }: PromptInputTextareaProps) => {
-  const controller = useOptionalPromptInputController();
+  // 粘贴事件不带修饰键：只在按下 Shift+V 时记下，紧随其后的粘贴照常插入；松键、失焦即清掉，菜单粘贴不受影响。
+  const shiftHeld = useRef(false);
   const attachments = usePromptInputAttachments();
   const [isComposing, setIsComposing] = useState(false);
 
   const handleKeyDown: KeyboardEventHandler<HTMLTextAreaElement> = useCallback(
     (e) => {
       // Call the external onKeyDown handler first
+      shiftHeld.current = e.shiftKey && e.code === "KeyV";
       onKeyDown?.(e);
 
       // If the external handler prevented default, don't run internal logic
@@ -933,10 +357,12 @@ export const PromptInputTextarea = ({
       }
 
       if (e.key === "Enter") {
-        if (isComposing || e.nativeEvent.isComposing) {
+        // Safari 在 compositionend 之后才派发确认候选词的回车，isComposing 已为 false，只剩 keyCode 229 可辨认。
+        if (isComposing || e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) {
           return;
         }
-        if (e.shiftKey) {
+        // 纯触屏（无悬停、粗指针）上回车换行，发送交给按钮；与移动端聊天应用的手感一致。
+        if (e.shiftKey || touchOnly()) {
           return;
         }
         e.preventDefault();
@@ -976,40 +402,30 @@ export const PromptInputTextarea = ({
       if (!items) {
         return;
       }
-
-      const files: File[] = [];
-
-      for (const item of Array.from(items)) {
-        if (item.kind === "file") {
-          const file = item.getAsFile();
-          if (file) {
-            files.push(file);
-          }
-        }
-      }
-
-      if (files.length > 0) {
+      // 1. 先分出真正的文件：Office 类来源同时带文本、HTML 与一张渲染图，那张图只是文字的替代渲染。
+      const text = event.clipboardData.getData("text/plain");
+      const pasted = Array.from(items, (item) => item.kind === "file" ? item.getAsFile() : null).filter((file): file is File => file !== null);
+      const rendering = Boolean(text) && event.clipboardData.types.includes("text/html")
+        && pasted.length === 1 && pasted[0].type.startsWith("image/");
+      const files = rendering ? [] : pasted;
+      // 2. 长文本转附件（Desktop 同样在 4KB 处转换），与同时粘贴的文件一起入列；一个都没接纳就照常插入文字。
+      if (pasteAsFile && text && !shiftHeld.current && new Blob([text]).size >= pasteAsFile.bytes) {
+        const accepted = attachments.add([new File([text], pasteAsFile.filename, { type: "text/plain" }), ...files]);
+        if (!accepted) return;
         event.preventDefault();
-        attachments.add(files);
+        pasteAsFile.onConverted?.(text.split("\n").length);
+        return;
+      }
+      // 3. 普通粘贴里的文件入列；没有接纳时不拦文字。
+      if (files.length > 0 && attachments.add(files) > 0) {
+        event.preventDefault();
       }
     },
-    [attachments]
+    [attachments, pasteAsFile]
   );
 
   const handleCompositionEnd = useCallback(() => setIsComposing(false), []);
   const handleCompositionStart = useCallback(() => setIsComposing(true), []);
-
-  const controlledProps = controller
-    ? {
-        onChange: (e: ChangeEvent<HTMLTextAreaElement>) => {
-          controller.textInput.setInput(e.currentTarget.value);
-          onChange?.(e);
-        },
-        value: controller.textInput.value,
-      }
-    : {
-        onChange,
-      };
 
   return (
     <InputGroupTextarea
@@ -1018,29 +434,21 @@ export const PromptInputTextarea = ({
       onCompositionEnd={handleCompositionEnd}
       onCompositionStart={handleCompositionStart}
       onKeyDown={handleKeyDown}
+      onKeyUp={(event) => {
+        shiftHeld.current = false;
+        onKeyUp?.(event);
+      }}
+      onBlur={(event) => {
+        shiftHeld.current = false;
+        onBlur?.(event);
+      }}
       onPaste={handlePaste}
       placeholder={placeholder}
+      enterKeyHint={touchOnly() ? "enter" : "send"}
       {...props}
-      {...controlledProps}
     />
   );
 };
-
-export type PromptInputHeaderProps = Omit<
-  ComponentProps<typeof InputGroupAddon>,
-  "align"
->;
-
-export const PromptInputHeader = ({
-  className,
-  ...props
-}: PromptInputHeaderProps) => (
-  <InputGroupAddon
-    align="block-end"
-    className={cn("order-first flex-wrap gap-1", className)}
-    {...props}
-  />
-);
 
 export type PromptInputFooterProps = Omit<
   ComponentProps<typeof InputGroupAddon>,
@@ -1137,299 +545,3 @@ export const PromptInputButton = ({
     </Tooltip>
   );
 };
-
-export type PromptInputActionMenuProps = ComponentProps<typeof DropdownMenu>;
-export const PromptInputActionMenu = (props: PromptInputActionMenuProps) => (
-  <DropdownMenu {...props} />
-);
-
-export type PromptInputActionMenuTriggerProps = PromptInputButtonProps;
-
-export const PromptInputActionMenuTrigger = ({
-  className,
-  children,
-  ...props
-}: PromptInputActionMenuTriggerProps) => (
-  <DropdownMenuTrigger asChild>
-    <PromptInputButton className={className} {...props}>
-      {children ?? <PlusIcon className="size-4" />}
-    </PromptInputButton>
-  </DropdownMenuTrigger>
-);
-
-export type PromptInputActionMenuContentProps = ComponentProps<
-  typeof DropdownMenuContent
->;
-export const PromptInputActionMenuContent = ({
-  className,
-  ...props
-}: PromptInputActionMenuContentProps) => (
-  <DropdownMenuContent align="start" className={cn(className)} {...props} />
-);
-
-export type PromptInputActionMenuItemProps = ComponentProps<
-  typeof DropdownMenuItem
->;
-export const PromptInputActionMenuItem = ({
-  className,
-  ...props
-}: PromptInputActionMenuItemProps) => (
-  <DropdownMenuItem className={cn(className)} {...props} />
-);
-
-// Note: Actions that perform side-effects (like opening a file dialog)
-// are provided in opt-in modules (e.g., prompt-input-attachments).
-
-export type PromptInputSubmitProps = ComponentProps<typeof InputGroupButton> & {
-  status?: ChatStatus;
-  onStop?: () => void;
-};
-
-export const PromptInputSubmit = ({
-  className,
-  variant = "default",
-  size = "icon-sm",
-  status,
-  onStop,
-  onClick,
-  children,
-  ...props
-}: PromptInputSubmitProps) => {
-  const isGenerating = status === "submitted" || status === "streaming";
-
-  let Icon = <CornerDownLeftIcon className="size-4" />;
-
-  if (status === "submitted") {
-    Icon = <Spinner />;
-  } else if (status === "streaming") {
-    Icon = <SquareIcon className="size-4" />;
-  } else if (status === "error") {
-    Icon = <XIcon className="size-4" />;
-  }
-
-  const handleClick = useCallback(
-    (e: React.MouseEvent<HTMLButtonElement>) => {
-      if (isGenerating && onStop) {
-        e.preventDefault();
-        onStop();
-        return;
-      }
-      onClick?.(e);
-    },
-    [isGenerating, onStop, onClick]
-  );
-
-  return (
-    <InputGroupButton
-      aria-label={isGenerating ? "Stop" : "Submit"}
-      className={cn(className)}
-      onClick={handleClick}
-      size={size}
-      type={isGenerating && onStop ? "button" : "submit"}
-      variant={variant}
-      {...props}
-    >
-      {children ?? Icon}
-    </InputGroupButton>
-  );
-};
-
-export type PromptInputSelectProps = ComponentProps<typeof Select>;
-
-export const PromptInputSelect = (props: PromptInputSelectProps) => (
-  <Select {...props} />
-);
-
-export type PromptInputSelectTriggerProps = ComponentProps<
-  typeof SelectTrigger
->;
-
-export const PromptInputSelectTrigger = ({
-  className,
-  ...props
-}: PromptInputSelectTriggerProps) => (
-  <SelectTrigger
-    className={cn(
-      "border-none bg-transparent font-medium text-muted-foreground shadow-none transition-colors",
-      "hover:bg-accent hover:text-foreground aria-expanded:bg-accent aria-expanded:text-foreground",
-      className
-    )}
-    {...props}
-  />
-);
-
-export type PromptInputSelectContentProps = ComponentProps<
-  typeof SelectContent
->;
-
-export const PromptInputSelectContent = ({
-  className,
-  ...props
-}: PromptInputSelectContentProps) => (
-  <SelectContent className={cn(className)} {...props} />
-);
-
-export type PromptInputSelectItemProps = ComponentProps<typeof SelectItem>;
-
-export const PromptInputSelectItem = ({
-  className,
-  ...props
-}: PromptInputSelectItemProps) => (
-  <SelectItem className={cn(className)} {...props} />
-);
-
-export type PromptInputSelectValueProps = ComponentProps<typeof SelectValue>;
-
-export const PromptInputSelectValue = ({
-  className,
-  ...props
-}: PromptInputSelectValueProps) => (
-  <SelectValue className={cn(className)} {...props} />
-);
-
-export type PromptInputHoverCardProps = ComponentProps<typeof HoverCard>;
-
-export const PromptInputHoverCard = ({
-  openDelay = 0,
-  closeDelay = 0,
-  ...props
-}: PromptInputHoverCardProps) => (
-  <HoverCard closeDelay={closeDelay} openDelay={openDelay} {...props} />
-);
-
-export type PromptInputHoverCardTriggerProps = ComponentProps<
-  typeof HoverCardTrigger
->;
-
-export const PromptInputHoverCardTrigger = (
-  props: PromptInputHoverCardTriggerProps
-) => <HoverCardTrigger {...props} />;
-
-export type PromptInputHoverCardContentProps = ComponentProps<
-  typeof HoverCardContent
->;
-
-export const PromptInputHoverCardContent = ({
-  align = "start",
-  ...props
-}: PromptInputHoverCardContentProps) => (
-  <HoverCardContent align={align} {...props} />
-);
-
-export type PromptInputTabsListProps = HTMLAttributes<HTMLDivElement>;
-
-export const PromptInputTabsList = ({
-  className,
-  ...props
-}: PromptInputTabsListProps) => <div className={cn(className)} {...props} />;
-
-export type PromptInputTabProps = HTMLAttributes<HTMLDivElement>;
-
-export const PromptInputTab = ({
-  className,
-  ...props
-}: PromptInputTabProps) => <div className={cn(className)} {...props} />;
-
-export type PromptInputTabLabelProps = HTMLAttributes<HTMLHeadingElement>;
-
-export const PromptInputTabLabel = ({
-  className,
-  ...props
-}: PromptInputTabLabelProps) => (
-  // Content provided via children in props
-  // oxlint-disable-next-line eslint-plugin-jsx-a11y(heading-has-content)
-  <h3
-    className={cn(
-      "mb-2 px-3 font-medium text-muted-foreground text-xs",
-      className
-    )}
-    {...props}
-  />
-);
-
-export type PromptInputTabBodyProps = HTMLAttributes<HTMLDivElement>;
-
-export const PromptInputTabBody = ({
-  className,
-  ...props
-}: PromptInputTabBodyProps) => (
-  <div className={cn("space-y-1", className)} {...props} />
-);
-
-export type PromptInputTabItemProps = HTMLAttributes<HTMLDivElement>;
-
-export const PromptInputTabItem = ({
-  className,
-  ...props
-}: PromptInputTabItemProps) => (
-  <div
-    className={cn(
-      "flex items-center gap-2 px-3 py-2 text-xs hover:bg-accent",
-      className
-    )}
-    {...props}
-  />
-);
-
-export type PromptInputCommandProps = ComponentProps<typeof Command>;
-
-export const PromptInputCommand = ({
-  className,
-  ...props
-}: PromptInputCommandProps) => <Command className={cn(className)} {...props} />;
-
-export type PromptInputCommandInputProps = ComponentProps<typeof CommandInput>;
-
-export const PromptInputCommandInput = ({
-  className,
-  ...props
-}: PromptInputCommandInputProps) => (
-  <CommandInput className={cn(className)} {...props} />
-);
-
-export type PromptInputCommandListProps = ComponentProps<typeof CommandList>;
-
-export const PromptInputCommandList = ({
-  className,
-  ...props
-}: PromptInputCommandListProps) => (
-  <CommandList className={cn(className)} {...props} />
-);
-
-export type PromptInputCommandEmptyProps = ComponentProps<typeof CommandEmpty>;
-
-export const PromptInputCommandEmpty = ({
-  className,
-  ...props
-}: PromptInputCommandEmptyProps) => (
-  <CommandEmpty className={cn(className)} {...props} />
-);
-
-export type PromptInputCommandGroupProps = ComponentProps<typeof CommandGroup>;
-
-export const PromptInputCommandGroup = ({
-  className,
-  ...props
-}: PromptInputCommandGroupProps) => (
-  <CommandGroup className={cn(className)} {...props} />
-);
-
-export type PromptInputCommandItemProps = ComponentProps<typeof CommandItem>;
-
-export const PromptInputCommandItem = ({
-  className,
-  ...props
-}: PromptInputCommandItemProps) => (
-  <CommandItem className={cn(className)} {...props} />
-);
-
-export type PromptInputCommandSeparatorProps = ComponentProps<
-  typeof CommandSeparator
->;
-
-export const PromptInputCommandSeparator = ({
-  className,
-  ...props
-}: PromptInputCommandSeparatorProps) => (
-  <CommandSeparator className={cn(className)} {...props} />
-);

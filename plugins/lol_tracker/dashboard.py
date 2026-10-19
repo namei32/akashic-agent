@@ -3,7 +3,7 @@ from datetime import UTC, datetime, timedelta
 from fastapi import HTTPException, Query
 from pydantic import BaseModel, Field
 
-from agent.plugin_contracts.configuration import register_routes
+from plugins.ui.contract import register_routes
 
 from .settings import RUNTIME, SETTINGS
 

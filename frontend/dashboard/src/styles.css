@@ -87,7 +87,7 @@ body {
   inset: 12px 12px auto auto;
   padding: 10px 14px;
   border: 1px solid var(--ak-rule-default);
-  border-radius: 10px;
+  border-radius: 12px;
   color: var(--ak-ink-primary);
   background: var(--ak-paper-raised);
 }
@@ -117,6 +117,13 @@ body {
   font-weight: 500;
 }
 
+/* 触控输入下开关可点区域不小于 44px（design.md 3.5）。 */
+@media (pointer: coarse) {
+  .unified-shell .conversation-page.has-tools .conversation-tools-toggle {
+    min-block-size: 44px;
+  }
+}
+
 .unified-shell .conversation-tools {
   box-sizing: border-box;
   border-inline-start: 1px solid var(--ak-rule-subtle);
@@ -130,11 +137,7 @@ body {
   padding-inline: 12px 8px;
 }
 
-.unified-shell .conversation-tools-content {
-  block-size: calc(100% - 52px);
-}
-
 .unified-shell .conversation-tool-panel {
-  /* 内容容器已经扣掉工具栏，面板本身不应再扣一次。 */
+  /* 工具区是“顶栏 + 1fr”网格，内容行已经扣掉顶栏，这里不再扣。 */
   block-size: 100%;
 }

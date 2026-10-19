@@ -4,11 +4,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from agent.plugin_contracts import ContentPart
-from agent.plugin_contracts.content import (
+from plugins.ledger.contract import ContentPart
+from plugins.content.contract import (
     CONTENT as CONTENT,
 )
-from agent.plugin_contracts.delivery import (
+from plugins.delivery.contract import (
     DELIVERY_GUARDED_START as DELIVERY,
     DELIVERY_SENDERS as DELIVERY_SENDERS,
     GuardedDeliveries as Deliveries,
@@ -17,8 +17,16 @@ from agent.plugin_contracts.delivery import (
     Selection as Selection,
     Senders as Senders,
 )
-from agent.plugin_contracts.tools import (
+from plugins.delivery_policy.contract import (
+    INPUT_ORIGIN as INPUT_ORIGIN,
+)
+from plugins.conversation.contract import (
+    CONVERSATION_COMPLETE_V2 as CONVERSATION_COMPLETE,
+)
+from plugins.tools.contract import (
     ALL_TOOLS as ALL_TOOLS,
+    CallSource as CallSource,
+    TOOL_LOADING_PRESENTATION as TOOL_LOADING_PRESENTATION,
     TOOLS as TOOLS,
     ToolCatalog as ToolCatalog,
     ToolRef as ToolRef,

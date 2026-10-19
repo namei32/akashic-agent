@@ -88,19 +88,6 @@ def prune_screenshots(screenshot_dir: Path, *, keep: Path) -> None:
         path.unlink()
 
 
-def screenshot_result(raw: bytes, media_type: str) -> dict[str, list[dict[str, str]]]:
-    """Return a file reference that both text and multimodal agents can consume."""
-
-    path = save_screenshot(raw, media_type)
-    value = {
-        "kind": "screenshot_file",
-        "path": path,
-        "mime_type": media_type,
-        "next": "Call read_file with this path to inspect the screenshot.",
-    }
-    return {"content": [{"type": "text", "text": json.dumps(value)}]}
-
-
 def reply(message: dict[str, Any]) -> dict[str, object] | None:
     """Handle one MCP JSON-RPC message."""
 
@@ -134,11 +121,10 @@ def driver_content(value: dict[str, Any]) -> dict[str, object]:
     content = []
     for item in value["content"]:
         if item.get("type") == "image":
-            content.extend(
-                screenshot_result(
-                    base64.b64decode(item["data"], validate=True), item["mimeType"]
-                )["content"]
-            )
+            path = save_screenshot(base64.b64decode(item["data"], validate=True), item["mimeType"])
+            content.append({"type": "text", "text": f"Screenshot: {path}"})
+            # 同一调用可能超过 32 张；附件导入使用原字节，不依赖可能被缓存淘汰的路径。
+            content.append(item)
         else:
             content.append(item)
     return {"content": content, "call_id": value["call_id"]}
@@ -247,12 +233,12 @@ async def serve() -> None:
         status.raise_for_status()
         info = status.json()
         if (
-            info.get("version") != 2
+            info.get("version") != 3
             or info.get("source") is not True
             or info.get("ready") is not True
         ):
             raise RuntimeError(
-                "Computer requires the v2 source driver image; publish it and update the plugin image digest"
+                "Computer requires the v3 on-demand driver image; publish it and update the plugin image digest"
             )
     data_root = os.environ.get("AKA_PLUGIN_DATA_DIR") or os.environ.get(
         "AKASHIC_PLUGIN_DATA_DIR"

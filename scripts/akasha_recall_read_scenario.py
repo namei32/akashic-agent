@@ -28,13 +28,14 @@ args.source = args.source.resolve()
 if args.output.exists():
     parser.error('--output must not already exist')
 sys.path.insert(0, str(args.source))
-from agent.plugin_composition import PluginUiRpcInvalidRequest
-from agent.plugin_contracts import CallRef, ContentPart, ContentReferences, Control, Input, Output, ToolCall, ToolResult
-from agent.plugin_contracts.tools import durable_call_key
-import session.log as storage
-from session.log import MessageLog
+from plugins.ui.contract import PluginUiRpcInvalidRequest
+from plugins.ledger.contract import CallRef, ContentPart, ContentReferences, Control, Input, Output, ToolCall, ToolResult
+from plugins.tools.contract import durable_call_key
+import plugins.ledger.log as storage
+from plugins.ledger.log import MessageLog
 from plugins.akasha.inspector import RecallInspector
-from plugins.akasha.recalls import ContextSource, Hit, ProgramSource, Recall, RecallRecords, ToolSource, context_identity
+from plugins.akasha.contract import ContextSource, Hit, ProgramSource, Recall, ToolSource
+from plugins.akasha.recalls import RecallRecords, context_identity
 from plugins.turn_projection.plugin import TurnProjection
 BASE = args.baseline_ref
 old_module = None

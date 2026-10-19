@@ -12,14 +12,14 @@ from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from typing import Any, ContextManager, Literal, TypeVar, cast
 
-from agent.plugin_composition.channel_io import (
+from plugins.ledger.contract import (
     CHANNEL_ATTACHMENT_IMPORT,
     CHANNEL_ATTACHMENT_READ,
     CHANNEL_IDENTITY,
     INPUT_CUSTODY,
     InputCustody,
 )
-from agent.plugin_composition.channels import (
+from plugins.channels.contract import (
     CHANNEL_INPUT_V2 as CHANNEL_INPUT,
     CHANNELS,
     DURABLE_HANDOFF_ID,
@@ -34,6 +34,8 @@ from agent.plugin_composition.channels import (
     ChannelCapability,
     ChannelCleanupFailure,
     ChannelDefinition,
+    ChannelInboundMessage,
+    JsonValue,
     ChannelDeliveryReceipt,
     ChannelFactoryContext,
     ChannelPresentationPorts,
@@ -83,6 +85,35 @@ class _ChannelStopReceiptFailure(RuntimeError):
         super().__init__("channel adapter.stop 报告资源未完整关闭")
         self.receipt = receipt
         self.failures = failures
+
+
+@dataclass(slots=True)
+class _InboundEnvelope:
+    message_id: str
+    session_key: str
+    message: ChannelInboundMessage
+    lease: ChannelBindingLease
+    closed: bool = False
+
+    @property
+    def metadata(self) -> Mapping[str, JsonValue]:
+        return self.message.metadata
+
+    async def close(self) -> None:
+        """原 lease 完成释放后才发布关闭状态，保留调用方取消。"""
+        if self.closed:
+            return
+        task = asyncio.create_task(self.lease.aclose())
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+        task.result()
+        self.closed = True
+        if cancelled:
+            raise asyncio.CancelledError
 
 
 @dataclass
@@ -1022,15 +1053,17 @@ class PluginChannels:
             )
             await self._start_binding(key)
 
+            started_key = key
             async def open_when_ready() -> None:
                 try:
                     async with ctx.runtime_scope():
-                        state = self._binding(key)
+                        state = self._binding(started_key)
                         if state.plugin_context is not ctx or state.activation_token is not ctx.fiber.activation_token:
                             raise RuntimeError("Channel ready 属于已替换 activation")
-                        self._open_admission(key)
+                        self._open_admission(started_key)
+                        await self._input_custody.recover_durable_inbounds(self.recover_inbound)
                 except BaseException as error:
-                    state = self._bindings.get(key)
+                    state = self._bindings.get(started_key)
                     if state is not None and state.plugin_context is ctx:
                         ctx.report_incident("CHANNEL_OPEN_FAILED", str(error) or type(error).__name__)
                     raise
@@ -1608,12 +1641,9 @@ class PluginChannels:
                     if identity_task.done() and not identity_task.cancelled():
                         identity_receipt = identity_task.result()
                     raise
-            envelope = InboundEnvelope(
+            envelope = _InboundEnvelope(
                 message_id=raw.message_id,
                 session_key=session_key,
-                snapshot_id=binding.snapshot_id,
-                generation_id=binding.generation_id,
-                binding_token=binding.binding_token,
                 message=raw.message,
                 lease=binding,
             )

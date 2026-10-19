@@ -7,10 +7,12 @@ from contextlib import AbstractContextManager, AsyncExitStack, nullcontext
 from typing import cast
 
 from agent.plugin_composition.tasks import Task, TaskAdmission, TaskSlot
-from agent.plugin_composition.messages import MessageCatalog, MessageReader, MessageWriter, OwnerRecord
-from agent.plugin_contracts.delivery import StartGuard
+from plugins.ledger.contract import MessageCatalog, MessageReader, MessageWriter, OwnerRecord
+from plugins.delivery.contract import (
+    StartGuard,
+)
 from core.common.file_io import run_file_io
-from agent.plugin_contracts import Body, Message
+from plugins.ledger.contract import Body, Message
 
 from .api import OpenSender, Receipt, Sink
 from .records import Delivery, DeliveryRecords, Selection, delivery_key
@@ -42,6 +44,13 @@ class Deliveries:
                             sinks: tuple[Sink | Mapping[str, object], ...] | None, *, passive: bool = False) -> Selection | None:
         selected = await self._records.consume_async(reader, message, sinks, passive=passive)
         return selected if selected is not None and selected.recovery_owner == self._records.recovery_owner else None
+
+    async def consume_batch_async(self, reader: MessageReader,
+                                  items: tuple[tuple[Message, tuple[Sink | Mapping[str, object], ...] | None], ...],
+                                  *, passive: bool = False) -> tuple[Selection | None, ...]:
+        selected = await self._records.consume_batch_async(reader, items, passive=passive)
+        owner = self._records.recovery_owner
+        return tuple(item if item is not None and item.recovery_owner == owner else None for item in selected)
 
     async def add_async(self, message_id: str, sink: Sink | Mapping[str, object]) -> None:
         await self._records.add_async(message_id, sink)

@@ -8,12 +8,12 @@ from importlib import import_module
 from pydantic import BaseModel, Field
 
 from agent.plugin_composition import RUNTIME_STARTED, RUNTIME_STOPPING, Context
-from agent.plugin_composition.models import CHAT_MODELS
+from plugins.models.contract import CHAT_MODELS
 from agent.plugin_composition.plugin_config import PLUGIN_CONFIG
-from agent.plugin_composition.ui import UI
-from agent.plugin_contracts import ContentPart
-from agent.plugin_contracts.proactive import EVENTMAIL_ALERT_SOURCE
-from agent.plugin_contracts.tools import TOOLS, Result
+from plugins.ui.contract import UI
+from plugins.ledger.contract import ContentPart
+from plugins.eventmail.contract import EVENTMAIL_ALERT_SOURCE
+from plugins.tools.contract import TOOLS, Result
 from core.common.file_io import run_file_io
 
 from .config import Config

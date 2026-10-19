@@ -12,9 +12,9 @@ import time
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from agent.plugin_composition.models import LLMResponse
-from session.log import MessageLog, MessageWriter, WriterExpired
-from session.message import Input, Output
+from plugins.models.contract import LLMResponse
+from plugins.ledger.log import MessageLog, MessageWriter, WriterExpired
+from plugins.ledger.contract import Input, Output
 from tests.support.message_react import runtime
 
 

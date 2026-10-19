@@ -1,4 +1,5 @@
 import type {
+  WebChildRenderOptions,
   WebEntry,
   WebEntryView,
   WebHostContextV1,
@@ -90,7 +91,7 @@ class BrowserCatalogSession implements WebHostSession {
     });
   }
 
-  async checkCurrent(): Promise<"current" | "updating" | "stale"> {
+  async checkCurrent(): Promise<"current" | "stale"> {
     this.requireOpen();
     const response = await fetch("/api/chat/web-ui/state", {
       headers: { Accept: "application/json" },
@@ -101,7 +102,7 @@ class BrowserCatalogSession implements WebHostSession {
     if (!isRecord(state)
       || typeof state.snapshotId !== "string"
       || typeof state.catalogId !== "string" || typeof state.updating !== "boolean") throw new Error("界面状态格式无效");
-    if (state.updating) return "updating";
+    // 当前 UI 目录由实际贡献方决定，管理操作进行中不使未变目录失效。
     if (state.snapshotId === this.bootstrap.snapshotId
       && state.catalogId === this.bootstrap.catalogId) return "current";
     this.markStale();
@@ -114,7 +115,7 @@ class BrowserCatalogSession implements WebHostSession {
       const notice = document.createElement("div");
       notice.className = "web-host-stale";
       notice.setAttribute("role", "status");
-      notice.textContent = "设置界面正在更新，已提交的操作会继续核对。";
+      notice.textContent = "界面配置已更新，稍后将自动刷新。进行中的操作不受影响。";
       document.body.prepend(notice);
       this.staleNotice = notice;
     }
@@ -477,7 +478,10 @@ class BrowserCatalogSession implements WebHostSession {
     );
   }
 
-  private renderEntry(mounted: MountedEntry, host: HTMLElement, props?: unknown): Disposer {
+  // 子挂载失败时通知父插件：props 里的回调是父插件给的，只有它能撤销。
+  private renderEntry(
+    mounted: MountedEntry, host: HTMLElement, props?: unknown, options?: WebChildRenderOptions,
+  ): Disposer {
     if (!mounted.entry.render) throw new Error(`entry ${mounted.entry.id} cannot be rendered`);
     const releaseStyle = installEntryStyle(mounted, host);
     const childIds = new Set(mounted.childMountIds);
@@ -499,11 +503,11 @@ class BrowserCatalogSession implements WebHostSession {
         const entries = this.sortedEntries(mount);
         return {
           entries: entries.map((item) => item.entry),
-          render: (entryId, target, childProps) => {
+          render: (entryId, target, childProps, options) => {
             const child = entries.find((item) => item.entry.id === entryId);
             if (!child) throw new Error(`entry is unavailable: ${mountId}:${entryId}`);
             target.replaceChildren();
-            return trackChildEffect(this.renderEntry(child, target, childProps));
+            return trackChildEffect(this.renderEntry(child, target, childProps, options));
           },
           style: (entryId, target) => {
             const child = entries.find((item) => item.entry.id === entryId);
@@ -527,6 +531,7 @@ class BrowserCatalogSession implements WebHostSession {
       error.textContent = `界面模块加载失败：${asError(reason).message}`;
       host.appendChild(error);
       pluginDispose = undefined;
+      options?.onError?.(asError(reason));
     }
     return once(() => {
       disposeReverse(childRenderEffects);
@@ -577,7 +582,8 @@ function activationOrder(modules: WebModulePayload[]): WebModulePayload[] {
   while (pending.size) {
     const ready = modules.filter((module) => pending.has(module) && module.requires.every((mountId) => {
       const dependency = provider.get(mountId);
-      return dependency === undefined || !pending.has(dependency);
+      // 模块先声明再使用自己的子挂载点，不构成跨模块依赖。
+      return dependency === module || dependency === undefined || !pending.has(dependency);
     }));
     if (!ready.length) throw new Error("Web UI mount dependencies contain a cycle");
     for (const module of ready) {
@@ -589,16 +595,22 @@ function activationOrder(modules: WebModulePayload[]): WebModulePayload[] {
 }
 
 export async function startWebHost(host: HTMLElement): Promise<WebHostSession> {
-  const runtime = await import("./design/runtime");
-  runtime.exposeRuntime();
+  const preloads = preloadHostModules();
+  // 运行时下载与目录读取彼此独立；插件执行仍等共享运行时发布完成。
+  const runtimeReady = import("./design/runtime").then((runtime) => runtime.exposeRuntime());
   const open = async (): Promise<BrowserCatalogSession> => {
-    const response = await fetch("/api/chat/web-ui/bootstrap", {headers: {Accept: "application/json"}, cache: "no-cache"});
+    const [, response] = await Promise.all([
+      runtimeReady,
+      fetch("/api/chat/web-ui/bootstrap", {headers: {Accept: "application/json"}, cache: "no-cache"}),
+    ]);
     if (!response.ok) throw new Error(`界面目录暂时不可用（${response.status}）`);
     const next = new BrowserCatalogSession(parseBootstrap(await response.json()));
     try { await next.activateModules(); return next; }
     catch (error) { next.close(); throw error; }
   };
-  let session = await open();
+  let session: BrowserCatalogSession;
+  try { session = await open(); }
+  finally { for (const link of preloads) link.remove(); }
   session.renderRoot(host);
   host.dataset.akashicCatalog = session.bootstrap.catalogId;
   let closed = false;
@@ -619,7 +631,6 @@ export async function startWebHost(host: HTMLElement): Promise<WebHostSession> {
     checking = true;
     try {
       const state = await session.checkCurrent();
-      if (state === "updating") { sawChange = true; show(attempts >= 60 ? "自动核对已结束；操作不因此取消。请点击重新核对查看实际结果。" : "配置仍在应用，原操作会继续核对。等待较久时可重新核对。"); return; }
       if (state === "current") { if (sawChange) { window.clearInterval(timer); notice.remove(); } return; }
       sawChange = true;
       const next = await open();
@@ -661,6 +672,21 @@ export async function startWebHost(host: HTMLElement): Promise<WebHostSession> {
     document.removeEventListener("visibilitychange", focus);
     session.close();
   })};
+}
+
+/** 提前下载 Host SDK；modulepreload 不执行读取共享 runtime 的模块正文。 */
+function preloadHostModules(): HTMLLinkElement[] {
+  // URL 只由页面的 import map 拥有，避免再维护一份 SDK 路径表。
+  const map = document.querySelector<HTMLScriptElement>('script[type="importmap"]');
+  if (!map) throw new Error("Web Host import map is missing");
+  const { imports } = JSON.parse(map.text) as { imports: Record<string, string> };
+  return Object.values(imports).map((href) => {
+    const link = document.createElement("link");
+    link.rel = "modulepreload";
+    link.href = href;
+    document.head.appendChild(link);
+    return link;
+  });
 }
 
 function parseBootstrap(value: unknown): WebUiBootstrap {

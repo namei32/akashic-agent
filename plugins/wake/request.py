@@ -7,9 +7,9 @@ from typing import Literal, Self
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 from agent.plugin_composition import ServiceKey
-from agent.plugin_composition.messages import MessageReader
+from plugins.ledger.contract import MessageReader
 from agent.plugin_composition.tasks import Task
-from agent.plugin_contracts import (
+from plugins.ledger.contract import (
     ContentPart,
     ContentReferences,
     Control,
@@ -174,4 +174,5 @@ def read_phase(messages: Sequence[Message], request: Request) -> tuple[Message, 
     raise ValueError("Wake 程序缺少已提交阶段输入")
 
 
+# 私有程序 binding：runtime.py 固定身份，source.py 恢复时经 Bindings.open 读取。
 WAKE_PROGRAM = ServiceKey[Callable[[Task, MessageReader, Request], Awaitable[Message]]]("wake.program.v1")

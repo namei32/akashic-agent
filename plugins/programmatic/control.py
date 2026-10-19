@@ -2,56 +2,28 @@ from __future__ import annotations
 
 from typing import cast
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel
 
-from agent.plugin_composition import Context, ServiceKey
-from agent.plugin_composition.control_frames import (
+from agent.plugin_composition import Context
+from plugins.gateway.contract import (
     CONTROL_FRAMES,
     FrameResolver,
     FrameRouteStage,
 )
-from agent.plugin_composition.messages import (
+from plugins.ledger.contract import (
     MESSAGE_CATALOG,
     SESSION_ADMISSION,
     MessageReader,
     SessionAttributes,
 )
-from agent.plugin_composition.rpc import RequestTransport, RpcMethod
-from agent.plugin_contracts import ContentPart, Input
-from agent.plugin_contracts.delivery import (
+from plugins.gateway.contract import RequestTransport, RpcMethod
+from plugins.ledger.contract import ContentPart, Input
+from plugins.delivery.contract import (
     FinalOutputTurn as FinalOutputTurn,
 )
 
+from .contract import (PROGRAMMATIC, SessionIdParams, AdmitParams, SendParams, PauseParams, ResumeParams, ResultParams)
 from .result import TURN_PROJECTION, TurnProjection, read_result, read_result_snapshot
-
-
-class SessionIdParams(BaseModel):
-    """程序调用在自己的 RPC 输入边界校验参数。"""
-    model_config = ConfigDict(extra="forbid", strict=True)
-    session_id: str = Field(min_length=1, max_length=512)
-
-
-class AdmitParams(SessionIdParams):
-    persist_memory: bool = False
-
-
-class SendParams(SessionIdParams):
-    message_id: str = Field(min_length=1, max_length=256)
-    text: str = Field(min_length=1, max_length=1_048_576)
-    model_id: str | None = Field(default=None, min_length=1, max_length=512)
-    reasoning_effort: str | None = Field(default=None, min_length=1, max_length=64)
-
-
-class PauseParams(SessionIdParams):
-    message_id: str = Field(min_length=1, max_length=256)
-
-
-class ResumeParams(PauseParams):
-    input_id: str = Field(min_length=1, max_length=256)
-
-
-class ResultParams(SessionIdParams):
-    input_id: str = Field(min_length=1, max_length=256)
 
 
 PARAMS: dict[str, type[BaseModel]] = {
@@ -92,6 +64,8 @@ class Programmatic:
         self.ctx = ctx
         self.call = ctx.entrypoint(self.call)
         self._frames = ctx.require(CONTROL_FRAMES)
+        # Session -> (已检查到的来源 head, 当时的 active input 集合)
+        self._settled: dict[str, tuple[int, frozenset[str]]] = {}
 
     def _resolver(self, session_id: str, input_id: str) -> FrameResolver:
         """Capture only the reader, pure projection and Input identity."""
@@ -105,6 +79,9 @@ class Programmatic:
             return
         input_ids = self._frames.active_input_ids(reader.session_id)
         if not input_ids:
+            _ = self._settled.pop(reader.session_id, None)
+            return
+        if not self._may_end(reader, source, frozenset(input_ids)):
             return
         projection = self.ctx.require(TURN_PROJECTION)
         # 1. 纯只读快照只解释已经提交的 Input，不消费连接状态。
@@ -129,9 +106,27 @@ class Programmatic:
         head, ended = await reader.read_async(read)
         if reader.head(source=source) != head:
             return
+        self._settled[reader.session_id] = (head, frozenset(input_ids))
         for input_id, status in ended:
             error = None if status == "complete" else RuntimeError(f"programmatic input 已结束: {status}")
             self._frames.settle_input(reader.session_id, input_id, error)
+
+    # Turn 只会因终态 Output 或 Control 结束；水位之后没有这两类消息时无需重读整个 Session。
+    def _may_end(self, reader: MessageReader, source: str, input_ids: frozenset[str]) -> bool:
+        head = reader.head(source=source)
+        previous = self._settled.get(reader.session_id)
+        if previous is None or previous[1] != input_ids:
+            return True
+        checked = previous[0]
+        if head <= checked:
+            return False
+        if reader.latest_finished_output_seq(source, after_seq=checked, through_seq=head) is not None:
+            return True
+        control = reader.latest_control(source, through_seq=head)
+        if control is not None and control.seq > checked:
+            return True
+        self._settled[reader.session_id] = (head, input_ids)
+        return False
 
     def _reserve_before_accept(
         self, session_id: str, input_id: str, transport: RequestTransport | None,
@@ -167,7 +162,10 @@ class Programmatic:
                     return identity
             raise ValueError("程序最终 Output 没有同连接 Input reservation")
         input_id = await reader.read_async(read)
-        await self._frames.wait_input(reader.session_id, input_id, ending)
+        try:
+            await self._frames.wait_input(reader.session_id, input_id, ending)
+        except LookupError as error:
+            raise ConnectionError("程序调用的最终 Output 连接已结束") from error
 
     async def call(
         self, method: str, params: BaseModel,
@@ -241,9 +239,6 @@ class Programmatic:
             raise AssertionError("未声明的程序调用方法: " + method)
         return {"version": 2, "session_id": message.session_id,
                 "message_id": message.message_id, "seq": message.seq}
-
-
-PROGRAMMATIC = ServiceKey[Programmatic]("programmatic.v1")
 
 
 def rpc_methods(programmatic: Programmatic) -> dict[str, RpcMethod]:

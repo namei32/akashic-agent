@@ -3,30 +3,33 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from collections.abc import Callable, Hashable, Mapping
+from collections.abc import Awaitable, Callable, Hashable, Mapping
 from typing import cast
 
 from agent.plugin_composition.tasks import Task, TaskAdmission, TaskSlot
 from agent.plugin_composition.tasks import ExternalRootPermit
-from agent.plugin_composition.messages import (
+from plugins.ledger.contract import (
     MessageConflict,
     OwnerRecord,
     OwnerStore,
     OwnerTransaction,
 )
-from agent.plugin_contracts import (
+from plugins.ledger.contract import (
     ContentPart,
     ToolResult,
-    freeze_json,
 )
-from agent.plugin_contracts import json_value
-from agent.plugin_contracts.tools import CommitAfter
+from core.common.frozen_json import freeze_json
+from plugins.ledger.contract import json_value
+from plugins.tools.contract import CallSource, CommitAfter
 from core.common.file_io import run_file_io
+from core.common.diagnostic_log import log_timing
+from functools import partial
 
 from .api import (
     Authorize, Denied, InvalidArguments, MessageReply, OpenTool, Outcome, Result,
-    coerce_result, durable_call_key,
+    coerce_result, durable_call_key, result_message_id,
 )
+from plugins.tools.contract import PROCESS_STARTED_AT
 
 
 class ToolExecution:
@@ -41,6 +44,7 @@ class ToolExecution:
         *,
         task_key: Hashable,
         child_permit: Callable[[], ExternalRootPermit] | None = None,
+        check_batch: Callable[[CallSource], str | None] | None = None,
     ):
         self._state = state
         self._tasks = tasks
@@ -48,6 +52,7 @@ class ToolExecution:
         self._authorize = authorize
         self._task_key = task_key
         self._child_permit = child_permit
+        self._check_batch = check_batch
 
     async def execute(
         self, key: str, binding_id: str, arguments: Mapping[str, object]
@@ -81,11 +86,20 @@ class ToolExecution:
         if not isinstance(arguments, Mapping):
             raise TypeError("工具参数必须是对象")
         arguments = cast(Mapping[str, object], freeze_json(arguments))
+        # 默认消息调用：ToolCall 即意图、ToolResult 即完成，不写阶段回执（ADR-0100）。
+        if reply is not None and reply.message_id == result_message_id(reply.call_ref):
+            return await self._execute_message(key, binding_id, arguments, reply, commit_after)
         fingerprint = _fingerprint(binding_id, arguments, reply)
+        committed: asyncio.Future[Result | None] = asyncio.get_running_loop().create_future()
+
+        def publish(result: Result | None) -> None:
+            if not committed.done():
+                committed.set_result(result)
 
         async def run(task: Task) -> Result:
             return await self._run(
                 task, key, binding_id, arguments, fingerprint, reply, commit_after,
+                on_commit=publish,
             )
 
         # 1. 不同插件 scope 共用获授的 Task key，热更不能把活调用当成崩溃。
@@ -93,31 +107,33 @@ class ToolExecution:
             current = slot.current
             if current is not None:
                 return current, False
-            record = await run_file_io(lambda: self._record(key, fingerprint))
-            if record is None:
-                if reply is not None:
-                    reply.check(self._state)
-                await self._save(key, None, {
-                    "version": 1, "request": fingerprint, "binding": binding_id,
-                    "reply_id": None if reply is None else reply.message_id,
-                    "phase": "requested", "arguments": arguments,
-                })
-            permit = None if self._child_permit is None else self._child_permit()
-            try:
-                started = slot.start(run)
-            except BaseException:
-                if permit is not None:
-                    permit.release()
-                raise
-            if permit is not None:
-                started.on_done(permit.release)
-            return started, True
+
+            def ensure_requested() -> None:
+                """回执读取与首存 requested 同一次 worker 往返；核对与 CAS 语义不变。"""
+                record = self._record(key, fingerprint)
+                if record is None:
+                    if reply is not None:
+                        reply.check(self._state)
+                    # 独立请求或自定义结果身份才有 ToolCall 之外的待保存事实。
+                    _ = self._state.transact(lambda transaction: transaction.save(
+                        key,
+                        {
+                            "version": 1, "request": fingerprint, "binding": binding_id,
+                            "reply_id": None if reply is None else reply.message_id,
+                            "phase": "requested", "arguments": arguments,
+                        },
+                        expected_version=None,
+                    ))
+
+            await run_file_io(ensure_requested)
+            return self._start_task(slot, run, publish), True
 
         task, owned = await self._tasks.admit_async((self._task_key, key), admit)
         try:
             result = (
                 cast(Result, await task.join()) if reply is None
-                else await self._wait_result(task, key, fingerprint, reply)
+                else await self._wait_result(task, key, fingerprint, reply,
+                                             committed=committed if owned else None)
             )
         except asyncio.CancelledError:
             if owned:
@@ -129,14 +145,179 @@ class ToolExecution:
             raise ValueError("同一工具 key 的 binding 或参数不一致")
         return result
 
+    def _start_task(
+        self,
+        slot: TaskSlot,
+        run: Callable[[Task], Awaitable[Result]],
+        publish: Callable[[Result | None], None],
+    ) -> Task:
+        """在已获授的空 slot 启动工作，许可随真实 Task 排空释放。"""
+        permit = None if self._child_permit is None else self._child_permit()
+        try:
+            started = slot.start(run)
+        except BaseException:
+            if permit is not None:
+                permit.release()
+            raise
+        # 撤权和入口失败都能唤醒调用者；普通结果只由提交 owner 交付。
+        started.on_close(lambda: publish(None))
+        started.on_done(lambda: publish(None))
+        if permit is not None:
+            started.on_done(permit.release)
+        return started
+
+    # 消息调用的准入与等待：同一 key 只有一个进程内 Task，结果由提交者交付。
+    async def _execute_message(
+        self, key: str, binding_id: str, arguments: Mapping[str, object],
+        reply: MessageReply, commit_after: CommitAfter | None,
+    ) -> Result:
+        committed: asyncio.Future[Result | None] = asyncio.get_running_loop().create_future()
+
+        def publish(result: Result | None) -> None:
+            if not committed.done():
+                committed.set_result(result)
+
+        async def run(task: Task) -> Result:
+            return await self._run_message(task, key, binding_id, arguments, reply, commit_after, publish)
+
+        async def admit(slot: TaskSlot) -> tuple[Task, bool]:
+            if slot.current is not None:
+                return slot.current, False
+            return self._start_task(slot, run, publish), True
+
+        task, owned = await self._tasks.admit_async((self._task_key, key), admit)
+        try:
+            if not owned:
+                return cast(Result, await task.join())
+            result = await committed
+            # 原始异常不能被先提交的 error 结果盖住。
+            if result is None or result.outcome == "error" or task.done:
+                return cast(Result, await task.join())
+            return result
+        except asyncio.CancelledError:
+            if owned:
+                task.cancel()
+                await _drain(task)
+            raise
+
+    # 消息调用正文：已有结果直接复用；上个进程留下的未结调用不重跑，记为结果未知。
+    async def _run_message(
+        self, task: Task, key: str, binding_id: str, arguments: Mapping[str, object],
+        reply: MessageReply, commit_after: CommitAfter | None, publish: Callable[[Result], None],
+    ) -> Result:
+        mark = partial(log_timing, operation_id=key, session_id=reply.reader.session_id,
+                       parent_operation_id=reply.call_ref.message_id)
+        mark("tool.task.begin")
+
+        async def commit(result: Result) -> Result:
+            mark("tool.commit.wait")
+            if commit_after is not None:
+                await commit_after.wait()
+            mark("tool.commit.begin")
+            finished = await commit_message(self._state, reply, result, on_commit=publish)
+            mark("tool.committed")
+            return finished
+
+        try:
+            return await self._settle_message(task, key, binding_id, arguments, reply, commit, mark)
+        except MessageConflict:
+            # 放弃可能先提交终态；只采用已经提交的结果。
+            existing = await run_file_io(lambda: existing_result(reply))
+            if existing is None:
+                raise
+            return existing
+
+    async def _settle_message(
+        self, task: Task, key: str, binding_id: str, arguments: Mapping[str, object],
+        reply: MessageReply, commit: Callable[[Result], Awaitable[Result]], mark: Callable[[str], None],
+    ) -> Result:
+        existing = existing_result(reply)
+        if existing is not None:
+            return existing
+        call = reply.reader.get(reply.call_ref.message_id)
+        if call is None:
+            raise ValueError("工具调用消息缺失")
+        reply.check(self._state)
+        source = None
+        if self._check_batch is not None:
+            source = reply.source()
+            refusal = self._check_batch(source)
+            if refusal is not None:
+                return await commit(Result("denied", (ContentPart("text", refusal),)))
+        if call.recorded_at < PROCESS_STARTED_AT:
+            return await commit(Result("error", (ContentPart("text", _UNKNOWN_OUTCOME),)))
+        try:
+            return await commit(await self._invoke_message(task, key, binding_id, arguments, reply, source, mark))
+        except _Failed as failure:
+            try:
+                _ = await commit(failure.result)
+            except Exception as record_failure:
+                raise failure.original from record_failure
+            raise failure.original from None
+
+    # 打开工具、准备参数、授权并执行；准备或授权失败返回结果，执行异常包装后由调用者提交。
+    async def _invoke_message(
+        self, task: Task, key: str, binding_id: str, arguments: Mapping[str, object],
+        reply: MessageReply, source: CallSource | None, mark: Callable[[str], None],
+    ) -> Result:
+        async with self._open_tool(binding_id) as tool:
+            if not task.active:
+                raise asyncio.CancelledError
+            mark("tool.prepare.begin")
+            try:
+                prepared = await tool.prepare(arguments, reply.source() if source is None else source)
+            except InvalidArguments as error:
+                return Result("error", (ContentPart("text", str(error)),))
+            mark("tool.prepare.end")
+            if isinstance(prepared, str):
+                return Result("error", (ContentPart("text", prepared),))
+            final = freeze_json(prepared)
+            if not isinstance(final, Mapping):
+                raise TypeError("工具 prepare 必须返回参数对象")
+            final_arguments = cast(Mapping[str, object], final)
+            try:
+                permission = await self._authorize(binding_id, final_arguments)
+            except Denied as error:
+                return Result("denied", (ContentPart("text", str(error)),))
+            if isinstance(permission, str):
+                return Result("denied", (ContentPart("text", permission),))
+            if not task.active:
+                raise asyncio.CancelledError
+            # 来源提交权在启动前核对；之后的放弃由 abandon 结算并取消本 Task。
+            with reply.reader.read_snapshot():
+                reply.check(self._state)
+                try:
+                    reply.check_start(None)
+                except Denied as error:
+                    return Result("denied", (ContentPart("text", str(error)),))
+            try:
+                mark("tool.invoke.begin")
+                result = coerce_result(await tool.invoke(key, final_arguments))
+                mark("tool.invoke.end")
+                return result
+            except BaseException as failure:
+                mark("tool.invoke.failed")
+                raise _Failed(_invocation_failure(failure), failure) from failure
+
     async def settle_abandoned(self, reply: MessageReply) -> Result:
         """放弃调用的窄幂等结算入口；ReAct 与后台 watcher 共用同一回执。"""
         from .abandon import abandon_call
 
         return await abandon_call(self._state, self._tasks, reply, task_key=self._task_key)
 
-    async def _wait_result(self, task: Task, key: str, fingerprint: str, reply: MessageReply) -> Result:
+    async def _wait_result(
+        self, task: Task, key: str, fingerprint: str, reply: MessageReply, *,
+        committed: asyncio.Future[Result | None] | None = None,
+    ) -> Result:
         """持久终态提交即释放等待者；物理清理由原 Task 独立排空。"""
+        if committed is not None:
+            result = await committed
+            if result is not None:
+                # 原始异常不能被先提交的 error 回执盖住；已结束的任务也先取其异常。
+                if result.outcome == "error" or task.done:
+                    return cast(Result, await task.join())
+                return result
+
         async def recorded() -> Result:
             call = reply.reader.get(reply.call_ref.message_id)
             if call is None:
@@ -180,13 +361,27 @@ class ToolExecution:
         fingerprint: str,
         reply: MessageReply | None,
         commit_after: CommitAfter | None = None,
+        *,
+        on_commit: Callable[[Result], None] | None = None,
     ) -> Result:
         """恢复先查回执；最终授权后先落盘 start，再进入真实工具。"""
+        mark = partial(log_timing, operation_id=key,
+                       session_id="" if reply is None else reply.reader.session_id,
+                       parent_operation_id="" if reply is None else reply.call_ref.message_id)
+        mark("tool.task.begin")
         # 同批重叠调用只并发执行；结果提交仍等前驱完成。
         async def commit(record: OwnerRecord | None, result: Result) -> Result:
+            mark("tool.commit.wait")
             if commit_after is not None:
                 await commit_after.wait()
-            return await finish(self._state, key, record, result, reply)
+            mark("tool.commit.begin")
+            finished = await finish(self._state, key, record, result, reply, initial={
+                "version": 1, "request": fingerprint, "binding": binding_id,
+                "reply_id": None if reply is None else reply.message_id,
+                "arguments": arguments,
+            }, on_commit=on_commit)
+            mark("tool.committed")
+            return finished
 
         record = self._record(key, fingerprint)
         if record is not None:
@@ -200,16 +395,26 @@ class ToolExecution:
         try:
             if reply is not None:
                 reply.check(self._state)
-            if record is None:
-                raise RuntimeError("已接纳工具缺少 requested 回执")
+            if record is None and reply is None:
+                raise RuntimeError("独立工具调用缺少 requested 回执")
+            # source() 的前缀以调用消息序号为上界、不可变，同一调用内只取一次。
+            source = None
+            if reply is not None and self._check_batch is not None:
+                source = reply.source()
+                refusal = self._check_batch(source)
+                if refusal is not None:
+                    return await commit(record, Result("denied", (ContentPart("text", refusal),)))
             async with self._open_tool(binding_id) as tool:
                 if not task.active:
                     raise asyncio.CancelledError
                 # 2. prepare 的最终参数只固定一次，恢复不重新随机化或改写。
-                if record.value["phase"] == "requested":
-                    source = None if reply is None else reply.source()
+                if record is None or record.value["phase"] == "requested":
+                    if reply is not None and source is None:
+                        source = reply.source()
                     try:
+                        mark("tool.prepare.begin")
                         prepared = await tool.prepare(arguments, source)
+                        mark("tool.prepare.end")
                         if isinstance(prepared, str):
                             return await commit(
                                 record, Result("error", (ContentPart("text", prepared),)),
@@ -289,17 +494,15 @@ class ToolExecution:
                         (ContentPart("text", str(error)),),
                     ))
                 try:
+                    mark("tool.invoke.begin")
                     result = await tool.invoke(key, final_arguments)
+                    mark("tool.invoke.end")
                 except BaseException as failure:
-                    # start intent 已耐久；内部异常或取消都不能证明远端没有效果。
+                    mark("tool.invoke.failed")
+                    # start intent 已提交；内部异常或取消都不能证明远端没有效果。
+                    # 普通进程崩溃保留提交，宿主故障可能丢失 intent，保证边界见 ADR-0099。
                     try:
-                        _ = await commit(
-                            record,
-                            Result(
-                                "interrupted" if isinstance(failure, asyncio.CancelledError) else "error",
-                                (ContentPart("text", "工具调用取消，已执行的效果不会撤销。" if isinstance(failure, asyncio.CancelledError) else f"工具执行失败: {type(failure).__name__}；已执行的效果不会撤销。"),),
-                            ),
-                        )
+                        _ = await commit(record, _invocation_failure(failure))
                     except Exception as record_failure:
                         raise failure from record_failure
                     raise
@@ -366,25 +569,12 @@ async def finish(
         return (_read_result(current.value["result"]) if reply is None
                 else reply.read(current.value["result"]))
 
-    previous = await run_file_io(lambda: state.snapshot(completed))
-    if previous is not None:
-        if on_commit is not None:
-            on_commit(previous)
-        return previous
+    # 不再先做快照预读：首次完成的热路径上它是纯重复——commit 事务内对
+    # 「已 done」与「请求不一致」的核对相同；重放路径由 prepare 冲突或
+    # 事务内核对接管，结果与回执回调完全一致。
+    # 准备留在调用方 scope（评审 #1146）：ToolResult 的内容引用与 metadata
+    # owner 回调属于工具 owner 的原执行上下文，worker 只接收不可变结果。
     prepared = None
-    if reply is not None:
-        try:
-            prepared = await reply.writer.prepare_async(
-                reply.message_id, ToolResult(reply.call_ref, result.outcome, result.parts),
-            )
-        except MessageConflict:
-            # 放弃与真实结果竞争同一身份；只采用已经完成的权威回执。
-            previous = await run_file_io(lambda: state.snapshot(completed))
-            if previous is None:
-                raise
-            if on_commit is not None:
-                on_commit(previous)
-            return previous
 
     def commit(transaction: OwnerTransaction) -> Result:
         current = transaction.read(key)
@@ -408,7 +598,80 @@ async def finish(
         )
         return result
 
-    return await state.transact_async(commit, on_commit=on_commit)
+    try:
+        if reply is not None:
+            prepared = await reply.writer.prepare_async(
+                reply.message_id, ToolResult(reply.call_ref, result.outcome, result.parts),
+            )
+        return await state.transact_async(commit, on_commit=on_commit)
+    except MessageConflict:
+        # 准备或提交时发生竞争，都只采用已经完成的权威回执。
+        if reply is None:
+            raise
+        previous = await run_file_io(lambda: state.snapshot(completed))
+        if previous is None:
+            raise
+        if on_commit is not None:
+            on_commit(previous)
+        return previous
+
+
+_UNKNOWN_OUTCOME = (
+    "工具调用在进程重启前已发出，结果未知。只读操作可以重新执行；"
+    "可能有副作用的操作先检查当前状态，不要直接重复。"
+)
+
+
+class _Failed(Exception):
+    """执行异常及其要提交的结果；提交后重新抛出原异常。"""
+
+    def __init__(self, result: Result, original: BaseException):
+        super().__init__(str(original))
+        self.result = result
+        self.original = original
+
+
+def _invocation_failure(failure: BaseException) -> Result:
+    """两种执行协议共用失败描述；提交与重抛仍由各自 owner 完成。"""
+    cancelled = isinstance(failure, asyncio.CancelledError)
+    text = ("工具调用取消，已执行的效果不会撤销。" if cancelled
+            else f"工具执行失败: {type(failure).__name__}；已执行的效果不会撤销。")
+    return Result("interrupted" if cancelled else "error", (ContentPart("text", text),))
+
+
+def existing_result(reply: MessageReply) -> Result | None:
+    """按默认结果身份读取已提交 ToolResult。"""
+    message = reply.reader.get(reply.message_id)
+    if message is None:
+        return None
+    body = message.body
+    if not isinstance(body, ToolResult) or body.call_ref != reply.call_ref:
+        raise ValueError("工具结果不属于原调用")
+    return Result(body.outcome, body.parts)
+
+
+async def commit_message(
+    state: OwnerStore, reply: MessageReply, result: Result, *,
+    on_commit: Callable[[Result], None] | None = None,
+) -> Result:
+    """只追加 ToolResult；与 abandon 竞争同一身份时采用已提交的结果。"""
+    try:
+        prepared = await reply.writer.prepare_async(
+            reply.message_id, ToolResult(reply.call_ref, result.outcome, result.parts),
+        )
+
+        def commit(transaction: OwnerTransaction) -> Result:
+            _ = transaction.append_prepared(prepared)
+            return result
+
+        return await state.transact_async(commit, on_commit=on_commit)
+    except MessageConflict:
+        previous = await run_file_io(lambda: existing_result(reply))
+        if previous is None:
+            raise
+        if on_commit is not None:
+            on_commit(previous)
+        return previous
 
 
 async def _drain(task: Task) -> None:

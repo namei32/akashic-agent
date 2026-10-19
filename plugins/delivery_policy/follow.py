@@ -2,17 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
 from agent.plugin_composition import Context
-from agent.plugin_composition.messages import MessageCatalog, MessageReader
-from agent.plugin_contracts import Message
+from plugins.ledger.contract import MessageCatalog, MessageReader
+from plugins.ledger.contract import Message, Output
 
-from .boundary import DeliveryExecution, SinkInput
+from plugins.delivery.contract import GuardedDeliveries
 
 logger = logging.getLogger(__name__)
-Select = Callable[[MessageReader, Message], tuple[SinkInput, ...] | None]
+Select = Callable[[MessageReader, Message], tuple[Mapping[str, object], ...] | None]
 
 
 @dataclass(slots=True)
@@ -30,7 +30,7 @@ class _Destination:
 
 async def follow(
     ctx: Context, catalog: MessageCatalog,
-    execution: Callable[[], DeliveryExecution], select: Select,
+    execution: Callable[[], GuardedDeliveries], select: Select,
     *, settled: Callable[[str, str], None] | None = None,
 ) -> None:
     """按 seq 固定选路；重启追赶 prepared，各目的地与各 Session 独立结算。"""
@@ -98,12 +98,15 @@ async def follow(
                         messages = reader.read(after_seq=delivery.cursor(session_id), limit=100)
                     if not messages:
                         break
-                    for message in messages:
-                        async with ctx.runtime_scope():
-                            delivery = execution()
-                            existing = delivery.selection(message.message_id)
-                            sinks = select(reader, message) if existing is None else ()
-                            selected = await delivery.consume_async(reader, message, sinks, passive=True)
+                    async with ctx.runtime_scope():
+                        delivery = execution()
+                        # 整批选择一次事务提交；选路事实仍按消息逐条固定。
+                        batch = tuple(
+                            (message, select(reader, message) if delivery.selection(message.message_id) is None else ())
+                            for message in messages
+                        )
+                        selected_batch = await delivery.consume_batch_async(reader, batch, passive=True)
+                    for message, selected in zip(messages, selected_batch):
                         if selected is not None:
                             for sink in selected.sinks:
                                 wake_destination(session_id, sink, selected.recovery_owner, message.seq - 1)
@@ -117,7 +120,8 @@ async def follow(
     previous: dict[str, int] = {}
     first = True
     async with asyncio.TaskGroup() as group:
-        async for heads in catalog.follow():
+        # 只有 Output 可能被选路；其他消息在下一次 Output 唤醒时按游标顺序一并消费。
+        async for heads in catalog.follow(wake_on=Output):
             # 先建立日志订阅再取耐久 pending；恢复后不用扫描当前策略重选旧路由。
             if first:
                 async with ctx.runtime_scope():

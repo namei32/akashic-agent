@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+from plugins.models.contract import ModelError
 import asyncio
 import sqlite3
 import tempfile
@@ -12,9 +13,12 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
-from agent.plugin_composition import (
-    CapabilitySources, ChatModelSelection, DiscoveredModel, ModelCapabilities,
-    ModelKind, ModelRequest,
+from plugins.models.contract import ModelRequest
+from plugins.models.contract import (
+    CapabilitySources,
+    ChatModelSelection,
+    DiscoveredModel,
+    ModelCapabilities,
 )
 from plugins.models.settings import AddModel, RemoveModel, SetDefaultModel, SyncModels, UpdateModel
 from plugins.models.state import ModelUnavailableError
@@ -29,7 +33,7 @@ EMBEDDING = "material-fixture-embedding"
 async def scenario(workspace: Path) -> None:
     """沿设置、执行和账本边界核对选择生命周期。"""
     candidate = DiscoveredModel(
-        kind=ModelKind.CHAT, model="extra-chat",
+        kind='chat', model="extra-chat",
         capabilities=ModelCapabilities(context_window=8192),
         capability_sources=CapabilitySources(context_window="fixture"),
     )
@@ -58,7 +62,7 @@ async def scenario(workspace: Path) -> None:
             async def add(model_id, *, discovery_owned=True):
                 return await models.settings.apply(AddModel(
                     expected_revision=snapshot().revision, model_id=model_id,
-                    connection_id=CONNECTION, kind=ModelKind.CHAT, model=candidate.model,
+                    connection_id=CONNECTION, kind='chat', model=candidate.model,
                     capabilities=candidate.capabilities, capability_sources=candidate.capability_sources,
                     discovery_owned=discovery_owned,
                 ))
@@ -84,7 +88,7 @@ async def scenario(workspace: Path) -> None:
             embedding = snapshot().models[EMBEDDING]
             await models.settings.apply(AddModel(
                 expected_revision=snapshot().revision, model_id="extra-space",
-                connection_id=CONNECTION, kind=ModelKind.EMBEDDING, model="extra-embedding",
+                connection_id=CONNECTION, kind='embedding', model="extra-embedding",
                 capabilities=embedding.capabilities, capability_sources=embedding.capability_sources,
                 discovery_owned=True,
             ))
@@ -98,7 +102,7 @@ async def scenario(workspace: Path) -> None:
             # 显式 embedding 目录也只能改变可用性，不能替代已验证的空间。
             verified = snapshot().models["extra-space"]
             changed_space = DiscoveredModel(
-                kind=ModelKind.EMBEDDING, model="extra-embedding",
+                kind='embedding', model="extra-embedding",
                 capabilities=replace(verified.capabilities,
                     embedding_dimensions=space.dimensions + 1, embedding_normalization="none"),
                 capability_sources=CapabilitySources(embedding_dimensions="catalog", embedding_normalization="catalog"),
@@ -185,7 +189,9 @@ async def scenario(workspace: Path) -> None:
                 await remove("extra")
                 try:
                     await models.settings.apply(RemoveModel(old_revision, CHAT))
-                except RevisionConflictError:
+                except (RuntimeError, TimeoutError) as _model_error:
+                    if not (ModelError.matches(_model_error, RevisionConflictError)):
+                        raise
                     pass
                 else:
                     raise AssertionError("stale delete was accepted")
@@ -223,7 +229,9 @@ async def scenario(workspace: Path) -> None:
             try:
                 async with models.chat_models.execution(model_id="extra"):
                     raise AssertionError("execution without any selected chat model was accepted")
-            except ModelUnavailableError:
+            except (RuntimeError, TimeoutError) as _model_error:
+                if not (ModelError.matches(_model_error, ModelUnavailableError)):
+                    raise
                 pass
             print("PASS removed session preference uses default; deleted default selects a remaining model; empty selection fails clearly")
 
@@ -233,7 +241,9 @@ async def scenario(workspace: Path) -> None:
             assert snapshot().default_embedding_model_id is None
             try:
                 models.embeddings.describe(model_id=descriptor.model_id)
-            except ModelUnavailableError:
+            except (RuntimeError, TimeoutError) as _model_error:
+                if not (ModelError.matches(_model_error, ModelUnavailableError)):
+                    raise
                 pass
             else:
                 raise AssertionError("removed embedding identity silently rebound")

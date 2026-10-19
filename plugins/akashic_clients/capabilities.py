@@ -9,25 +9,26 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from agent.plugin_composition import MODEL_CATALOG
-from agent.plugin_composition.messages import MESSAGE_CATALOG
-from agent.plugin_composition.rpc import rpc_method_key
+from plugins.models.contract import MODEL_CATALOG
+from plugins.ledger.contract import MESSAGE_CATALOG, SESSION_ADMIN
+from plugins.gateway.contract import RpcMethod
 from agent.plugin_composition.runtime_catalog import (
     RUNTIME_CATALOG as RUNTIME_CATALOG,
-    RUNTIME_MCP_DETAIL as RUNTIME_MCP_DETAIL,
 )
-from agent.plugin_composition.ui import (
+from plugins.jobs.contract import JOB_NOTICES as JOB_NOTICES
+from plugins.mcp.contract import MCP_DETAIL, MCP_SERVERS
+from plugins.ui.contract import (
     WEB_UI as WEB_UI,
 )
-from agent.plugin_contracts.models import (
+from plugins.models.contract import (
     MODEL_SELECTION as MODEL_SELECTION,
     ModelSelection as ModelSelectionReader,
 )
-from agent.plugin_contracts.reply import (
+from plugins.reply.contract import (
     REPLY_STATUS as REPLY_STATUS,
     ReplyStatus as ReplyStatusReader,
 )
-from agent.plugin_contracts.ui import (
+from plugins.ui.contract import (
     MESSAGE_DISPLAY as MESSAGE_DISPLAY,
     PLUGIN_UI as PLUGIN_UI,
 )
@@ -41,11 +42,11 @@ if TYPE_CHECKING:
 # name, so this module remains independent from the provider plugin package.
 
 
-INSPECTION_DOCUMENTS_LIST = rpc_method_key("inspection/documents.list")
-INSPECTION_DOCUMENTS_GET = rpc_method_key("inspection/documents.get")
-INSPECTION_JOBS_LIST = rpc_method_key("inspection/jobs.list")
-INSPECTION_JOBS_GET = rpc_method_key("inspection/jobs.get")
-INSPECTION_SKILLS_LIST = rpc_method_key("inspection/skills.list")
+INSPECTION_DOCUMENTS_LIST = RpcMethod.key("inspection/documents.list")
+INSPECTION_DOCUMENTS_GET = RpcMethod.key("inspection/documents.get")
+INSPECTION_JOBS_LIST = RpcMethod.key("inspection/jobs.list")
+INSPECTION_JOBS_GET = RpcMethod.key("inspection/jobs.get")
+INSPECTION_SKILLS_LIST = RpcMethod.key("inspection/skills.list")
 
 INSPECTION_RPC_KEYS = (
     INSPECTION_DOCUMENTS_LIST,
@@ -58,14 +59,13 @@ INSPECTION_RPC_KEYS = (
 # 聊天启动只等待基础能力；诊断 RPC 在请求中借用，未接线的旧模型 RPC 不阻塞启动。
 CLIENT_CAPABILITIES = (
     RUNTIME_CATALOG,
-    RUNTIME_MCP_DETAIL,
     MESSAGE_CATALOG,
     MESSAGE_DISPLAY,
     PLUGIN_UI,
     WEB_UI,
     MODEL_CATALOG,
     MODEL_SELECTION,
-    REPLY_STATUS,
+    SESSION_ADMIN,
 )
 
 
@@ -77,14 +77,17 @@ __all__ = [
     "INSPECTION_JOBS_LIST",
     "INSPECTION_RPC_KEYS",
     "INSPECTION_SKILLS_LIST",
+    "JOB_NOTICES",
     "MODEL_CATALOG",
     "MODEL_SELECTION",
     "MESSAGE_DISPLAY",
     "PLUGIN_UI",
+    "SESSION_ADMIN",
     "WEB_UI",
     "ReplyStatusReader",
     "ModelSelectionReader",
     "REPLY_STATUS",
     "RUNTIME_CATALOG",
-    "RUNTIME_MCP_DETAIL",
+    "MCP_DETAIL",
+    "MCP_SERVERS",
 ]

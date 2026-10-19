@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
+import os
+import sys
+import subprocess
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, Protocol
@@ -13,97 +13,6 @@ from typing import Literal, Protocol
 from agent.plugin_composition.context import Context
 from agent.plugin_composition.model import ServiceKey
 
-WorkloadMode = Literal["candidate", "formal"]
-
-
-class WorkloadEffectUnknown(RuntimeError):
-    """The connection failed after Controller may have changed Docker state."""
-
-
-@dataclass(frozen=True, slots=True)
-class WorkloadEndpoint:
-    name: str
-    url: str
-
-
-@dataclass(frozen=True, slots=True)
-class WorkloadLease:
-    workspace_id: str
-    plugin_id: str
-    workload: str
-    mode: WorkloadMode
-    transaction_id: str
-    generation_id: str
-    container_id: str
-    spec_digest: str
-
-
-@dataclass(frozen=True, slots=True)
-class WorkloadStartRequest:
-    workspace_id: str
-    plugin_id: str
-    workload: str
-    mode: WorkloadMode
-    transaction_id: str
-    generation_id: str
-    spec_digest: str
-    image: str
-    command: tuple[str, ...]
-    ports: tuple[tuple[str, int], ...]
-    data: tuple[tuple[str, str, bool], ...]
-    health: tuple[str, str, float]
-    limits: tuple[int, float, int]
-    loopback_ports: tuple[tuple[str, int], ...] = ()
-    user_namespaces: bool = False
-
-    def to_dict(self) -> dict[str, object]:
-        return asdict(self)
-
-
-@dataclass(frozen=True, slots=True)
-class WorkloadStartReceipt:
-    lease: WorkloadLease
-    endpoints: tuple[WorkloadEndpoint, ...]
-    adopted_from_generation: str | None
-
-
-@dataclass(frozen=True, slots=True)
-class WorkloadStopReceipt:
-    lease: WorkloadLease
-    container_absent: bool
-    mounts_released: bool
-
-
-def workload_spec_digest(
-    *,
-    plugin_id: str,
-    workload: str,
-    image: str,
-    command: tuple[str, ...],
-    ports: tuple[tuple[str, int], ...],
-    data: tuple[tuple[str, str, bool], ...],
-    health: tuple[str, str, float],
-    limits: tuple[int, float, int],
-    loopback_ports: tuple[tuple[str, int], ...] = (),
-    user_namespaces: bool = False,
-) -> str:
-    """Hash the complete immutable Workload spec with one fixed encoding."""
-
-    value = {
-        "owner": plugin_id,
-        "name": workload,
-        "image": image,
-        "command": list(command),
-        "ports": [list(item) for item in ports],
-        "data": [list(item) for item in data],
-        "health": list(health),
-        "limits": list(limits),
-        "loopback_ports": [list(item) for item in loopback_ports],
-        "user_namespaces": user_namespaces,
-    }
-    return hashlib.sha256(
-        json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
 
 
 class ChildProcess(Protocol):
@@ -201,20 +110,66 @@ class ExecutionAccess(Protocol):
     def bind(self, ctx: Context) -> ExecutionGrant: ...
 
 
-class ControllerGrant(Protocol):
-    @property
-    def mode(self) -> Literal["candidate", "formal"]: ...
-    @property
-    def workspace_id(self) -> str: ...
-    @property
-    def identity(self) -> str: ...
-    async def start(self, request: WorkloadStartRequest) -> WorkloadStartReceipt: ...
-    async def stop(self, lease: WorkloadLease) -> WorkloadStopReceipt: ...
-
-
-class ControllerAccess(Protocol):
-    def bind(self, ctx: Context) -> ControllerGrant: ...
 
 
 EXECUTION = ServiceKey[ExecutionAccess]("host.execution.v1")
-WORKLOAD_CONTROLLER = ServiceKey[ControllerAccess]("host.workload_controller.v1")
+
+
+def process_group_exists(group_id: int) -> bool:
+    """只在进程组仍有活成员时返回 True。"""
+
+    if sys.platform.startswith("linux"):
+        return _linux_group_has_live_members(group_id)
+    if sys.platform == "darwin":
+        return _darwin_group_has_live_members(group_id)
+    try:
+        os.killpg(group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _darwin_group_has_live_members(group_id: int) -> bool:
+    """Darwin 的 killpg(0) 也会命中 zombie，需检查 stat。"""
+
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pgid=,stat="],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if (
+            len(fields) >= 2
+            and fields[0].isdigit()
+            and int(fields[0]) == group_id
+            and not fields[1].startswith("Z")
+        ):
+            return True
+    return False
+
+
+def _linux_group_has_live_members(group_id: int) -> bool:
+    """将只剩 zombie 的组视为已释放，避免容器 PID 1 延迟回收误报。"""
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text()
+        except OSError:
+            continue
+        command_end = stat.rfind(")")
+        if command_end < 0:
+            continue
+        fields = stat[command_end + 2 :].split()
+        if len(fields) < 3 or int(fields[2]) != group_id:
+            continue
+        if fields[0] != "Z":
+            return True
+    return False

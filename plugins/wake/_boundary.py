@@ -10,23 +10,20 @@ from dataclasses import dataclass
 from typing import Literal, TypedDict
 
 from agent.plugin_composition import EmitEventKey, ServiceKey
-from agent.plugin_contracts import (
+from plugins.ledger.contract import (
     ContentPart,
 )
-from agent.plugin_contracts.content import (
+from plugins.content.contract import (
     CONTENT as CONTENT,
 )
-from agent.plugin_contracts.delivery import (
+from plugins.delivery.contract import (
     DELIVERY_GUARDED_START as DELIVERY,
     DELIVERY_READ as DELIVERY_READ,
     DELIVERY_SENDERS as DELIVERY_SENDERS,
     DeliveryHistory as DeliveryHistory,
 )
-from agent.plugin_contracts.proactive import (
-    SEMANTIC_INTEREST as SEMANTIC_INTEREST,
-    SemanticInterest as SemanticInterest,
-)
-from agent.plugin_contracts.tools import (
+from plugins.akasha.contract import SEMANTIC_INTEREST as SEMANTIC_INTEREST, SemanticInterest as SemanticInterest
+from plugins.tools.contract import (
     ALL_TOOLS as ALL_TOOLS,
     TOOLS as TOOLS,
     CallSource as CallSource,
@@ -56,6 +53,3 @@ class ToolResultValue:
 
 
 WAKE_TOOLS_VIEW = ServiceKey[ToolView]("wake.tools.v1")
-
-
-DRIFT_CHANGED = EmitEventKey[None]("drift.changed")

@@ -2,23 +2,22 @@ from __future__ import annotations
 
 from importlib import import_module
 
-from agent.plugin_composition import (
+from agent.plugin_composition import Context
+from plugins.models.contract import EMBEDDINGS
+from plugins.models.contract import (
     CHAT_MODELS,
-    EMBEDDINGS,
     MODEL_CATALOG,
     MODEL_DRIVERS,
-    Context,
 )
-from agent.plugin_composition.models import MODEL_CALL_STATS
-from agent.plugin_composition.rpc import rpc_method_key
-from agent.plugin_composition.ui import UI
+from plugins.models.contract import MODEL_CACHE_USAGE, MODEL_CALL_STATS
+from plugins.gateway.contract import RpcMethod
+from plugins.ui.contract import UI, UI_SLOTS, PluginUiDefinition, PluginUiRpcInvalidRequest
 
 from .content import MODEL_CONTENT, ContentOwner
 from .views import CONTENT_VIEWS, ContentViews
 from .litellm_catalog import LiteLlmCapabilityCatalog
 from .model_settings_http import BoundModelControl, rpc_methods
 from .projection import (
-    MODEL_CALL_HISTORY,
     MODEL_CALLS,
     MODEL_DISPLAY,
     MODEL_MESSAGE_CHECKS,
@@ -31,6 +30,7 @@ from .selection import MODEL_SELECTION, SelectionOwner
 from .settings import MODEL_SETTINGS
 from .state import ModelsState
 from .store import ModelsStore
+from .usage import CacheUsage
 
 api_version = 3
 name = "models"
@@ -69,8 +69,9 @@ async def apply(ctx: Context) -> None:
     _ = await ctx.provide(MODEL_CATALOG, state.catalog)
     _ = await ctx.provide(MODEL_SETTINGS, state.settings)
     _ = await ctx.provide(MODEL_CALLS, store.read_call)
-    _ = await ctx.provide(MODEL_CALL_HISTORY, store.read_calls)
     _ = await ctx.provide(MODEL_CALL_STATS, store.read_call_stats)
+    usage = CacheUsage(ctx, store)
+    _ = await ctx.provide(MODEL_CACHE_USAGE, usage)
     _ = await ctx.provide(MODEL_DISPLAY, display_facts)
     _ = await ctx.provide(MODEL_PROJECTION, ProjectionOwner())
     _ = await ctx.provide(MODEL_MESSAGE_CHECKS, MessageChecksOwner())
@@ -78,23 +79,42 @@ async def apply(ctx: Context) -> None:
     views = ContentViews(ctx)
     _ = await ctx.provide(CONTENT_VIEWS, views, binding_contributors=views.binding_contributors)
     _ = await ctx.provide(MODEL_SELECTION, SelectionOwner())
-    from agent.plugin_contracts.onboarding import ONBOARDING, Step
+    from plugins.onboarding.contract import ONBOARDING, Ability, Step
     async def status():
         async with ctx.runtime_scope():
             catalog = state.catalog.snapshot()
-            from agent.plugin_composition.models import ModelAvailability
             model_id = catalog.role_bindings.get("default")
-            ready = model_id is not None and catalog.model(model_id).availability == ModelAvailability.AVAILABLE
+            ready = model_id is not None and catalog.model(model_id).availability == 'available'
             return {"ready": ready, "enabled": True if ready else None, "blocked": False,
                     "reason": "" if ready else "请选择连接方式并设置默认模型"}
     async def contribute(child: Context):
-        await child.require(ONBOARDING).group(child, "models", "模型连接")
+        await child.require(ONBOARDING).group(child, "models", "模型连接", Ability(
+            pitch="连接一个对话模型",
+            benefit="Akashic 本身不带模型。选一个你已经有账号的服务，连上之后它就能回答你。",
+            required=True,
+        ))
         await child.require(ONBOARDING).register(child, Step("connect", "模型连接", "models", "models", status))
     await ctx.inject((ONBOARDING,), contribute, name="onboarding")
     for method, operation in rpc_methods(BoundModelControl(ctx)).items():
-        _ = await ctx.provide(rpc_method_key(method), operation)
-    _ = await ctx.inject((UI, MODEL_CATALOG, MODEL_CALL_STATS, MODEL_SETTINGS, MODEL_SELECTION),
+        _ = await ctx.provide(RpcMethod.key(method), operation)
+    _ = await ctx.inject((UI, MODEL_CATALOG, MODEL_CALL_STATS, MODEL_SETTINGS, MODEL_SELECTION, MODEL_CACHE_USAGE),
                          _register_ui, name="ui")
+
+    # 回答尾注只读本插件的用量视图；聊天界面经插件界面插槽查询。
+    async def message_ui(child: Context) -> None:
+        async def query(method: str, payload: dict[str, object], *,
+                        session_id: str | None, turn_id: str | None) -> dict[str, object]:
+            message_id = payload.get("message_id")
+            if method != "usage.message" or set(payload) != {"message_id"} or not session_id \
+                    or not isinstance(message_id, str) or not message_id:
+                raise PluginUiRpcInvalidRequest("用量查询需要会话与消息")
+            return {"output_tokens": await usage.message_output_tokens(session_id, message_id)}
+
+        _ = await child.require(UI_SLOTS).register_plugin_ui(
+            child, PluginUiDefinition(module="message_ui.js", stylesheet="message_ui.css",
+                                      slots=("turn.after_answer",)), query=query)
+
+    _ = await ctx.inject((UI_SLOTS,), message_ui, name="message-ui")
 
 
 async def _register_ui(ctx: Context) -> None:
@@ -102,9 +122,10 @@ async def _register_ui(ctx: Context) -> None:
     await ctx.require(UI).register(
         ctx, web="web_module.js",
         dashboard=lambda: import_module(".dashboard", __package__),
-        requires=("shell.pages.v1",),
+        requires=("shell.settings.v1",),
         provides=("models.connection-types.v1",),
         contract_digests={
             "models.connection-types.v1": "8c304d85090a65a4a66cd777a5c2a88e6908de147964dc91e7f84336979ea561",
+            "shell.settings.v1": "1f4dd2eaee9118c799590a36745975150c46979a3f62b431f73aa29e949ce189",
         },
     )

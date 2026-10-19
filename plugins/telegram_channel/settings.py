@@ -9,9 +9,9 @@ from agent.plugin_composition.context import FiberHandle
 from agent.plugin_composition.plugin_config import PLUGIN_CONFIG
 from agent.plugin_composition.runtime_catalog import RUNTIME_CATALOG
 from agent.plugin_composition.config_input import save_credential
-from agent.plugin_composition.ui import UI
-from agent.plugin_contracts.configuration import Configuration
-from agent.plugin_contracts.onboarding import ONBOARDING, Step
+from plugins.ui.contract import UI
+from plugins.ui.contract import Configuration
+from plugins.onboarding.contract import ONBOARDING, Step
 
 SETTINGS = ServiceKey[Configuration]("telegram_channel.settings.v1")
 FIELDS = ('allow_from', 'timeout_seconds')
@@ -97,6 +97,7 @@ async def mount(ctx: Context, model: type[BaseModel], function: FiberHandle) -> 
     async def contribute(child: Context):
         await child.require(ONBOARDING).register(child, Step("configure", "Telegram 接入", "channels", "telegram_channel-settings", settings.read, (function.fiber_id,)))
     async def ui(child: Context):
-        await child.require(UI).register(child, web="web_module.js", dashboard=lambda: import_module(".dashboard", __package__), requires=("shell.pages.v1",))
+        await child.require(UI).register(child, web="web_module.js", dashboard=lambda: import_module(".dashboard", __package__), requires=("shell.settings-plugins.v1",),
+                                         contract_digests={"shell.settings-plugins.v1": "1823b19c778297893495ca9193d688e24c99d079effbaf5ecf0d1148ae0a1aa2"})
     await ctx.inject((ONBOARDING,), contribute, name="onboarding")
     await ctx.inject((UI, SETTINGS), ui, name="settings-ui")

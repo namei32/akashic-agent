@@ -3,10 +3,24 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
-from dataclasses import dataclass, field
-from typing import Any, TypeVar
+from dataclasses import asdict, dataclass, field
+from typing import Any, TypedDict, TypeVar
+
+from agent.plugin_composition.plugin_updates import UpdateStatus
 
 T = TypeVar("T")
+AcceptedFuture = asyncio.Future[UpdateStatus] | asyncio.Future[dict[str, object]]
+
+
+class OperationStatus(TypedDict):
+    kind: str
+    plugin_id: str | None
+    update_id: str | None
+    state: str
+    error: str | None
+    revoked: bool
+    committed: bool
+    accepted: dict[str, object] | None
 
 
 @dataclass(eq=False)
@@ -15,7 +29,7 @@ class ManagerOperation:
 
     deadline: float
     update_id: str | None = None
-    accepted: asyncio.Future[Any] | None = None
+    accepted: AcceptedFuture | None = None
     task: asyncio.Task[Any] = field(init=False)
     revoked: bool = False
     committed: object | None = None
@@ -37,6 +51,79 @@ class ManagerOperation:
         # A disconnected caller cannot retrieve this future; mark the error
         # observed now while the future remains awaitable for a live caller.
         _ = self.accepted.exception()
+
+    def status(self) -> OperationStatus:
+        """从实际任务和 accepted 结果读取状态，不记录第二份进度。"""
+        # 1. 任务是否结束与选择是否 accepted 是两个独立事实。
+        if self.task.cancelled():
+            task_state = "cancelled"
+            task_error = None
+        elif not self.task.done():
+            task_state = "running"
+            task_error = None
+        else:
+            task_error_value = self.task.exception()
+            task_state = "error" if task_error_value is not None else "done"
+            task_error = (
+                None
+                if task_error_value is None
+                else str(task_error_value) or type(task_error_value).__name__
+            )
+
+        # 2. 只从已返回的结果识别插件，pending 请求不猜测目标。
+        view: OperationStatus = {
+            "kind": "install" if self.update_id is not None else "unknown",
+            "plugin_id": None,
+            "update_id": self.update_id,
+            "state": task_state,
+            "error": task_error,
+            "revoked": self.revoked,
+            "committed": self.committed is not None,
+            "accepted": None,
+        }
+        self._add_accepted_status(view)
+        return view
+
+    def _add_accepted_status(self, view: OperationStatus) -> None:
+        """把 accepted 等待或结果补入本次诊断快照。"""
+        if self.accepted is None:
+            return
+        if self.accepted.cancelled():
+            view["accepted"] = {"state": "cancelled"}
+            return
+        if not self.accepted.done():
+            view["accepted"] = {"state": "pending"}
+            return
+        try:
+            result = self.accepted.result()
+        except asyncio.CancelledError:
+            view["accepted"] = {"state": "cancelled"}
+        except Exception as error:
+            view["accepted"] = {"state": "error", "error": str(error) or type(error).__name__}
+        else:
+            if isinstance(result, UpdateStatus):
+                view["kind"] = "install"
+                view["plugin_id"] = result.plugin_id
+                view["accepted"] = {
+                    "kind": "install",
+                    "state": "accepted",
+                    "result": asdict(result),
+                }
+            else:
+                # 卸载结果也交给调用方，读取时仍需校验这个可变字典。
+                plugin_id = result.get("plugin_id")
+                state = result.get("state")
+                if not isinstance(plugin_id, str):
+                    raise TypeError("ManagerOperation.accepted uninstall 结果缺少 plugin_id")
+                if not isinstance(state, str):
+                    raise TypeError("ManagerOperation.accepted uninstall 结果缺少 state")
+                view["kind"] = "uninstall"
+                view["plugin_id"] = plugin_id
+                view["accepted"] = {
+                    "kind": "uninstall",
+                    "state": state,
+                    "result": dict(result),
+                }
 
 
 current_operation: ContextVar[ManagerOperation | None] = ContextVar(

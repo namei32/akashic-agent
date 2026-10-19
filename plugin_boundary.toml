@@ -4,161 +4,31 @@
 # 由 `python scripts/plugin_boundary.py check` 强制（R4）。
 # 新增声明必须登记 role，否则静态门失败；登记不授予运行时权限。
 #
-# role 是待逐项复核的现状分类，不是目标 Core 白名单：
-#   core  —— 当前由 Core 提供；仍须证明其事实或通用机制归属。
-#   seam  —— 协作入口；可替换性必须另外用独立实现验证。
-#   bundle—— 默认装配；不得赋予第一方实现特殊入口。
-#   claim —— 单 owner 占用声明，不是可注入服务。
-#
-# Runtime 不读取本表。表不证明消费者权限、原子性或独立安装成功。
-# 业务合同可以由普通插件生态拥有；不要求所有共享类型迁入 Core。
+# 九个中立 key 由 Core 独占；R7、R10 同时核对声明和 provider。
+# Runtime 不读取本表。表不证明原子性、消费者权限或独立替换成功。
+# 业务合同由提供方插件公开，不在 Core 中登记第二份归属。
 
 [capabilities]
 
-[capabilities."eventmail.alert_source.v2"]
-role = "seam"
-note = "EventMail 拥有告警提交；来源通过公共合同提交固定事件，不取得邮箱存储权限"
-
-# ── Message 与 Session 权威事实 ───────────────────────────────
-[capabilities."core.message_catalog"]
-role = "core"
-note = "读取已提交 Message；不授予写入"
-
-[capabilities."core.message_writers"]
-role = "core"
-note = "按绑定权限追加 Input/Output/ToolResult/Control"
-
-[capabilities."core.message_embeddings"]
-role = "core"
-note = "读取和追加 Message embedding"
-
-[capabilities."core.session_admission"]
-role = "core"
-note = "create-once 建立带固定属性的 Session"
-
-[capabilities."core.owner_state"]
-role = "core"
-note = "按插件 owner 隔离的同库事务空间"
-
-[capabilities."core.bindings"]
-role = "core"
-note = "exact Root 的工具 binding 归档与解析"
-
-[capabilities."core.interaction_undo"]
-role = "core"
-note = "显式撤销最近一次 interaction"
-
-# ── 外部效果与投递 ───────────────────────────────────────────
-[capabilities."core.artifact_read"]
-role = "core"
-note = "有界字节读取租约"
-
-[capabilities."core.artifact_import"]
-role = "core"
-note = "来源导入与不可变引用"
-
-[capabilities."core.channel_attachment_import"]
-role = "core"
-note = "Channel 附件导入端口；宿主绑定传输与数据，不借用正式数据"
-
-[capabilities."core.channel_attachment_read"]
-role = "core"
-note = "Channel 附件有界读取端口；与 artifact_read 同一租约边界"
-
-[capabilities."core.channel_identity"]
-role = "core"
-note = "Channel 身份权威事实读取"
-
-[capabilities."core.installed_assets.v1"]
-role = "seam"
-note = "普通 assets provider 注册贡献方代码目录，并按 exact Root scope 提供只读资产；不解释内容"
-
 [capabilities."core.credentials"]
-role = "seam"
-note = "按插件 owner 打开短凭据租约；来源可替换"
-
-# ── 外部运行：进程、MCP、容器 ────────────────────────────────
-[capabilities."core.processes"]
 role = "core"
-note = "宿主统一保留的进程集合与清理核对"
-
-[capabilities."core.managed_processes"]
-role = "core"
-note = "受 Core 监督的进程声明注册表"
-
-[capabilities."core.mcp_servers"]
-role = "core"
-note = "generation-bound MCP server 声明注册表"
-
-[capabilities."core.workloads"]
-role = "core"
-note = "窄 Controller 管理的容器 workload 注册表"
+note = "Core 按可信插件 owner 打开短凭据租约"
 
 [capabilities."host.execution.v1"]
-role = "seam"
-note = "宿主执行端口；由 managed_processes host 提供，不授予任意 Core 访问"
-
-[capabilities."host.workload_controller.v1"]
-role = "seam"
-note = "宿主 workload 控制端口；由 workloads host 提供"
+role = "core"
+note = "Core 只拥有执行身份与 generation 作用域；实际进程和文件由插件提供"
 
 [capabilities.executor]
 role = "core"
 note = "有界纯同步 worker 池"
 
-# ── 人类与模型入口 ───────────────────────────────────────────
-[capabilities."core.commands"]
-role = "seam"
-note = "普通 Commands provider 拥有人类命令、alias、handler 注册及当前活动目录"
-
-[capabilities."core.ui_slots"]
-role = "seam"
-note = "普通 UI provider 拥有插件页面、查询与导航注册及当前活动目录"
-
-[capabilities."core.message_display.v1"]
-role = "core"
-note = "按当前 live Root 组合 message.display:* 的只读页面投影"
-
-[capabilities."core.plugin_ui.v1"]
-role = "core"
-note = "按当前 live Root 提供中立插件 UI registry 投影"
-
-[capabilities."core.web_ui.v1"]
-role = "seam"
-note = "普通 UI provider 提供当前 Root 的 Web bootstrap 与身份投影"
-
-[capabilities."core.dashboard_routes.v1"]
-role = "core"
-note = "宿主装配从实际端口固定 Dashboard route 列表，UI 插件只读"
-
 [capabilities."core.host_info"]
 role = "core"
 note = "宿主装配固定提供 boot identity 与 validation marker 的只读值"
 
-[capabilities."ui.v1"]
-role = "seam"
-note = "普通 UI provider 拥有贡献注册、活动目录和 Dashboard 资源"
-
 [capabilities."core.runtime_catalog.v1"]
 role = "core"
-note = "按当前 live Root 提供中立插件与 MCP 只读目录投影"
-
-[capabilities."core.runtime_mcp_detail.v1"]
-role = "core"
-note = "已声明的调用方在当前 live Root 按需读取单一 MCP 目标详情"
-
-[capabilities."plugin.channels"]
-role = "seam"
-note = "inbound/outbound Channel 适配注册表；由普通 channels provider 提供，多实现可替换"
-
-[capabilities."core.input_custody"]
-role = "core"
-note = "durable inbound 的 reserve/defer/recover 托管事实；关闭后幂等结算"
-
-# ── 调度、生命周期与发布 ─────────────────────────────────────
-[capabilities."core.timers"]
-role = "seam"
-note = "one-shot deadline wait；不拥有 recurrence 或 job 语义"
+note = "按当前 live Root 提供中立插件、Fiber 与健康只读投影"
 
 [capabilities."core.tasks"]
 role = "core"
@@ -168,43 +38,11 @@ note = "按通用 key 串行准入的短命工作与资源"
 role = "core"
 note = "重启提交权与外部效果 permit"
 
-[capabilities."core.control_frames.v1"]
-role = "core"
-note = "控制帧路由与声明"
-
 [capabilities."core.plugin_updates"]
 role = "core"
 note = "插件 install/uninstall/revert 状态"
 
-# ── 模型协作入口：声明位置不等于提供者归属 ──────────────────
-[capabilities."models.chat.v1"]
-role = "seam"
-note = "按冻结 revision 取得 chat model"
-
-[capabilities."models.embeddings.v1"]
-role = "seam"
-note = "统一 embedding space"
-
-[capabilities."models.catalog.v1"]
-role = "seam"
-note = "模型与 connection 目录"
-
-[capabilities."models.drivers.v1"]
-role = "seam"
-note = "Provider 注册模型 driver；已有多个可替换实现"
-
-[capabilities."models.call-stats.v1"]
-role = "core"
-note = "模型调用统计读取"
-
-# ── 占用声明 ─────────────────────────────────────────────────
-[capabilities."plugin.claim.embedding_memory"]
-role = "claim"
-note = "embedding-memory 单 owner 占用；同一 Root 只允许一个"
-
-# 已记录为「文档承诺、代码未实现」的名字。
-# 本清单断言这些名字在 Python 代码中不存在（R5）：一旦有人实现，
-# 门会失败，强制同时更新文档与 [capabilities] 登记，避免文档漂移。
+# 尚未实现的文档名称不能重新作为隐式合同出现。
 [phantom.SCOPED_TURNS]
 note = "多份设计文档称其为已具备的 Turn 原子；实际由 plugins/reply 的 run_reply 顶替"
 
@@ -214,190 +52,6 @@ note = "content-wake 设计列为现有原子；代码中无此 ServiceKey"
 [phantom.BACKGROUND_JOBS]
 note = "插件手册与 skill 文档仍在教学使用；代码中无此 ServiceKey"
 
-[capabilities."reply.status.v2"]
-role = "seam"
-note = "客户端消费插件已投影的短命回复状态，不取得内部状态类"
-
-[capabilities."tools.display-name.v1"]
-role = "seam"
-note = "客户端只读历史 binding 名称；工具插件拥有描述解释，不允许打开或执行工具"
-
-[capabilities."tools.v1"]
-role = "seam"
-note = "独立公共合同；实现由普通插件提供，来源见 Issue 766 设计"
-
-[capabilities."tools.all.v1"]
-role = "seam"
-note = "独立公共合同；实现由普通插件提供，来源见 Issue 766 设计"
-
-[capabilities."tools.loading.presentation.v1"]
-role = "seam"
-note = "独立公共合同；按插件加载的展示由普通插件提供，来源见 Issue 766 设计"
-
-[capabilities."models.selection.v1"]
-role = "seam"
-note = "独立公共合同；实现由普通插件提供，来源见 Issue 766 设计"
-
-[capabilities."models.content.v3"]
-role = "seam"
-note = "独立公共合同；实现由普通插件提供，来源见 Issue 766 设计"
-
-[capabilities."models.message-checks.v1"]
-role = "seam"
-note = "独立公共合同；实现由普通插件提供，来源见 Issue 766 设计"
-
-[capabilities."models.projection.v1"]
-role = "seam"
-note = "独立公共合同；实现由普通插件提供，来源见 Issue 766 设计"
-
-[capabilities."models.calls.v1"]
-role = "seam"
-note = "独立公共合同；实现由普通插件提供，来源见 Issue 766 设计"
-
-[capabilities."akasha.semantic-interest.v1"]
-role = "seam"
-note = "公共结构合同；实际状态与生命周期由提供方插件拥有"
-
-[capabilities."compaction.reader.v1"]
-role = "seam"
-note = "公共结构合同；实际状态与生命周期由提供方插件拥有"
-
-[capabilities."compaction.summaries.v1"]
-role = "seam"
-note = "公共结构合同；实际状态与生命周期由提供方插件拥有"
-
-[capabilities."content.v2"]
-role = "seam"
-note = "公共结构合同；实际状态与生命周期由提供方插件拥有"
-
-[capabilities."context.v2"]
-role = "seam"
-note = "公共结构合同；实际状态与生命周期由提供方插件拥有"
-
-[capabilities."conversation.check_origin.v1"]
-role = "seam"
-note = "公共结构合同；实际状态与生命周期由提供方插件拥有"
-
-[capabilities."conversation.commands.v1"]
-role = "seam"
-note = "公共结构合同；实际状态与生命周期由提供方插件拥有"
-
-[capabilities."delivery.final_output.v1"]
-role = "seam"
-note = "公共结构合同；实际状态与生命周期由提供方插件拥有"
-
-[capabilities."delivery.input-origin.v1"]
-role = "seam"
-note = "公共结构合同；实际状态与生命周期由提供方插件拥有"
-
-[capabilities."delivery.read.v1"]
-role = "seam"
-note = "公共结构合同；实际状态与生命周期由提供方插件拥有"
-
-[capabilities."delivery.senders.v1"]
-role = "seam"
-note = "公共结构合同；实际状态与生命周期由提供方插件拥有"
-
-[capabilities."delivery.guarded-start.v1"]
-role = "seam"
-note = "公共结构合同；实际状态与生命周期由提供方插件拥有"
-
-[capabilities."eventmail.delivery.v2"]
-role = "seam"
-note = "公共结构合同；实际状态与生命周期由提供方插件拥有"
-
-[capabilities."eventmail.wake.v2"]
-role = "seam"
-note = "公共结构合同；实际状态与生命周期由提供方插件拥有"
-
-[capabilities."reply.completion.v1"]
-role = "seam"
-note = "公共结构合同；实际状态与生命周期由提供方插件拥有"
-
-[capabilities."scheduler.inspection.v3"]
-role = "seam"
-note = "Scheduler 异步只读快照；查询取消排空由提供方插件拥有"
-
-[capabilities."standard_tools.skill_inspection.v1"]
-role = "seam"
-note = "公共结构合同；实际状态与生命周期由提供方插件拥有"
-
-[capabilities."tools.bind-saved.v1"]
-role = "seam"
-note = "公共结构合同；实际状态与生命周期由提供方插件拥有"
-
-[capabilities."tools.cleanup.v1"]
-role = "seam"
-note = "公共结构合同；实际状态与生命周期由提供方插件拥有"
-
-[capabilities."turn.projection.v1"]
-role = "seam"
-note = "公共结构合同；实际状态与生命周期由提供方插件拥有"
-
 [capabilities."core.plugin_config.v1"]
 role = "core"
 note = "按实际 Context 应用自身固定输入；沿 selection CAS 与局部换代，不解释业务字段"
-
-[capabilities."onboarding.steps.v1"]
-role = "seam"
-note = "普通 onboarding provider 持有 Effect 步骤目录；贡献者保留配置 writer"
-
-[capabilities."inspection.documents.v1"]
-role = "seam"
-note = "文档 owner 发布有界只读入口；检查插件仅拥有贡献目录"
-
-[capabilities."context.materials.v4"]
-role = "seam"
-note = "材料声明用途；选择不依赖 provider 名称"
-
-[capabilities."models.content-views.v1"]
-role = "seam"
-note = "模型内容纯投影贡献；不授予消息写入或执行权"
-
-[capabilities."channel.input.v2"]
-role = "seam"
-note = "Channel 入站入口；由 CHANNELS 的注册者提供"
-
-[capabilities."source.check.v2"]
-role = "seam"
-note = "公共结构合同；实际状态与生命周期由提供方插件拥有"
-
-[capabilities."source.interrupt.v2"]
-role = "seam"
-note = "Sources 拥有输入与停止的共同路由；渠道声明停止能力依赖"
-
-[capabilities."source.session.v4"]
-role = "seam"
-note = "Source 拥有异步只读判定和同步提交通知；Core 只承载公共合同"
-
-[capabilities."sources.v5"]
-role = "seam"
-note = "异步待回复读取由来源提供，注册与路由生命周期由 Sources 拥有"
-
-[capabilities."tools.program.v2"]
-role = "seam"
-note = "公共结构合同；实际状态与生命周期由提供方插件拥有"
-
-[capabilities."conversation.complete.v2"]
-role = "seam"
-note = "来源固定控制前提，交给完成程序；输出来源不能代替控制来源"
-
-[capabilities."reply.program.v3"]
-role = "seam"
-note = "回传程序显式携带来源控制前提，不另存执行权威状态"
-
-[capabilities."react.ordered-start.v2"]
-role = "seam"
-note = "首次效果和新 Output 在各自原事务核对同一来源控制前提"
-
-[capabilities."reply.execute.v4"]
-role = "seam"
-note = "来源入口提供必填执行前提；回复程序不重建或推断来源权限"
-
-[capabilities."drift.wake.v2"]
-role = "seam"
-note = "Drift 拥有异步快照、领取与流转；取消等待实际存储退出"
-
-[capabilities."drift.delivery.v2"]
-role = "seam"
-note = "Drift 拥有异步送达读取与结算；真实发送仍归 Delivery"

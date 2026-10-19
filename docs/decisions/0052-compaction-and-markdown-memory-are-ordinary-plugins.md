@@ -1,5 +1,7 @@
 # 0052 · Compaction 与 Markdown 记忆是普通插件
 
+> 请求切点与保留量由 [0095](0095-context-compaction-uses-settled-batches.md) 修订；普通插件 owner 与完整 Turn 学习边界不变。
+
 - 状态：accepted
 - 日期：2026-08-31
 - 关联条款：CTX-007、MEM-001～MEM-011、PLG-001～PLG-014、SES-003～SES-005
@@ -93,6 +95,8 @@ Core atoms                         ordinary plugins
 - Wake、Subagent、QQ、Mobile inspection 与 Akasha 逐项通过迁移清单中的行为 oracle。
 
 ## 2026-09-07：请求材料与新事实的来源
+
+位置约定部分由 [0096](0096-context-reminders-keep-their-first-position.md) 替代：不变材料保留首次使用位置；材料归属、权限与持久资格不变。
 
 维护者确认以更新频率决定请求位置：SELF/MEMORY、技能和渠道规则保留 system，时间、Akasha 召回和本次后台结果进入末尾的临时提醒。低频档案没有必要因为可变而迁出前缀；异步档案发布也不保证与 compaction 合并为一次 provider 缓存失效。
 

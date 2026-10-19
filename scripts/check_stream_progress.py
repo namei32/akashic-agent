@@ -15,9 +15,16 @@ import httpx
 
 sys.path.insert(0, str(Path.cwd()))
 
-from agent.plugin_composition import (
-    BoundModelDescriptor, CapabilitySources, ModelCapabilities, ModelRequest,
-    ModelTimeoutError, ModelUnavailableError,
+from plugins.models.contract import ModelRequest
+from plugins.models.contract import (
+    BoundModelDescriptor,
+    CapabilitySources,
+    ModelCapabilities,
+)
+from plugins.models.contract import (
+    ModelTimeoutError,
+    ModelUnavailableError,
+    ModelError,
 )
 from core.net.http import HttpClient
 from plugins.codex import responses as codex
@@ -110,7 +117,7 @@ class LocalCredential:
 
 
 async def check_codex_receipt() -> None:
-    """穿过完整 driver 和 Models 结算，在临时账本核对部分响应及不重发。"""
+    """穿过完整 driver 和 Models，核对单次预算耗尽后的部分响应与禁止隐式重发。"""
     descriptor = BoundModelDescriptor(
         binding_id="scenario", plugin_snapshot_id="scenario", model_revision=0,
         model_id="scenario", connection_id="scenario", driver_id="codex",
@@ -131,18 +138,20 @@ async def check_codex_receipt() -> None:
         base_url="https://scenario.invalid", transport=httpx.MockTransport(respond),
     ))
     driver = codex.CodexResponses(http=http, credential=LocalCredential(),
-                                 descriptor=descriptor, config={}, progress_timeout=0.1)
+                                 descriptor=descriptor, config={}, client_version="0.0.0", progress_timeout=0.1)
     with TemporaryDirectory(prefix="stream-progress-") as directory:
         root = Path(directory)
         store = ModelsStore(root / "models.db", root / "backups")
         store.initialize()
         try:
-            bound = _BoundChat(descriptor, driver, store, max_attempts=3)
+            bound = _BoundChat(descriptor, driver, store, max_attempts=1)
             request = ModelRequest([], request_key="stream-progress")
             try:
                 await bound.complete(request)
-            except ModelTimeoutError as error:
-                assert getattr(error, "response_delta_seen", False)
+            except (RuntimeError, TimeoutError) as error:
+                if not (ModelError.matches(error, ModelTimeoutError)):
+                    raise
+                assert (value := ModelError.read(error)) is not None and value.response_delta_seen
                 assert "没有有效进展" in str(error)
             else:
                 raise AssertionError("partial stream did not time out")
@@ -153,7 +162,9 @@ async def check_codex_receipt() -> None:
             assert records[0]["next_attempt_at"] is None
             try:
                 await bound.complete(request)
-            except ModelUnavailableError:
+            except (RuntimeError, TimeoutError) as _model_error:
+                if not (ModelError.matches(_model_error, ModelUnavailableError)):
+                    raise
                 pass
             else:
                 raise AssertionError("uncertain request was sent again")
@@ -178,9 +189,10 @@ async def main() -> None:
                 await consume(driver, stream)
             except Exception as error:
                 failure = getattr(error, "error", error)
-                assert isinstance(failure, ModelTimeoutError), repr(error)
+                value = ModelError.read(failure, ModelTimeoutError)
+                assert value is not None, repr(error)
                 assert "没有有效进展" in str(failure)
-                assert getattr(failure, "send_evidence", None) is None
+                assert value.send_evidence is None
                 if driver != "codex":
                     module = compatible if driver == "compatible" else opencode
                     assert not module._retryable(module._map_error(error))
@@ -236,7 +248,9 @@ async def main() -> None:
         checked += 1
         try:
             await consume("codex", Stream([(0.04, done)] * 6 + [(0, terminal)]))
-        except ModelTimeoutError:
+        except (RuntimeError, TimeoutError) as _model_error:
+            if not (ModelError.matches(_model_error, ModelTimeoutError)):
+                raise
             pass
         else:
             raise AssertionError("duplicate completed items extended progress deadline")

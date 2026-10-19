@@ -10,8 +10,8 @@ from pydantic import BaseModel, ConfigDict
 from core.common.file_io import run_file_io
 
 from agent.plugin_composition import Context
-from agent.plugin_composition.bindings import BINDINGS
-from agent.plugin_composition.messages import (
+from plugins.ledger.contract import BINDINGS
+from plugins.ledger.contract import (
     MESSAGE_CATALOG,
     MESSAGE_WRITERS,
     OWNER_STATE,
@@ -22,19 +22,21 @@ from agent.plugin_composition.messages import (
     SessionAttributes,
 )
 from agent.plugin_composition.tasks import TASKS, Task, TaskSlot
-from agent.plugin_contracts import (
+from plugins.ledger.contract import (
     ContentPart,
     Input,
     Message,
     Output,
 )
-from agent.plugin_contracts.models import (
+from plugins.models.contract import (
     MODEL_SELECTION as MODEL_SELECTION,
     ModelSelection as ModelSelection,
 )
 
 from ._boundary import CONTENT, DELIVERY
-from agent.plugin_contracts.delivery import StartGuard
+from plugins.delivery.contract import (
+    StartGuard,
+)
 
 from .api import DRIFT_DELIVERY, DRIFT_WAKE, EVENTMAIL_DELIVERY, EVENTMAIL_WAKE
 from .content import (

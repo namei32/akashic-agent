@@ -5,11 +5,12 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, cast
 
-from agent.plugin_composition.bindings import Bindings
-from agent.plugin_composition.models import ToolCall as ModelToolCall
-from agent.plugin_contracts import CallRef, ToolCall
-from agent.plugin_contracts.tools import CommitAfter as CommitAfter
-from agent.plugin_contracts.tools import ToolPresentation as ToolPresentation
+from plugins.ledger.contract import Bindings
+from plugins.models.contract import ToolCall as ModelToolCall
+from plugins.ledger.contract import CallRef, ToolCall
+from core.common.frozen_json import freeze_json
+from plugins.tools.contract import CommitAfter as CommitAfter
+from plugins.tools.contract import ToolPresentation as ToolPresentation
 
 from .execution import MessageReply, Result, ToolExecution
 from .plugin import TOOLS
@@ -22,8 +23,11 @@ class ToolCallDecode:
     binding_id: str | None
     arguments: Mapping[str, object]
     rejection: Mapping[str, object] | None = None
+    exclusive_batch: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.exclusive_batch) is not bool:
+            raise TypeError("工具批次标记必须是 bool")
         if not isinstance(self.arguments, Mapping):
             raise TypeError("工具解码参数必须是对象")
         accepted = self.binding_id is not None
@@ -45,10 +49,15 @@ class NativePresentation:
 
     def __init__(self, descriptions: Mapping[str, Mapping[str, object]]):
         self._descriptions = dict(descriptions)
+        self._schemas: tuple[Mapping[str, Any], ...] | None = None
 
     @property
     def schemas(self) -> tuple[Mapping[str, Any], ...]:
-        return tuple(tool_schema(self._descriptions[name]) for name in self._descriptions)
+        if self._schemas is None:
+            self._schemas = cast(tuple[Mapping[str, Any], ...], freeze_json(
+                tuple(tool_schema(description) for description in self._descriptions.values())
+            ))
+        return self._schemas
 
     @property
     def system_prompt(self) -> str:
@@ -97,6 +106,10 @@ class ToolMenu:
 
         self._bound = dict(fixed_bindings)
         descriptions = self._descriptions()
+        self._exclusive_bindings = frozenset(
+            self._bound[name] for name, description in descriptions.items()
+            if description.get("exclusive_batch") is True
+        )
         self._presentation = presentation or NativePresentation(descriptions)
         if limit is not None and len(self._presentation.schemas) > limit:
             raise ValueError(
@@ -140,7 +153,7 @@ class ToolMenu:
         identity = self._bound.get(name)
         if identity is None:
             raise PermissionError(f"展示层返回了未获授工具: {name}")
-        return ToolCallDecode(identity, arguments)
+        return ToolCallDecode(identity, arguments, exclusive_batch=identity in self._exclusive_bindings)
 
     def bind(self, name: str) -> str:
         """让归档旧 ReAct 只解析已经固定在本菜单中的 binding。"""
@@ -150,6 +163,10 @@ class ToolMenu:
         return identity
 
     def name(self, binding_id: str) -> str:
+        """复用菜单已校验的固定名称；旧历史 binding 仍从原描述读取。"""
+        for name, identity in self._bound.items():
+            if identity == binding_id:
+                return name
         description = cast(
             Mapping[str, object], self._bindings.describe(binding_id, TOOLS)["tool"]
         )

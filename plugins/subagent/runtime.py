@@ -11,21 +11,24 @@ from typing import Literal, cast
 from core.common.file_io import run_file_io
 
 from agent.plugin_composition import CompositionError, Context, ServiceKey
-from agent.plugin_composition.bindings import BINDINGS
-from agent.plugin_composition.messages import MESSAGE_CATALOG, MESSAGE_WRITERS, OWNER_STATE, SESSION_ADMISSION
+from plugins.ledger.contract import BINDINGS
+from plugins.ledger.contract import MESSAGE_CATALOG, MESSAGE_WRITERS, OWNER_STATE, SESSION_ADMISSION
 from agent.plugin_composition.tasks import TASKS, Task, TaskSlot
 from .inputs import CONTENT, CHECK_ORIGIN
 from .inputs import CONVERSATION_COMPLETE
 from .inputs import DELIVERY
 from .inputs import REPLY_PROGRAM
-from agent.plugin_composition.messages import MessageConflict, MessageReader, OwnerRecord, OwnerTransaction, SessionAttributes
-from agent.plugin_contracts import ContentPart, Control, Input, Message, Output
-from agent.plugin_contracts import json_value
-from agent.plugin_contracts.sources import SourceGuard
+from plugins.ledger.contract import MessageConflict, MessageReader, OwnerRecord, OwnerTransaction, SessionAttributes
+from plugins.ledger.contract import ContentPart, Control, Input, Message, Output
+from plugins.ledger.contract import json_value
+from plugins.sources.contract import (
+    SourceGuard,
+)
 
 from .request import Request, check_request
 
 logger = logging.getLogger(__name__)
+# 私有程序 binding：tools.py 固定身份，恢复路径经 Bindings.open 读取，不提供外部 SDK。
 SUBAGENT_PROGRAM = ServiceKey[Callable[[Task, MessageReader, Request], Awaitable[Message]]]("subagent.program.v1")
 _MAX_ACTIVE = 3
 

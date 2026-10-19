@@ -7,9 +7,14 @@ import hashlib
 import json
 import os
 import re
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import cache, lru_cache
 from pathlib import Path, PurePosixPath
+from typing import cast
+
+from agent.plugins.manifest import plugins_root
 
 _NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -50,6 +55,8 @@ class StaticPluginManifest:
     api_version: int
     python: tuple[StaticPythonRuntime, ...]
     identity_digest: str
+    entrypoints: tuple[tuple[str, str], ...] = ()
+    ingress_guard: bool = False
 
     @property
     def requirements(self) -> tuple[str, ...]:
@@ -68,6 +75,8 @@ def load_static_plugin_manifest(plugin_root: Path) -> StaticPluginManifest:
     # 2. 身份与 requirements 都来自固定代码制品，不读取数据复制策略。
     name, version, api_version = load_plugin_identity(root)
     python = _python_runtimes(root)
+    entrypoints = _plugin_entrypoints(root / "plugin.py")
+    ingress_guard = _plugin_ingress_guard(root / "plugin.py")
     identity: dict[str, object] = {
         "name": name,
         "version": version,
@@ -80,6 +89,10 @@ def load_static_plugin_manifest(plugin_root: Path) -> StaticPluginManifest:
             for item in python
         ],
     }
+    if entrypoints:
+        identity["entrypoints"] = dict(entrypoints)
+    if ingress_guard:
+        identity["ingress_guard"] = True
     identity_digest = hashlib.sha256(
         json.dumps(
             identity,
@@ -94,7 +107,179 @@ def load_static_plugin_manifest(plugin_root: Path) -> StaticPluginManifest:
         api_version=api_version,
         python=python,
         identity_digest=identity_digest,
+        entrypoints=entrypoints,
+        ingress_guard=ingress_guard,
     )
+
+
+# 入口守卫插件被选中即要求守卫在场；声明必须是顶层字面 True，发现阶段不执行插件。
+def _plugin_ingress_guard(path: Path) -> bool:
+    """按源码内容缓存守卫声明，和身份、命令入口共用事实缓存。"""
+    source = path.read_text(encoding="utf-8")
+    cached = _read_fact("ingress_guard", source)
+    if isinstance(cached, bool):
+        return cached
+    tree = _parse_source_tree(path, source)
+    values = [statement.value for statement in tree.body
+              if isinstance(statement, ast.Assign) and len(statement.targets) == 1
+              and isinstance(statement.targets[0], ast.Name) and statement.targets[0].id == "ingress_guard"]
+    if not values:
+        _write_fact("ingress_guard", source, False)
+        return False
+    if len(values) != 1 or not isinstance(values[0], ast.Constant) or not isinstance(values[0].value, bool):
+        raise PluginSourceContentError("ingress_guard 必须是单次字面 bool 声明")
+    guard = values[0].value
+    _write_fact("ingress_guard", source, guard)
+    return guard
+
+
+def _plugin_entrypoints(path: Path) -> tuple[tuple[str, str], ...]:
+    """只接受字面命令到模块函数的映射，发现阶段不执行插件入口。"""
+    return _parse_plugin_entrypoints(path, path.read_text(encoding="utf-8"))
+
+
+@lru_cache(maxsize=128)
+def _parse_plugin_entrypoints(path: Path, source: str) -> tuple[tuple[str, str], ...]:
+    cached = _cached_entrypoints(_read_fact("entrypoints", source))
+    if cached is not None:
+        return cached
+    entries = _parse_entrypoint_tree(path, source)
+    _write_fact("entrypoints", source, [list(item) for item in entries])
+    return entries
+
+
+def _parse_entrypoint_tree(path: Path, source: str) -> tuple[tuple[str, str], ...]:
+    tree = _parse_source_tree(path, source)
+    declarations: list[ast.expr | None] = []
+    for statement in tree.body:
+        if isinstance(statement, ast.Assign):
+            if not any(isinstance(target, ast.Name) and target.id == "entrypoints" for target in statement.targets):
+                continue
+            if len(statement.targets) != 1:
+                raise PluginSourceContentError("entrypoints 必须单独声明")
+            declarations.append(statement.value)
+        elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name) and statement.target.id == "entrypoints":
+            declarations.append(statement.value)
+    if not declarations:
+        return ()
+    if len(declarations) != 1 or not isinstance(declarations[0], ast.Dict):
+        raise PluginSourceContentError("entrypoints 必须是单次字面 dict 声明")
+    declaration = declarations[0]
+    entries: dict[str, str] = {}
+    for key, target in zip(declaration.keys, declaration.values):
+        if (not isinstance(key, ast.Constant) or not isinstance(key.value, str)
+                or not isinstance(target, ast.Constant) or not isinstance(target.value, str)):
+            raise PluginSourceContentError("entrypoint 必须映射命令名到 module.function")
+        if key.value in entries:
+            raise PluginSourceContentError(f"entrypoint 重复命令: {key.value}")
+        entries[key.value] = target.value
+    try:
+        return check_entrypoints(entries)
+    except ValueError as error:
+        raise PluginSourceContentError(f"插件命令声明无效: {path}") from error
+
+
+# 身份与入口共用同一份只读 AST；调用方只遍历顶层语句，不修改节点。
+@lru_cache(maxsize=16)
+def _parse_source_tree(path: Path, source: str) -> ast.Module:
+    return ast.parse(source, filename=str(path))
+
+
+# 身份与入口只由 plugin.py 文本决定。成功结果按内容和解析器指纹存入宿主目录，
+# 只省去 AST 解析；读回的值仍逐项校验，失败结果从不落盘。
+@cache
+def _parser_fingerprint() -> str | None:
+    try:
+        parser = Path(__file__).read_bytes()
+    except OSError:
+        return None
+    return hashlib.sha256(sys.implementation.cache_tag.encode() + b"\0" + parser).hexdigest()[:16]
+
+
+def _fact_path(kind: str, source: str) -> Path | None:
+    fingerprint = _parser_fingerprint()
+    if fingerprint is None:
+        return None
+    try:
+        root = plugins_root()
+    except ValueError:
+        return None
+    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    return root / "manifest-facts" / fingerprint / f"{digest}.{kind}.json"
+
+
+def _read_fact(kind: str, source: str) -> object:
+    path = _fact_path(kind, source)
+    if path is None:
+        return None
+    try:
+        return json.loads(path.read_bytes())
+    except (OSError, ValueError):
+        return None
+
+
+# 读回的身份按源码解析的同一组规则重新校验；任何不符都当作未命中。
+def _cached_identity(value: object) -> tuple[str, str, int] | None:
+    if not isinstance(value, list):
+        return None
+    fields = cast(list[object], value)
+    if len(fields) != 3:
+        return None
+    try:
+        if _integer({"api_version": fields[2]}, "api_version") != 3:
+            return None
+        return _name(fields[0], "name"), _version(fields[1], "version"), 3
+    except PluginSourceContentError:
+        return None
+
+
+# 读回的入口必须已是 check_entrypoints 的规范结果：无重复、已排序、格式合法。
+def _cached_entrypoints(value: object) -> tuple[tuple[str, str], ...] | None:
+    if not isinstance(value, list):
+        return None
+    pairs: list[tuple[str, str]] = []
+    for item in cast(list[object], value):
+        if not isinstance(item, list):
+            return None
+        parts = cast(list[object], item)
+        if len(parts) != 2 or not isinstance(parts[0], str) or not isinstance(parts[1], str):
+            return None
+        pairs.append((parts[0], parts[1]))
+    try:
+        entries = check_entrypoints(dict(pairs))
+    except ValueError:
+        return None
+    return entries if list(entries) == pairs else None
+
+
+def _write_fact(kind: str, source: str, value: object) -> None:
+    path = _fact_path(kind, source)
+    if path is None or sys.dont_write_bytecode:
+        return
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = temporary.write_text(json.dumps(value, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        os.replace(temporary, path)
+    except OSError:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def check_entrypoints(value: object) -> tuple[tuple[str, str], ...]:
+    """在源码与选择输入边界校验同一命令声明表示。"""
+    if not isinstance(value, Mapping):
+        raise ValueError("entrypoints 必须是 dict")
+    entries: list[tuple[str, str]] = []
+    for key, target in value.items():
+        if (not isinstance(key, str) or re.fullmatch(r"[a-z][a-z0-9-]*", key) is None
+                or not isinstance(target, str)
+                or re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+", target) is None):
+            raise ValueError("entrypoint 必须映射命令名到 module.function")
+        entries.append((key, target))
+    return tuple(sorted(entries))
 
 
 def load_plugin_identity(plugin_root: Path) -> tuple[str, str, int]:
@@ -107,8 +292,23 @@ def load_plugin_identity(plugin_root: Path) -> tuple[str, str, int]:
         source = path.read_text(encoding="utf-8")
     except UnicodeError as error:
         raise PluginSourceContentError(f"插件身份源码无法解码: {path}") from error
+    return _parse_plugin_identity(path, source)
+
+
+@lru_cache(maxsize=128)
+def _parse_plugin_identity(path: Path, source: str) -> tuple[str, str, int]:
+    """只复用内容完全相同的解析结果；磁盘读取和路径检查仍逐次执行。"""
+    cached = _cached_identity(_read_fact("identity", source))
+    if cached is not None:
+        return cached
+    identity = _parse_identity_tree(path, source)
+    _write_fact("identity", source, list(identity))
+    return identity
+
+
+def _parse_identity_tree(path: Path, source: str) -> tuple[str, str, int]:
     try:
-        tree = ast.parse(source, filename=str(path))
+        tree = _parse_source_tree(path, source)
     except SyntaxError as error:
         raise PluginSourceContentError(f"插件身份源码无法解析: {path}") from error
 
@@ -202,22 +402,25 @@ def _python_runtimes(root: Path) -> tuple[StaticPythonRuntime, ...]:
 
     def visit(directory: Path) -> None:
         # 1. 不进入依赖和缓存；其余目录链接可能隐藏 runtime，直接拒绝。
-        for path in sorted(directory.iterdir()):
-            if path.name in excluded:
+        with os.scandir(directory) as entries:
+            children = sorted(entries, key=lambda entry: entry.name)
+        for entry in children:
+            if entry.name in excluded:
                 continue
-            if path.is_symlink():
-                if path.name == "requirements.txt" or path.is_dir() or not path.exists():
+            path = directory / entry.name
+            if entry.is_symlink():
+                if entry.name == "requirements.txt" or entry.is_dir() or not path.exists():
                     raise ValueError(f"插件 Python runtime 不能经过符号链接: {path}")
                 continue
-            if path.is_dir():
-                if path.name == "requirements.txt":
+            if entry.is_dir():
+                if entry.name == "requirements.txt":
                     raise ValueError(f"插件 requirements.txt 必须是文件: {path}")
                 visit(path)
             elif path.name == "requirements.txt":
                 # 2. 精确文件名是 runtime 标记，其他 requirements 文件不独立安装。
                 requirements = _relative_artifact_path(
                     root, path.relative_to(root).as_posix(),
-                    label="requirements", must_exist=True, require_file=True,
+                    label="requirements",
                 )
                 result.append(StaticPythonRuntime(
                     requirements=requirements,
@@ -276,9 +479,8 @@ def _relative_artifact_path(
     raw: object,
     *,
     label: str,
-    must_exist: bool,
-    require_file: bool,
 ) -> str:
+    """Validate an existing artifact file without optional directory/missing modes."""
     if not isinstance(raw, str) or not raw or raw != raw.strip():
         raise ValueError(f"{label} 必须是非空相对路径")
     path = PurePosixPath(raw.replace("\\", "/"))
@@ -286,13 +488,10 @@ def _relative_artifact_path(
         raise ValueError(f"{label} 必须是 artifact 内的相对路径")
     resolved = root.joinpath(*path.parts)
     _reject_symlink_ancestors(root, resolved, label)
-    if must_exist:
-        if not resolved.exists():
-            raise ValueError(f"{label} 不存在: {raw}")
-        if require_file and not resolved.is_file():
-            raise ValueError(f"{label} 必须是文件: {raw}")
-        if not require_file and not resolved.is_dir():
-            raise ValueError(f"{label} 必须是目录: {raw}")
+    if not resolved.exists():
+        raise ValueError(f"{label} 不存在: {raw}")
+    if not resolved.is_file():
+        raise ValueError(f"{label} 必须是文件: {raw}")
     return "/".join(path.parts) or "."
 
 

@@ -184,6 +184,10 @@ async def apply(ctx: Context) -> None:
 `ServiceKey` 的值类型不变型，提供者必须符合明确的合同。`scripts/plugin_boundary.py check` 拒绝重复声明；
 `python scripts/plugin_boundary.py catalog` 输出能力、提供与消费的静态位置，动态激活以运行时组合图为准。
 
+服务改名后需要读取已有 binding 时，提供方在合同 key 的 `binding_names` 中声明历史名称。
+消费者使用该合同 key 打开或描述原选择；新 binding 只保存当前 `name`。历史名称不参与
+key 的相等比较和哈希，不成为可注入别名，也不改写既有 descriptor 或身份。
+
 服务若依赖动态注册者，使用 `await ctx.provide(KEY, value, binding_contributors=read_contexts)`
 声明归档依赖。`read_contexts()` 同步返回当前实际注册者的 `tuple[Context, ...]`，只读原注册状态；
 固定 binding 时，这些 Context 与静态 `inject` 一起进入同一依赖闭包。伪造或其他 Root 的 Context
@@ -357,6 +361,11 @@ Dashboard 继续使用 `DashboardContext` 的 `require()`、`workspace_root()`�
 初次导入失败仅允许 dashboard-only 插件暂不可用；配套 Web/API 不能半发布。
 Web bootstrap 和 DashboardHost 从所选 Root 的 typed service 读取目录；
 宿主投影不复制 Web/UI 注册状态，Core compiler 不解释 UI 合同。
+目录只包含已初始化且 ACTIVE 的贡献方；无关安装或卸载不阻止 bootstrap。
+浏览器按 snapshot 与 catalog identity 判断目录是否变化，manager 的 `updating`
+只描述操作进行中，不使未变的 UI 失效。请求继续核对贡献方 generation 与权限。
+Channel 激活只声明启动实际需要的硬依赖；例如回复状态在请求中通过已声明的
+可选能力借用，缺失时该请求明确失败，设置与其他只读入口继续服务。
 
 ```text
 贡献插件 apply(ctx) ── UI.register ──┐
@@ -524,3 +533,15 @@ SDK 导入路径静态链路：向导从自身 `__file__` 定位宿主源码根�
 
 能力没有消息 writer、模型调用或工具执行口。`content_view` 是其普通消费者，仅另依赖 CONTENT
 与 TOOLS。完整行为、范围和恢复约束见 [0081](../decisions/0081-content-views-keep-original-messages.md)。
+
+## 服务调用者与来源身份
+
+provider 用 `ctx.require_runtime_identity(KEY, self)` 验证传入 Context 的实际
+Task、调用许可和服务对象，取得 `CallerIdentity(plugin_id, generation_id)`。
+返回值只描述内核已核对的事实，不作为可以转交的授权 token；后续操作仍需
+当前 Context 的有效 scope。原生 Task 继承 ContextVar 不会继承调用许可。
+
+`ctx.service_origins(KEY, contributors=...)` 从当前调用者声明的依赖以及
+provider 登记的动态贡献者读取来源，返回身份，不暴露 Root 或 Fiber。
+`ctx.open_service(KEY)` 为持久动态选择借用当前 provider，退出时释放同代许可。
+Ledger 只负责保存 descriptor 和解释业务 metadata；依赖图和调用寿命仍归内核。

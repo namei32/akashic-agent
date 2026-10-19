@@ -14,8 +14,55 @@
   color: var(--chat-ink, var(--ak-ink-primary));
   background: var(--chat-chip, var(--ak-paper-sheet));
   font-size: 0.9375rem;
-  line-height: 1.45;
+  line-height: var(--chat-user-leading, calc(20 / 15));
   overflow-wrap: break-word;
+}
+
+/* 视口外的占位行与完整行同高：用户气泡占位同样收在 12 行，升级时不塌陷。 */
+.desktop-message-placeholder .user-bubble {
+  max-height: calc(12lh + 18px + 0.8125rem * var(--chat-user-leading, calc(20 / 15)));
+  overflow: hidden;
+}
+
+@media (pointer: coarse) {
+  .desktop-message-placeholder .user-bubble { max-height: calc(12lh + 18px + 32px); }
+}
+
+/* 长输入收成 12 行，末两行渐隐提示还有内容；展开后不限高。 */
+.user-text-clamp:not([data-state="open"]) {
+  max-height: 12lh;
+  overflow: hidden;
+}
+
+.user-text-clamp[data-state="clamped"] {
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 2lh), transparent);
+}
+
+/* 开关是气泡上的一行次级文字，不是按钮外观。 */
+.user-text-toggle {
+  display: block;
+  margin-block-start: 2px;
+  border: 0;
+  padding: 0;
+  color: var(--ak-color-text-secondary, var(--chat-muted));
+  background: none;
+  font: inherit;
+  font-size: 0.8125rem;
+  cursor: pointer;
+}
+
+@media (hover: hover) {
+  .user-text-toggle:hover { color: var(--chat-ink, var(--ak-ink-primary)); }
+}
+
+.user-text-toggle:focus-visible {
+  outline: 2px solid var(--ak-rule-focus);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+@media (pointer: coarse) {
+  .user-text-toggle { min-height: 32px; }
 }
 
 .agent-row {
@@ -27,7 +74,7 @@
   width: min(100%, var(--chat-column, 52rem));
   color: var(--ak-ink-primary);
   font-size: max(1rem, var(--chat-type-body, 1rem));
-  line-height: 1.75;
+  line-height: var(--chat-response-leading, 1.5);
   overflow-wrap: break-word;
   user-select: text;
 }
@@ -41,21 +88,22 @@
 }
 
 .agent-content h1 { font-size: 1.375em; }
-.agent-content h2 {
-  font-size: 1.175em;
-  border-bottom: 1px solid var(--ak-rule-subtle);
-  padding-bottom: 0.3em;
-  border-bottom-style: dashed;
-}
+.agent-content h2 { font-size: 1.175em; }
 .agent-content h3 { font-size: 1.025em; }
 .agent-content h4 { font-size: 1em; }
 
 .agent-content p {
-  margin-block: 0 0.9em;
+  margin-block: 0 var(--chat-paragraph-gap, 0.75em);
+  line-height: inherit;
 }
 
-.agent-content :where(ul, ol) {
-  margin-block: 0 0.9em;
+.agent-content :where(ul, ol) + p,
+.agent-content .markstream-react [data-node-type="list"] + [data-node-type="paragraph"] p {
+  margin-block-start: 1.5em;
+}
+
+.agent-content .markdown-reading :is(ul, ol) {
+  margin-block: 0 var(--chat-paragraph-gap, 0.75em);
   padding-inline-start: 1.5em;
 }
 
@@ -72,12 +120,13 @@
   padding-inline-start: 1.25em;
 }
 
-.agent-content li {
+.agent-content .markdown-reading li {
+  margin-block: 0;
   padding-inline-start: 0.2em;
 }
 
-.agent-content li + li {
-  margin-block-start: 0.35em;
+.agent-content .markdown-reading li + li {
+  margin-block-start: var(--chat-list-gap, 0.25em);
 }
 
 .agent-content li::marker {
@@ -122,7 +171,7 @@
 .process-markdown th,
 .process-markdown td {
   padding: 0.375rem 1rem 0.375rem 0;
-  border-block-end: 1px solid color-mix(in oklch, var(--md-sys-color-on-surface) 10%, transparent);
+  border-block-end: 1px solid color-mix(in oklab, var(--md-sys-color-on-surface) 10%, transparent);
   text-align: start;
   vertical-align: top;
   min-width: 5rem;
@@ -131,7 +180,7 @@
 
 .agent-content thead th,
 .process-markdown thead th {
-  border-block-end-color: color-mix(in oklch, var(--md-sys-color-on-surface) 24%, transparent);
+  border-block-end-color: color-mix(in oklab, var(--md-sys-color-on-surface) 24%, transparent);
   color: var(--md-sys-color-on-surface-variant);
   font-size: 0.875em;
   font-weight: 560;
@@ -157,8 +206,7 @@
   outline: none;
 }
 
-.image-preview-full,
-.attachment-hover-image {
+.media-preview__media:not(.is-video) {
   outline: 1px solid var(--ak-color-image-outline);
   outline-offset: -1px;
 }
@@ -169,10 +217,63 @@
   border-radius: 0.3125rem;
   padding: 0.125rem 0.375rem;
   color: var(--md-sys-color-on-surface);
-  background: color-mix(in oklch, var(--md-sys-color-on-surface) 6%, transparent);
+  background: color-mix(in oklab, var(--md-sys-color-on-surface) 6%, transparent);
   font-family: var(--ak-type-technical, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
   font-size: 0.875em;
   font-weight: 480;
+}
+
+/* Markstream 的行内代码自带 (0,2,0) 工具类且在懒加载后插入：用三级作用域显式压过，
+   底色只取墨色的 6% 透明叠加，深浅主题都不出现冷蓝底；字体回到技术字体。 */
+.agent-content .markstream-react .inline-code,
+.process-markdown .markstream-react .inline-code {
+  border-radius: 0.3125rem;
+  padding: 0.125rem 0.375rem;
+  color: inherit;
+  background: color-mix(in oklab, var(--ak-ink-primary) 6%, transparent);
+  font-family: var(--ak-type-technical);
+  font-size: 0.875em;
+}
+
+/* 长标识符折行时每一段都自带内边距与圆角，不在断开处被硬切成半块底色。 */
+:is(.agent-content, .static-message-response, .process-markdown) :not(pre) > code,
+:is(.agent-content, .process-markdown) .markstream-react .inline-code {
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}
+
+/* 回复里的文件路径：行内代码外包一层按钮，点开在工作台“改动”里定位；只加虚下划线提示可点。 */
+.reading-file-link {
+  display: inline;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: inherit;
+  cursor: pointer;
+}
+
+.reading-file-link > code,
+.reading-file-link .inline-code {
+  text-decoration: underline dotted color-mix(in oklab, currentColor 45%, transparent);
+  text-underline-offset: 0.2em;
+}
+
+.reading-file-link:hover > code,
+.reading-file-link:hover .inline-code {
+  text-decoration-style: solid;
+}
+
+.reading-file-link:focus-visible {
+  border-radius: 0.3125rem;
+  outline: 2px solid var(--ak-rule-focus);
+  outline-offset: 1px;
+}
+
+/* 裸网址没有可读的词边界：按字符填满整行，不在 "-" 前后紧急断开、留下单独一行的连字符。 */
+.markdown-reading a.reading-url {
+  word-break: break-all;
 }
 
 /* Markstream owns Markdown structure; the product only maps it to chat tokens. */
@@ -187,22 +288,106 @@
   content-visibility: visible;
 }
 
-.agent-content .markstream-react pre[data-markstream-pre="1"],
-.process-markdown .markstream-react pre[data-markstream-pre="1"],
-.markstream-deferred-source {
+/* 复制含公式的选区时，克隆挂在页外取 innerText（reading-math.tsx）：渲染外壳的 content-visibility:auto 在页外会跳过渲染、读不到字，这里统一改回可见。 */
+.reading-copy-holder {
+  position: fixed;
+  inset-block-start: 0;
+  inset-inline-start: -99999px;
+  white-space: pre-wrap;
+}
+.reading-copy-holder,
+.reading-copy-holder * {
+  content-visibility: visible !important;
+}
+
+/* 公式（reading-math.tsx）。独立公式不画底色：与正文同一纸面，上下留出呼吸；放不下时横滚，渐隐提示同代码块。
+   KaTeX 自带的 .katex-display 外边距归零，间距只由外层决定，生成中与落定同一几何。 */
+:is(.agent-content, .process-markdown, .user-bubble) .markdown-reading .reading-math-display {
+  --code-edge: 28px;
   max-width: 100%;
-  margin-block: 0.5rem !important;
+  margin-block: 0.85rem;
+  padding-block: 0.3rem;
   overflow-x: auto;
-  border: none !important;
-  border-radius: var(--md-sys-shape-corner-medium) !important;
-  padding: 10px 14px !important;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+}
+.reading-math-display > .katex-display {
+  margin: 0;
+}
+.reading-math-display[data-overflow="end"] {
+  mask-image: linear-gradient(to right, #000 calc(100% - var(--code-edge)), transparent);
+}
+.reading-math-display[data-overflow="start"] {
+  mask-image: linear-gradient(to right, transparent, #000 var(--code-edge));
+}
+.reading-math-display[data-overflow="start end"] {
+  mask-image: linear-gradient(to right, transparent, #000 var(--code-edge), #000 calc(100% - var(--code-edge)), transparent);
+}
+.reading-math-display[data-scroll-stop]:focus-visible {
+  outline: 2px solid var(--ak-rule-focus);
+  outline-offset: -2px;
+}
+/* 生成中末尾还没写完的公式：已渐进排版，墨色略淡，闭合后回到正文墨色（不换节点，不跳）。 */
+:is(.reading-math, .reading-math-display)[data-pending] {
+  color: var(--ak-ink-secondary);
+}
+/* 排不了的公式（KaTeX 未载入或源码有错）按源码原样显示：等宽、正文同色，不出红字也不画框。 */
+.reading-math-source {
+  font-family: var(--ak-type-technical, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  font-size: 0.875em;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.reading-math-display[data-empty] {
+  min-height: 2.6em;
+}
+.reading-math-display > .reading-math-source {
+  display: block;
+  text-align: center;
+}
+.reading-math-source[data-pending] {
+  color: var(--ak-ink-secondary);
+}
+/* 行内 $$…$$ 按 display 字号排在行里，行高随公式撑开，不压上下行。 */
+.reading-math[data-mode="inline-display"] {
+  display: inline-block;
+  vertical-align: middle;
+  margin-inline: 0.15em;
+}
+
+/* 流式期间代码块先用 PreCodeNode 的 <pre> 渲染（块外的那一个），落定后换成高亮组件。两者必须同一几何：
+   44px 块头位（+4px 首行偏移、12px 末行留白，见 CODE_BLOCK_OPTIONS）、12px/18px 行、一圈 subtle 发丝线、1rem 外边距。
+   PreCodeNode 带 inline 字号/行高/上下内边距，只能用 !important 覆盖。 */
+:is(.agent-content, .process-markdown, .user-bubble) .markstream-react pre[data-markstream-pre="1"]:not(.code-block-container pre) {
+  max-width: 100%;
+  margin-block: 1rem !important;
+  overflow-x: auto;
+  border: 1px solid var(--ak-rule-subtle) !important;
+  border-radius: 0 !important;
+  padding: 48px 16px 12px !important;
   color: var(--ak-ink-primary) !important;
   background: var(--ak-paper-quiet) !important;
   font-family: var(--ak-type-technical, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace) !important;
-  font-size: 0.8125rem !important;
-  font-weight: 480;
-  line-height: 1.55 !important;
-  white-space: pre-wrap;
+  font-size: 12px !important;
+  font-weight: 400;
+  line-height: 18px !important;
+  white-space: pre;
+}
+
+/* 高亮组件加载期间，块头下面先放一个同样的 <pre> 占位：它已经在块里，不再自带块头留白与边框，
+   只对齐高亮后代码区的字号、行高与内边距，换成高亮时块高不变。 */
+:is(.agent-content, .process-markdown, .user-bubble) .code-block-container pre[data-markstream-pre="1"] {
+  margin: 0 !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  padding: 4px 16px 12px !important;
+  color: var(--ak-ink-primary) !important;
+  background: transparent !important;
+  font-family: var(--ak-type-technical, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace) !important;
+  font-size: 12px !important;
+  font-weight: 400;
+  line-height: 18px !important;
+  white-space: pre;
 }
 
 /* GFM 任务列表：勾选框自带语义，去掉重复的 disc 标记。 */
@@ -228,7 +413,7 @@
   margin-block: 0.5rem;
   padding-block: 0.125rem;
   padding-inline: 0.875rem 0;
-  border-inline-start: 2px solid color-mix(in oklch, var(--md-sys-color-on-surface) 18%, transparent);
+  border-inline-start: 2px solid color-mix(in oklab, var(--md-sys-color-on-surface) 18%, transparent);
   color: var(--md-sys-color-on-surface-variant);
 }
 
@@ -246,41 +431,169 @@
 .process-markdown hr {
   margin-block: 1.25rem;
   border: 0;
-  border-block-start: 1px solid color-mix(in oklch, var(--md-sys-color-on-surface) 12%, transparent);
+  border-block-start: 1px solid color-mix(in oklab, var(--md-sys-color-on-surface) 12%, transparent);
 }
 
-/* 语言代码块保留现有高亮与复制，控件只占一行。 */
-:where(.agent-content, .process-markdown) .code-block-container {
-  margin-block: 0.85rem;
-  border: 1px dashed var(--ak-rule-default) !important;
+/* 语言代码块保留现有高亮与复制，控件只占一行。外边距与流式 <pre> 同为 1rem；
+   组件自带 my-4 工具类，显式 !important 让两边一致不依赖层叠顺序。 */
+:where(.agent-content, .process-markdown, .user-bubble) .code-block-container {
+  margin-block: 1rem !important;
+  border: 1px solid var(--ak-rule-subtle) !important;
   border-radius: 0 !important;
   box-shadow: none !important;
   background: var(--ak-paper-quiet) !important;
 }
 
-:where(.agent-content, .process-markdown) .code-block-header {
-  padding: 0.2rem 1rem !important;
-  background: var(--ak-paper-sheet) !important;
-  border-block-end: 1px solid var(--ak-rule-subtle);
+/* 高亮主题把底色写在 shadow 的 :host 上；外部对宿主的声明优先，代码区与块头同一纸面。 */
+:where(.agent-content, .process-markdown, .user-bubble) .code-block-container diffs-container {
+  --diffs-bg: var(--ak-paper-quiet);
+  background-color: var(--ak-paper-quiet);
 }
 
-:where(.agent-content, .process-markdown) .code-block-header .icon-slot {
+/* 流式代码块的语言标签：落在预留的 44px 块头位里，几何与落定块头的标题一致（左 17px、垂直居中），不随代码横滚。 */
+.reading-code-scroll.is-streaming { position: relative; }
+/* 生成中的语言标签与落定块头一样吸顶：放在流里、用负外边距叠到 pre 预留的块头位上（不占高度），
+   铺一层与代码块同色的底（两侧让出 1px 边框）；静止时看不出底，吸住时代码从它下面滑过。 */
+.reading-code-stream-label {
+  position: sticky;
+  z-index: 1;
+  inset-block-start: var(--heading-cover, 0px);
+  display: flex;
+  block-size: 44px;
+  /* pre 自带 1rem 上外边距：标签带同样的外边距，与 pre 的相互折叠，pre 位置不变、标签落在边框内 1px。 */
+  margin: calc(1rem + 1px) 1px calc(-1rem - 45px);
+  padding-inline-start: 16px;
+  align-items: center;
+  background: var(--ak-paper-quiet);
+  pointer-events: none;
+  transition: inset-block-start var(--ak-sys-duration-short) var(--ak-sys-motion-standard);
+  container-type: scroll-state;
+}
+:where(.agent-content) :is(.turn-process.is-open, .thinking-row[data-state="open"]) .reading-code-stream-label {
+  inset-block-start: calc(var(--heading-cover, 0px) + var(--code-sticky-layers) * var(--tool-sticky-h));
+}
+
+/* 高亮交接快照（useHighlightHandoff）：落定后新挂载的代码块在重新高亮前，先盖上同一段代码上次的高亮结果。 */
+.reading-code-scroll .code-block-body { position: relative; }
+.reading-code-handoff {
+  position: absolute !important;
+  inset: var(--handoff-top) 0 0 var(--handoff-left) !important;
+  z-index: 1;
+  overflow: hidden;
+  background: var(--ak-paper-quiet);
+  pointer-events: none;
+}
+
+/* 横滚提示：哪边还有被藏住的字，哪边渐隐 28px；滚到头渐隐消失。只遮代码区，不遮块头。 */
+.reading-code-scroll { --code-edge: 28px; }
+.reading-code-scroll[data-overflow="end"] :is(diffs-container, pre) {
+  mask-image: linear-gradient(to right, #000 calc(100% - var(--code-edge)), transparent);
+}
+.reading-code-scroll[data-overflow="start"] :is(diffs-container, pre) {
+  mask-image: linear-gradient(to right, transparent, #000 var(--code-edge));
+}
+.reading-code-scroll[data-overflow="start end"] :is(diffs-container, pre) {
+  mask-image: linear-gradient(to right, transparent, #000 var(--code-edge), #000 calc(100% - var(--code-edge)), transparent);
+}
+
+:where(.agent-content, .process-markdown, .user-bubble) .code-block-header {
+  min-height: 0 !important;
+  padding: 0 0.25rem 0 1rem !important;
+  background: transparent !important;
+  border-block-end: 0 !important;
+}
+
+@media (min-width: 36.0625rem) {
+  :where(.agent-content, .process-markdown, .user-bubble) .code-header-actions .code-action-btn {
+    min-width: 36px;
+    min-height: 36px;
+  }
+}
+
+:where(.agent-content, .process-markdown, .user-bubble) .code-block-header .icon-slot {
   display: none;
 }
 
-:where(.agent-content, .process-markdown) .code-header-title {
+/* markstream 自带 `:where(.markstream-react) .code-block-header .code-header-title`（写死的灰、继承字体），特异性需高过它；
+   流式标签用同一类名，两态同一字体、字重与墨色。 */
+:is(.agent-content, .process-markdown, .user-bubble) :is(.code-block-header, .reading-code-scroll, .reading-diff-header) .code-header-title {
   font-family: var(--ak-type-technical);
   font-size: var(--chat-type-caption, 0.75rem);
+  font-weight: 500;
   color: var(--ak-ink-secondary);
 }
 
-:where(.agent-content, .process-markdown) .code-header-actions .code-action-btn {
+:where(.agent-content, .process-markdown, .user-bubble) .code-header-actions .code-action-btn {
   min-width: 44px;
   min-height: 44px;
-  color: var(--ak-ink-secondary);
 }
 
-:where(.agent-content, .process-markdown) .code-block-container pre {
+/* markstream 的复制钮颜色走它根上的 --code-action-*（写死的近黑、浅灰底），在代码块上改接设计 token，深浅主题一致；
+   复制成功与消息、工具结果的复制同一成功色反馈（组件只把 aria-label 换成"已复制"）。 */
+:where(.agent-content, .process-markdown, .user-bubble) .code-block-container {
+  --code-action-fg: var(--ak-ink-secondary);
+  --code-action-hover-fg: var(--ak-ink-primary);
+  --code-action-hover-bg: color-mix(in oklab, var(--ak-ink-primary) 6%, transparent);
+}
+
+:is(.agent-content, .process-markdown, .user-bubble) .code-header-actions .code-action-btn:is([aria-label="已复制"], [aria-label="Copied"]) {
+  color: var(--ak-sys-color-success);
+  background: color-mix(in srgb, var(--ak-sys-color-success) 12%, transparent);
+}
+
+/* markstream 默认把代码区限高 500px 并在块内纵向滚动：回复流里多出一个嵌套滚动区（滚轮先滚代码、底边硬切半行），
+   生成中的 <pre> 又不限高，落定时长代码整块塌下几百像素。代码完整铺开，与工具结果、用户气泡"流里不出现内部滚动"一致；
+   横向仍在块内滚动。 */
+:where(.agent-content, .process-markdown, .user-bubble) .code-block-container .code-editor-container {
+  /* 组件在行内同时写了 max-height 与 height（都是 500px），两项都要放开。 */
+  height: auto !important;
+  max-height: none !important;
+}
+
+/* 代码不限高后，长块读到中间时块头（语言、复制）还在：块头在回复滚动区里吸顶，代码从它下面滑过。
+   组件给容器的 overflow: hidden 会让 sticky 失效，改成不产生滚动容器的 clip（裁剪效果相同）。 */
+:where(.agent-content, .process-markdown) .code-block-container {
+  overflow: clip !important;
+}
+:where(.agent-content, .process-markdown) .code-block-container > .code-block-header {
+  position: sticky;
+  /* 与吸顶的工具行同一规则：紧凑外壳的顶栏在场时停在它下面，向下阅读顶栏移出后贴回顶缘。 */
+  inset-block-start: var(--heading-cover, 0px);
+  z-index: 2;
+  /* 上面的通用规则把块头底色设为 transparent !important；吸顶时代码要从它下面滑过，这里必须不透明。 */
+  background: var(--ak-paper-quiet) !important;
+  transition: inset-block-start var(--ak-sys-duration-short) var(--ak-sys-motion-standard);
+  container-type: scroll-state;
+}
+/* 只在真正吸住时下沿出一道发丝线（与吸顶的过程行同款），把块头和从下面滑过的半行代码分开；
+   不支持 scroll-state 查询的浏览器只是没有这条线。 */
+:where(.agent-content, .process-markdown) .code-block-container > .code-block-header::after,
+.reading-code-stream-label::after {
+  position: absolute;
+  inset: auto 0 0;
+  block-size: 1px;
+  background: transparent;
+  content: "";
+}
+@container scroll-state(stuck: top) {
+  :where(.agent-content, .process-markdown) .code-block-container > .code-block-header::after,
+  .reading-code-stream-label::after {
+    background: color-mix(in oklab, var(--ak-color-text-primary) 7%, transparent);
+  }
+}
+/* 展开的过程组、思考里，上面已有吸顶的摘要行，块头停在它下面，不叠在一起。
+   摘要会嵌套（过程组里的思考，两行摘要都吸住），按祖先里展开的摘要层数让位；生成中的语言标签同一规则。 */
+:where(.agent-content) :is(.turn-process.is-open, .thinking-row[data-state="open"]) {
+  --code-sticky-layers: 1;
+}
+:where(.agent-content) .turn-process.is-open .thinking-row[data-state="open"] {
+  --code-sticky-layers: 2;
+}
+:where(.agent-content) :is(.turn-process.is-open, .thinking-row[data-state="open"]) .code-block-container > .code-block-header {
+  inset-block-start: calc(var(--heading-cover, 0px) + var(--code-sticky-layers) * var(--tool-sticky-h));
+}
+
+:where(.agent-content, .process-markdown, .user-bubble) .code-block-container pre {
   background: transparent !important;
   border: none !important;
   border-radius: 0 !important;
@@ -288,8 +601,31 @@
 }
 
 /* 两条渲染路径共用阅读结构，源 Markdown 与 DOM 中的文字保持原样。 */
-:is(.agent-content, .process-markdown, .user-bubble) .markdown-reading :where(h1, h2, h3, h4):first-child {
+/* 只清整段回复首块的上边距（标题、表格、代码、引用都算）。富渲染路径每个块都包在 node-slot > node-content 里，
+   按 :first-child 写会命中每一个标题，让标题上方比下方还窄。 */
+:is(.agent-content, .process-markdown, .user-bubble) :is(
+  .markdown-reading .markdown-renderer > .node-slot:first-child > .node-content,
+  .static-message-response
+) > :first-child {
   margin-block-start: 0;
+}
+/* 首块是代码、Mermaid、公式或数学兜底时，真实边距在框上（多为 !important）：框可能是首块本身（流式数学兜底），也可能在包裹层里面，
+   两种都清；列表、引用、表格里嵌着的不算首块。 */
+:is(.agent-content, .process-markdown, .user-bubble) .markdown-reading .markdown-renderer > .node-slot:first-child > .node-content > :first-child:is(.code-block-container, pre[data-markstream-pre="1"], .mermaid-block, .reading-math-display),
+:is(.agent-content, .process-markdown, .user-bubble) .markdown-reading .markdown-renderer > .node-slot:first-child > .node-content > :first-child
+  :is(.code-block-container, pre[data-markstream-pre="1"], .mermaid-block, .reading-math-display):not(:is(li, blockquote, td) *) {
+  margin-block-start: 0 !important;
+}
+/* 生成中的语言标签跟着它的 pre 一起去掉 1rem（见 .reading-code-stream-label 的外边距说明）。 */
+:is(.agent-content, .process-markdown, .user-bubble) .markdown-reading .markdown-renderer > .node-slot:first-child > .node-content > .reading-code-scroll:first-child > .reading-code-stream-label {
+  margin-block: 1px -45px;
+}
+
+/* 气泡有自己的内边距：末块（代码块的 my-4、段落的段后距）的下边距只会在气泡底部多出一截空白。 */
+.user-bubble :is(.markdown-reading .markdown-renderer > .node-slot:last-child > .node-content, .static-message-response) > :last-child,
+.user-bubble .markdown-reading .markdown-renderer > .node-slot:last-child > .node-content > :last-child
+  :is(.code-block-container, pre[data-markstream-pre="1"], .reading-math-display):not(:is(li, blockquote, td) *) {
+  margin-block-end: 0 !important;
 }
 
 :is(.agent-content, .process-markdown, .user-bubble) .markdown-reading .reading-emphasis:not(li p) {
@@ -306,7 +642,7 @@
 :is(.agent-content, .process-markdown, .user-bubble) .markdown-reading .reading-concepts {
   margin-block: 0.85rem;
   padding: 0;
-  border: 1px dashed var(--ak-rule-default);
+  border: 1px solid var(--ak-rule-subtle);
   list-style: none;
 }
 
@@ -344,27 +680,35 @@
   margin-block-end: 0;
 }
 
-/* 用原生 list-item counter 保留 start/value、嵌套与辅助阅读的序号。 */
+/* 用原生 list-item counter 保留 start/value、嵌套与辅助阅读的序号。
+   序号画在 ::before 上：左缘贴阅读边线（::marker 靠右排，左缘无法对齐）；序号是阅读字体的次级墨色，条目之间只有行距。 */
 :is(.agent-content, .process-markdown, .user-bubble) .markdown-reading :where(ol):not(li ol) {
   margin-block: 0.75rem 1rem;
-  padding-inline-start: 2.65rem;
-  list-style-type: decimal-leading-zero;
+  padding-inline-start: 1.75rem;
+  list-style: none;
 }
 
 :is(.agent-content, .process-markdown, .user-bubble) .markdown-reading :where(ol):not(li ol) > li {
+  position: relative;
   margin: 0;
-  padding: 0.1rem 0 0.65rem 0.4rem;
+  padding: 0;
+}
+
+:is(.agent-content, .process-markdown, .user-bubble) .markdown-reading :where(ol):not(li ol) > li::before {
+  content: counter(list-item) ".";
+  position: absolute;
+  inset-inline-start: -1.75rem;
+  color: var(--ak-ink-secondary);
+  font-variant-numeric: tabular-nums;
 }
 
 :is(.agent-content, .process-markdown, .user-bubble) .markdown-reading :where(ol):not(li ol) > li + li {
-  padding-block-start: 0.65rem;
-  border-block-start: 1px dashed var(--ak-rule-subtle);
+  padding-block-start: var(--chat-list-gap, 0.25em);
 }
 
+/* 嵌套列表仍用 ::marker：与顶层 ::before 同为阅读字体的次级墨色，不换等宽小字，同一份清单里两级序号不像两种文档。 */
 :is(.agent-content, .process-markdown, .user-bubble) .markdown-reading ol > li::marker {
   color: var(--ak-ink-secondary);
-  font-family: var(--ak-type-technical);
-  font-size: 0.85em;
   font-variant-numeric: tabular-nums;
 }
 
@@ -393,11 +737,29 @@
 }
 
 .reading-table {
+  --code-edge: 28px;
   max-width: 100%;
   overflow-x: auto;
+  overscroll-behavior-x: contain;
   margin-block: 1rem;
-  padding: 0.3rem 0.7rem;
-  border: 1px dashed var(--ak-rule-default);
+}
+
+/* 放不下时可 Tab 到这里用方向键横滚：聚焦时去掉渐隐；回复正文左右贴边会裁掉外扩的框，框画在里面。 */
+.reading-table[data-scroll-stop]:focus-visible {
+  outline: 2px solid var(--ak-rule-focus);
+  outline-offset: -2px;
+  mask-image: none;
+}
+
+/* 与代码块同一套横滚提示：哪边还有列，哪边渐隐。 */
+.reading-table[data-overflow="end"] {
+  mask-image: linear-gradient(to right, #000 calc(100% - var(--code-edge)), transparent);
+}
+.reading-table[data-overflow="start"] {
+  mask-image: linear-gradient(to right, transparent, #000 var(--code-edge));
+}
+.reading-table[data-overflow="start end"] {
+  mask-image: linear-gradient(to right, transparent, #000 var(--code-edge), #000 calc(100% - var(--code-edge)), transparent);
 }
 
 :is(.agent-content, .process-markdown, .user-bubble) .markdown-reading table {
@@ -409,6 +771,27 @@
   padding: 0.55rem 0.6rem;
   max-width: 20rem;
   border-block-end: 1px solid var(--ak-rule-subtle);
+}
+
+/* 正文的 break-word（继承的与 markstream 文本节点自带的 break-words）会让表格自动布局把列压得比单词还窄
+   （"preferenc/e"）：单元格里英文词保持完整，中文照常按字折行；真放不下时整表横滚（见 .reading-table 渐隐），
+   网址另有 break-all。 */
+:is(.agent-content, .process-markdown, .user-bubble) .markdown-reading :where(th, td),
+:is(.agent-content, .process-markdown, .user-bubble) .markdown-reading :where(th, td) .text-node {
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+/* 表格没有外框，只有行线：首列文字贴正文左缘，不比段落缩进一格。 */
+:is(.agent-content, .process-markdown, .user-bubble) .markdown-reading :where(th, td):first-child { padding-inline-start: 0; }
+
+/* 紧凑外壳（触屏为主）列多时宁可横滚，也不把每列挤成三四个字一行；宽屏鼠标横滚别扭，仍以折行为主。 */
+/* 条件与 COMPACT_SHELL 一致：含横屏触屏的矮视口。 */
+@media (max-width: 820px), (max-height: 30rem) and (pointer: coarse) {
+  :is(.agent-content, .process-markdown, .user-bubble) .markdown-reading :where(th, td) { min-width: 8.5em; }
+  /* 三列以内本来放得下（390 宽每列约 6 个字）：不为每列 8.5em 的下限去横滚，只防把列挤成两三个字。
+     有合并单元格时每行元素数不等于逻辑列数，保留原下限。 */
+  :is(.agent-content, .process-markdown, .user-bubble) .markdown-reading table:not(:has(tr > :nth-child(4), [colspan])) :where(th, td) { min-width: 5em; }
 }
 
 :is(.agent-content, .process-markdown, .user-bubble) .markdown-reading th {
@@ -435,17 +818,94 @@
   white-space: nowrap;
 }
 
-:is(.agent-content, .process-markdown, .user-bubble) .markdown-reading tbody tr:nth-child(even) {
-  background: var(--ak-paper-quiet);
+:is(.agent-content, .process-markdown, .user-bubble) .markdown-reading thead :where(th, td) {
+  border-block-end-color: var(--ak-rule-default);
 }
 
-:is(.agent-content, .process-markdown, .user-bubble) .markdown-reading .math-block-node {
-  margin-block: 0.85rem;
-  padding: 0.35rem 0.6rem;
-  max-width: 100%;
-  overflow-x: auto;
-  border-block: 1px dashed var(--ak-rule-default);
-  background: var(--ak-paper-quiet);
+/* 脚注区是正文的附注：发丝线隔开，次级墨色小一号，不像正文里又起了一个列表。 */
+:is(.agent-content, .process-markdown, .user-bubble) .markdown-reading .footnotes {
+  margin-block-start: 1.25rem;
+  padding-block-start: 0.75rem;
+  border-block-start: 1px solid var(--ak-rule-subtle);
+  color: var(--ak-ink-secondary);
+  font-size: 0.875em;
+}
+:is(.agent-content, .process-markdown, .user-bubble) .markdown-reading .footnotes > ol {
+  margin-block: 0;
+}
+:is(.agent-content, .process-markdown, .user-bubble) .markdown-reading .data-footnote-backref {
+  text-decoration: none;
+}
+/* 富渲染路径（含代码、公式的回复）每条脚注各占一个 node-slot、各自带一条写死浅色的上边线、没有序号：
+   只在第一条前画同一条 subtle 发丝线，墨色、字号与静态路径一致，序号用计数器补成同样的"1."。
+   计数器要累加在 node-slot 上：累加在里层 .footnote-node 上时 Chromium 每条都从 1 数起。 */
+:is(.agent-content, .process-markdown, .user-bubble) .markdown-reading .markdown-renderer {
+  counter-reset: reading-footnote;
+}
+:is(.agent-content, .process-markdown, .user-bubble) .markdown-reading .node-slot[data-node-type="footnote"] {
+  counter-increment: reading-footnote;
+}
+:is(.agent-content, .process-markdown, .user-bubble) .markdown-reading .node-slot:not([data-node-type="footnote"]) + .node-slot[data-node-type="footnote"] {
+  margin-block-start: 1.25rem;
+  padding-block-start: 0.75rem;
+  border-block-start: 1px solid var(--ak-rule-subtle);
+}
+:is(.agent-content, .process-markdown, .user-bubble) .markdown-reading .footnote-node {
+  gap: 0;
+  padding-block-start: 0;
+  border-block-start: 0;
+  color: var(--ak-ink-secondary);
+  font-size: 0.875em;
+  line-height: inherit;
+}
+/* ReadingFootnote：脚注正文取自完整 GFM 解析（列表、代码、引用保留块结构），返回箭头本就在末段 p 里。 */
+:is(.agent-content, .process-markdown, .user-bubble) .markdown-reading .reading-footnote {
+  display: flex;
+}
+:is(.agent-content, .process-markdown, .user-bubble) .markdown-reading .reading-footnote__body {
+  flex: 1;
+  min-width: 0;
+}
+:is(.agent-content, .process-markdown, .user-bubble) .markdown-reading .reading-footnote__body > :where(p, ul, ol, blockquote) {
+  margin: 0 0 0.5em;
+}
+:is(.agent-content, .process-markdown, .user-bubble) .markdown-reading .reading-footnote__body > :last-child {
+  margin-block-end: 0;
+}
+/* 脚注正文是块级 p，返回箭头会掉到下一行：只把紧挨箭头的那一段改成行内，箭头跟在句末，和静态路径一样；
+   多段脚注的前几段、列表、代码保持块结构，段间留半行。 */
+:is(.agent-content, .process-markdown, .user-bubble) .markdown-reading .footnote-node .paragraph-node {
+  margin: 0 0 0.5em;
+}
+:is(.agent-content, .process-markdown, .user-bubble) .markdown-reading .footnote-node .paragraph-node:has(+ .footnote-anchor) {
+  display: inline;
+  margin: 0;
+}
+:is(.agent-content, .process-markdown, .user-bubble) .markdown-reading .footnote-anchor {
+  margin-inline-start: 0.25em;
+}
+/* markstream 在每个脚注引用处把段落拆成几个 p，"看这里 / [1] / ，还有这里"各占一行：同一段落槽里的 p 与引用改回行内排，
+   段后距挪到槽上。 */
+:is(.agent-content, .process-markdown, .user-bubble) .markdown-reading .node-content:has(> .footnote-reference) {
+  margin-block-end: 0.75rem;
+}
+:is(.agent-content, .process-markdown, .user-bubble) .markdown-reading .node-content:has(> .footnote-reference) > .paragraph-node {
+  display: inline;
+  margin: 0;
+}
+/* 引用号由 ReadingFootnoteReference 写成 <sup><a>1</a></sup>，与静态路径同一结构，这里只统一颜色、去下划线。 */
+:is(.agent-content, .process-markdown, .user-bubble) .markdown-reading :is(.footnote-link, [data-footnote-ref]) {
+  color: var(--ak-color-action-primary);
+  text-decoration: none;
+}
+:is(.agent-content, .process-markdown, .user-bubble) .markdown-reading .footnote-node::before {
+  content: counter(reading-footnote) ".";
+  flex: 0 0 1.75rem;
+  font-variant-numeric: tabular-nums;
+}
+:is(.agent-content, .process-markdown, .user-bubble) .markdown-reading .footnote-anchor {
+  font-size: inherit;
+  text-decoration: none;
 }
 
 /* 无标题文本块：技术字符等宽，中文沿用阅读字体。 */
@@ -455,7 +915,7 @@
   min-width: 0;
   max-width: 100%;
   margin-block: 0.85rem;
-  border-inline-start: 1px dashed var(--ak-rule-default);
+  border: 1px solid var(--ak-rule-subtle);
   background: var(--ak-paper-quiet);
 }
 
@@ -478,10 +938,34 @@
   background: transparent;
 }
 
+/* 回复里的 ```diff 是代码：与高亮代码块同一几何——44px 块头（左边 "Diff"、右边复制钮）、12px/18px 等宽行、
+   4px 首行偏移与 12px 末行留白。复制钮落在块头里，不再压住首行的增删底色。
+   每行一个网格项，增删底色整行铺满（含两侧留白），整体在块内横滚。 */
+.reading-diff-header {
+  display: flex;
+  align-items: center;
+  block-size: 44px;
+  padding-inline: 16px 52px;
+}
+.reading-plain-text.is-diff > pre {
+  padding: 4px 0 12px;
+  font-family: var(--ak-type-technical, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  font-size: 12px;
+  line-height: 18px;
+}
+.reading-plain-text.is-diff > pre > code {
+  display: grid;
+  grid-template-columns: minmax(max-content, 1fr);
+}
+.reading-plain-text.is-diff .tool-diff-line {
+  display: block;
+  padding-inline: 16px;
+}
+
 :is(.agent-content, .process-markdown, .user-bubble) .markdown-reading .reading-code-copy {
   position: absolute;
-  inset-block-start: 0.2rem;
-  inset-inline-end: 0.2rem;
+  inset-block-start: 0;
+  inset-inline-end: 0;
   display: grid;
   place-items: center;
   width: 44px;
@@ -491,6 +975,8 @@
   border-radius: 0;
   color: var(--ak-ink-muted);
   background: var(--ak-paper-quiet);
+  /* 贴住块的右上角，不留露出滚动文字的缝；横滚的长行在按钮左侧 16px 内淡出，不被硬切。 */
+  box-shadow: -16px 0 12px -4px var(--ak-paper-quiet);
   cursor: pointer;
 }
 
@@ -499,10 +985,15 @@
   height: 16px;
 }
 
-:is(.agent-content, .process-markdown, .user-bubble) .markdown-reading .reading-code-copy:hover,
 :is(.agent-content, .process-markdown, .user-bubble) .markdown-reading .reading-code-copy[data-copied="true"] {
   color: var(--ak-ink-primary);
   background: var(--ak-paper-sheet);
+}
+@media (hover: hover) {
+  :is(.agent-content, .process-markdown, .user-bubble) .markdown-reading .reading-code-copy:hover {
+    color: var(--ak-ink-primary);
+    background: var(--ak-paper-sheet);
+  }
 }
 
 :is(.agent-content, .process-markdown, .user-bubble) .markdown-reading .reading-code-copy:focus-visible {
@@ -519,15 +1010,19 @@
   border: 0;
   padding: 7px 10px 7px 13px;
   color: var(--ak-color-text-secondary);
-  background: color-mix(in oklch, var(--ak-color-action-primary) 8%, transparent);
+  background: color-mix(in oklab, var(--ak-color-action-primary) 8%, transparent);
   font: inherit;
   text-align: start;
-  transition: background-color 150ms cubic-bezier(0.2, 0, 0, 1);
+  transition: background-color var(--ak-sys-duration-short) var(--ak-sys-motion-standard);
 }
 
-.message-reply-reference:hover,
 .message-reply-reference:active {
-  background: color-mix(in oklch, var(--ak-color-action-primary) 14%, transparent);
+  background: color-mix(in oklab, var(--ak-color-action-primary) 14%, transparent);
+}
+@media (hover: hover) {
+  .message-reply-reference:hover {
+    background: color-mix(in oklab, var(--ak-color-action-primary) 14%, transparent);
+  }
 }
 
 .message-reply-reference:focus-visible {
@@ -575,8 +1070,66 @@
   min-width: 0;
 }
 
+/* 连续完成的工具收成一行摘要；展开后成员恢复普通行距。 */
+.tool-group {
+  min-width: 0;
+}
+
+.tool-group-items {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+/* 一轮结束后的过程摘要：与工具行同一栅格；展开后内部吸顶行让出摘要行的高度。 */
+.turn-process {
+  min-width: 0;
+  margin-block-end: 10px;
+}
+
+.turn-process-items {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  padding-block-start: 2px;
+}
+
+.turn-process-failed {
+  color: var(--ak-color-status-error);
+  font-style: normal;
+}
+
+.turn-process.is-open .turn-process-items :is(.tool-step-sticky.is-open, .thinking-row[data-state="open"] .process-trigger-sticky) {
+  top: calc(var(--heading-cover, 0px) + var(--tool-sticky-h));
+}
+
+.turn-process.is-open .turn-process-items .tool-group.is-open .tool-group-items .tool-step-sticky.is-open {
+  top: calc(var(--heading-cover, 0px) + 2 * var(--tool-sticky-h));
+}
+
+/* 跨天分隔：居中日期两侧各一条发丝线，与消息行同色阶。 */
+.day-separator {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 18px 0 6px;
+  color: var(--ak-ink-secondary);
+  font-size: var(--chat-type-caption, 0.75rem);
+  line-height: 1;
+  user-select: none;
+}
+
+.day-separator::before,
+.day-separator::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: color-mix(in oklab, var(--ak-ink-primary) 10%, transparent);
+}
+
 /* Reasoning 根节点自带 mb-4；逐行排列不需要段距。 */
 .thinking-row {
+  min-width: 0;
   margin: 0;
 }
 
@@ -599,7 +1152,7 @@
 .process-trigger-icon {
   flex: none;
   width: 13px;
-  color: color-mix(in oklch, var(--ak-color-text-secondary) 80%, transparent);
+  color: color-mix(in oklab, var(--ak-color-text-secondary) 80%, transparent);
 }
 
 .process-trigger-label {
@@ -610,7 +1163,7 @@
 .process-trigger-summary {
   min-width: 0;
   overflow: hidden;
-  color: color-mix(in oklch, var(--ak-color-text-secondary) 72%, transparent);
+  color: color-mix(in oklab, var(--ak-color-text-secondary) 72%, transparent);
   font-weight: 400;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -618,7 +1171,7 @@
 
 /* 流式时焦点落在当前活动：标签加深、摘要行轻微呼吸。 */
 .process-trigger.is-streaming {
-  color: color-mix(in oklch, var(--ak-color-text-primary) 80%, transparent);
+  color: color-mix(in oklab, var(--ak-color-text-primary) 80%, transparent);
 }
 
 .process-trigger.is-streaming .process-trigger-icon {
@@ -626,7 +1179,33 @@
 }
 
 .process-trigger.is-streaming .process-trigger-summary {
+  /* 参考 dsh:流式摘要槽位定宽，右缘渐变淡出代替生硬截断。 */
+  mask-image: linear-gradient(to right, black calc(100% - 48px), transparent);
   animation: process-trace-breathe 1.6s ease-in-out infinite;
+}
+
+/* 流式思考显示最新一行的末尾：短时靠左；写满槽位后右端贴齐最新文字，左缘淡出被推出去的部分。 */
+.process-trigger-summary.is-tail {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.process-trigger.is-streaming .process-trigger-summary.is-tail {
+  mask-image: none;
+}
+
+.process-trigger-summary.is-tail > span {
+  flex: none;
+  white-space: nowrap;
+}
+
+.process-trigger-summary.is-tail::after {
+  content: "";
+  flex: 1 1 auto;
+}
+
+.process-trigger.is-streaming .process-trigger-summary.is-tail.is-clipped {
+  mask-image: linear-gradient(to right, transparent, black 48px);
 }
 
 @keyframes process-trace-breathe {
@@ -638,15 +1217,18 @@
    button 上 sticky 在部分内核不生效，吸附放在外包 div。 */
 .thinking-row[data-state="open"] .process-trigger-sticky {
   position: sticky;
-  top: 0;
+  top: var(--heading-cover, 0px);
   z-index: 2;
   background: var(--ak-color-bg-canvas);
-  box-shadow: inset 0 -1px 0 color-mix(in oklch, var(--ak-color-text-primary) 7%, transparent);
+  box-shadow: inset 0 -1px 0 color-mix(in oklab, var(--ak-color-text-primary) 7%, transparent);
 }
 
-.process-trigger:hover,
 .process-trigger:active {
   color: var(--ak-color-status-trace);
+}
+
+@media (hover: hover) {
+  .process-trigger:hover { color: var(--ak-color-status-trace); }
 }
 
 .process-trigger .process-chevron {
@@ -655,19 +1237,46 @@
 }
 
 .process-chevron {
-  transition: transform 180ms cubic-bezier(0.2, 0, 0, 1);
+  transition: translate var(--ak-sys-duration-short) var(--ak-sys-motion-standard), transform var(--ak-sys-duration-short) var(--ak-sys-motion-standard);
 }
 
 .process-chevron.open {
   transform: rotate(180deg);
 }
 
+/* 过程里每一步（思考、工具、上下文提示）都能展开，一列十个常驻箭头只是噪音（Codex 桌面版同样只在悬停时给）。
+   鼠标下收起着的箭头在悬停或键盘聚焦该行时才出现；展开着的保留，它告诉人怎么收回去。
+   本轮与工具组的摘要行、图文回复前段收纳过程的摘要行、触屏照旧常驻。 */
+@media (hover: hover) and (pointer: fine) {
+  .process-trigger:not(.inline-reply-process > details > summary) .process-chevron:not(.open),
+  .tool-step-summary:not(.turn-process-summary, .tool-group-summary) .tool-step-chevron:not(.open) {
+    opacity: 0;
+    transition: opacity var(--ak-sys-duration-short) var(--ak-sys-motion-standard), translate var(--ak-sys-duration-short) var(--ak-sys-motion-standard), transform var(--ak-sys-duration-short) var(--ak-sys-motion-standard);
+  }
+  .context-notice[open] > .process-trigger .process-chevron,
+  .process-trigger:is(:hover, :focus-visible) .process-chevron:not(.open),
+  .tool-step-summary:is(:hover, :focus-visible) .tool-step-chevron:not(.open) {
+    opacity: 1;
+    /* 箭头先朝「将要打开」的方向挪 2px：点击之前，行就说清按下会发生什么。 */
+    translate: 0 2px;
+  }
+}
+
 /* 展开的思考正文缩进到行标签之下，字色保持第三级。 */
 .process-content {
+  min-width: 0;
   padding-left: 19px;
   color: var(--ak-color-text-secondary);
   outline: none;
 }
+
+/* 展开瞬间到位、只淡入：思考常有几千像素，过渡高度每帧都要重排整段（Claude Desktop 同样不做高度动画）。 */
+.thinking-row > .process-content[data-state="open"] {
+  animation: thinking-content-in var(--ak-sys-duration-short) ease-out;
+}
+
+@keyframes thinking-content-in { from { opacity: 0; translate: 0 2px; filter: blur(3px); } }
+@media (prefers-reduced-motion: reduce) { .thinking-row > .process-content[data-state="open"] { animation-name: none; } }
 
 /* 同轮中途回复：正常流出但字色更淡，最终回复保持墨色。 */
 .timeline-narration {
@@ -684,24 +1293,27 @@
 
 .process-text {
   max-width: 72ch;
-  color: color-mix(in oklch, var(--ak-color-text-primary) 46%, transparent);
+  color: color-mix(in oklab, var(--ak-color-text-primary) 46%, transparent);
   font-size: 0.75rem;
   line-height: 1.55;
+  overflow-wrap: break-word;
   white-space: pre-wrap;
   user-select: text;
 }
 
 /* 正在流式输出的思考正文略深，完成后沉入背景。 */
 .thinking-row:has(.process-trigger.is-streaming) .process-text {
-  color: color-mix(in oklch, var(--ak-color-text-primary) 62%, transparent);
+  color: color-mix(in oklab, var(--ak-color-text-primary) 62%, transparent);
 }
 
 .process-markdown {
   min-width: 0;
+  overflow-wrap: break-word;
   white-space: normal;
 }
 
 .process-markdown-fallback {
+  overflow-wrap: break-word;
   white-space: pre-wrap;
 }
 
@@ -727,7 +1339,7 @@
   display: flex;
   align-items: center;
   gap: 6px;
-  color: color-mix(in oklch, var(--ak-color-text-primary) 60%, transparent);
+  color: color-mix(in oklab, var(--ak-color-text-primary) 60%, transparent);
   font-family: var(--ak-type-technical, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
   font-size: 0.75rem;
   font-weight: 500;
@@ -737,6 +1349,12 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 本轮与工具组摘要是中文句子（"思考 3 次，调用 5 个工具"），不是工具名：用正文字体，数字等宽。 */
+:is(.turn-process-summary, .tool-group-summary) .tool-step-title {
+  font-family: var(--ak-type-reading);
+  font-variant-numeric: tabular-nums;
 }
 
 .tool-step-summary {
@@ -750,16 +1368,19 @@
   color: inherit;
   background: transparent;
   text-align: left;
-  transition: background-color 150ms cubic-bezier(0.2, 0, 0, 1), color 150ms cubic-bezier(0.2, 0, 0, 1), scale 150ms cubic-bezier(0.2, 0, 0, 1);
+  transition: background-color var(--ak-sys-duration-short) var(--ak-sys-motion-standard), color var(--ak-sys-duration-short) var(--ak-sys-motion-standard), scale var(--ak-sys-duration-short) var(--ak-sys-motion-standard);
 }
 
 .tool-step-summary-static {
   cursor: default;
 }
 
-button.tool-step-summary:hover {
-  color: color-mix(in oklch, var(--ak-color-text-primary) 72%, transparent);
-  background: color-mix(in oklch, var(--ak-ink-primary) 5%, transparent);
+/* 触屏的 :hover 会粘在最后点过的行上，悬停底色只给真正能悬停的指针。 */
+@media (hover: hover) {
+  button.tool-step-summary:hover {
+    color: color-mix(in oklab, var(--ak-color-text-primary) 72%, transparent);
+    background: color-mix(in oklab, var(--ak-ink-primary) 5%, transparent);
+  }
 }
 
 button.tool-step-summary:active {
@@ -797,6 +1418,17 @@ button.tool-step-summary:active {
   user-select: text;
 }
 
+/* 路径摘要：整段放进 RTL 行、内容按 LTR 隔离，省略号落在左侧——放不下时先让出最外层目录，文件名最后才让；
+   仍是一个文本节点，选中复制得到原样的一行路径。 */
+.tool-step-description--path {
+  direction: rtl;
+  text-align: left;
+}
+.tool-step-description--path > bdi {
+  direction: ltr;
+  unicode-bidi: isolate;
+}
+
 .tool-step-state {
   font-size: 0.6875rem;
   font-variant-numeric: tabular-nums;
@@ -805,7 +1437,7 @@ button.tool-step-summary:active {
 }
 
 .tool-step-chevron {
-  transition: transform 180ms cubic-bezier(0.2, 0, 0, 1);
+  transition: translate var(--ak-sys-duration-short) var(--ak-sys-motion-standard), transform var(--ak-sys-duration-short) var(--ak-sys-motion-standard);
 }
 
 .tool-step-chevron.open {
@@ -820,19 +1452,82 @@ button.tool-step-summary:active {
   color: var(--ak-color-status-error);
 }
 
+/* 展开区：grid 行过渡高度，内层淡入并下移 4px；收起淡出更快。
+   内层只能用 overflow: clip，hidden 会建立滚动容器，让嵌套行的 sticky 失效。 */
 .tool-step-disclosure {
   display: grid;
   grid-template-rows: 0fr;
-  transition: grid-template-rows 200ms cubic-bezier(0.2, 0, 0, 1);
+  transition: grid-template-rows var(--ak-sys-duration-medium) var(--ak-sys-motion-standard);
 }
 
 .tool-step-disclosure.open {
   grid-template-rows: 1fr;
 }
 
+/* grid 子项默认 min-width:auto 会被不折行的 diff 撑开（实测一行 1500 字撑到 1 万多像素）；归零后横滚留在结果区内。 */
+.tool-step-disclosure-inner,
+.tool-detail-section {
+  min-width: 0;
+}
+
 .tool-step-disclosure-inner {
   min-height: 0;
-  overflow: hidden;
+  overflow: clip;
+  opacity: 0;
+  translate: 0 -4px;
+  transition-property: opacity, translate;
+  transition-duration: var(--ak-sys-duration-short), var(--ak-sys-duration-medium);
+  transition-timing-function: ease-out, var(--ak-sys-motion-standard);
+}
+
+.tool-step-disclosure.open > .tool-step-disclosure-inner {
+  opacity: 1;
+  translate: 0 0;
+  transition-duration: var(--ak-sys-duration-medium), var(--ak-sys-duration-medium);
+}
+
+/* 吸顶状态下的收起瞬间完成，由脚本把行放回原位后再淡入下方内容。 */
+.tool-step-disclosure.is-instant,
+.tool-step-disclosure.is-instant > .tool-step-disclosure-inner {
+  transition: none;
+}
+
+/* 展开的工具行吸在消息列表顶部，读到哪都能收起；嵌在工具组里的行让出一行组标题的高度。
+   行高在展开时固定，嵌套偏移才能直接用变量计算。button 上 sticky 在部分内核不生效，吸附放在外包 div。 */
+.process-trace,
+.turn-process {
+  --tool-sticky-h: 28px;
+}
+
+/* --heading-cover：窄屏浮在滚动区上方的标题栏在场时的遮挡高度，吸顶行让到它下面。 */
+.tool-step-sticky.is-open {
+  position: sticky;
+  top: var(--heading-cover, 0px);
+  z-index: 3;
+  display: flex;
+  height: var(--tool-sticky-h);
+  align-items: center;
+  background: var(--ak-color-bg-canvas);
+  box-shadow: inset 0 -1px 0 color-mix(in oklab, var(--ak-color-text-primary) 7%, transparent);
+}
+
+.tool-group.is-open .tool-group-items .tool-step-sticky.is-open {
+  top: calc(var(--heading-cover, 0px) + var(--tool-sticky-h));
+  z-index: 2;
+}
+
+.tool-step-collapse-hint {
+  color: var(--ak-color-text-secondary);
+  font-family: var(--ak-type-reading, inherit);
+  font-size: 0.6875rem;
+  font-weight: 400;
+}
+
+@media (pointer: coarse) {
+  .process-trace,
+  .turn-process {
+    --tool-sticky-h: 44px;
+  }
 }
 
 .tool-detail-surface {
@@ -875,13 +1570,18 @@ button.tool-step-summary:active {
   background: transparent;
   font-size: var(--md-sys-typescale-label-medium-size);
   font-weight: 650;
-  transition: scale 180ms cubic-bezier(0.2, 0, 0, 1), background-color 180ms cubic-bezier(0.2, 0, 0, 1);
+  transition: scale var(--ak-sys-duration-short) var(--ak-sys-motion-standard), background-color var(--ak-sys-duration-short) var(--ak-sys-motion-standard);
 }
 
-.tool-detail-copy:hover,
 .tool-detail-copy:active {
   scale: 0.96;
-  background: color-mix(in oklch, var(--ak-ink-primary) 5%, transparent);
+  background: color-mix(in oklab, var(--ak-ink-primary) 5%, transparent);
+}
+@media (hover: hover) {
+  .tool-detail-copy:hover {
+    scale: 0.96;
+    background: color-mix(in oklab, var(--ak-ink-primary) 5%, transparent);
+  }
 }
 
 .tool-detail-copy.copied {
@@ -907,11 +1607,12 @@ button.tool-step-summary:active {
   line-height: 1.5;
 }
 
+/* 退一步但要读得清：用 muted 墨色（浅色 4.9:1、深色 5.6:1）；原 52% 透明墨色在浅色纸面上 12px 只有 3.6:1。 */
 .tool-parameter dd,
 .tool-result {
   overflow-wrap: anywhere;
   margin: 0;
-  color: color-mix(in oklch, var(--ak-color-text-primary) 52%, transparent);
+  color: var(--ak-ink-muted);
   font-family: var(--ak-type-technical, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
   font-size: 0.75rem;
   line-height: 1.5;
@@ -919,10 +1620,128 @@ button.tool-step-summary:active {
   user-select: text;
 }
 
+/* 结果不在框内滚动：长文本先给预览，“显示全部”原地铺开。clip 供展开时的高度动画裁切。 */
 .tool-result {
-  max-height: 11rem;
-  overflow: auto;
-  overscroll-behavior: contain;
+  overflow: clip;
+}
+
+/* 统一 diff：增删行用状态色的文字加极淡底色，整行铺满；路径头与 hunk 头退成次级。 */
+/* 每行一个网格项：列宽取最长一行与容器宽的较大者，增删底色整行铺到最右；内容整体横滚。 */
+.tool-result.is-diff {
+  display: grid;
+  grid-template-columns: minmax(max-content, 1fr);
+  overflow: auto hidden;
+  white-space: pre;
+  overscroll-behavior-x: contain;
+}
+.tool-result.is-diff .tool-diff-line { display: block; }
+.tool-diff-line { display: inline-block; min-inline-size: 100%; }
+.tool-diff-line.is-add {
+  color: var(--ak-color-status-success);
+  background: color-mix(in oklab, var(--ak-color-status-success) 8%, transparent);
+}
+.tool-diff-line.is-del {
+  color: var(--ak-color-status-error);
+  background: color-mix(in oklab, var(--ak-color-status-error) 7%, transparent);
+}
+.tool-diff-line.is-hunk { color: var(--ak-color-status-trace-text); }
+.tool-diff-line.is-meta { opacity: 0.7; }
+
+.tool-result.is-clipped-head {
+  mask-image: linear-gradient(to bottom, transparent 0, #000 2.2rem);
+}
+
+.tool-result.is-clipped-tail {
+  mask-image: linear-gradient(to top, transparent 0, #000 2.2rem);
+}
+
+.tool-result-preview {
+  display: grid;
+  min-width: 0;
+}
+
+.tool-result-more {
+  width: fit-content;
+  min-height: 32px;
+  border: 0;
+  border-radius: 8px;
+  padding: 0 8px;
+  margin-inline-start: -8px;
+  color: var(--ak-color-action-primary);
+  background: transparent;
+  font-size: 0.75rem;
+  transition: background-color var(--ak-sys-duration-short) var(--ak-sys-motion-standard);
+}
+
+@media (hover: hover) {
+  .tool-result-more:hover {
+    background: color-mix(in oklab, var(--ak-ink-primary) 5%, transparent);
+  }
+}
+
+/* 命令块：$ 命令 → 输出 → 底栏结果与耗时；内部字段收进原始数据。 */
+.tool-shell {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  border-radius: 8px;
+  padding: 8px 10px 4px;
+  background: color-mix(in oklab, var(--ak-ink-primary) 4%, transparent);
+}
+
+.tool-shell-command {
+  display: flex;
+  gap: 1ch;
+  overflow-wrap: anywhere;
+  color: var(--ak-color-text-primary);
+  font-family: var(--ak-type-technical, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  font-size: 0.75rem;
+  line-height: 1.5;
+}
+
+.tool-shell-command > span:first-child {
+  color: var(--ak-color-text-secondary);
+  user-select: none;
+}
+
+.tool-shell-empty {
+  margin: 0;
+  color: var(--ak-color-text-secondary);
+  font-size: 0.75rem;
+}
+
+.tool-shell-foot {
+  display: flex;
+  min-height: 28px;
+  align-items: center;
+  gap: 10px;
+  border-top: 1px solid var(--ak-rule-subtle);
+  color: var(--ak-color-text-secondary);
+  font-size: 0.75rem;
+}
+
+.tool-shell-exit {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--ak-sys-color-success);
+}
+
+.tool-shell-exit.is-failed {
+  color: var(--ak-color-status-error);
+}
+
+.tool-result-raw {
+  margin-top: 6px;
+  color: var(--ak-color-text-secondary);
+  font-size: 0.75rem;
+}
+
+.tool-result-raw > summary {
+  width: fit-content;
+  min-height: 28px;
+  padding-block: 4px;
+  cursor: pointer;
 }
 
 .tool-result.error {
@@ -933,153 +1752,138 @@ button.tool-step-summary:active {
   color: var(--ak-color-status-trace);
 }
 
-.message-attachments {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-block: 0 10px;
+/* 图片/视频查看器：整屏压暗，点媒体外的空白处关闭。压暗层在深浅主题都是暗的，顶栏用固定的浅色前景，
+   和所有看图器一样不随主题翻转；背后的标题文字再糊一层，不透出来和顶栏抢。 */
+.media-preview-overlay {
+  background: rgb(var(--ak-color-shadow-rgb) / 0.92);
+  backdrop-filter: blur(6px);
 }
 
-.user-bubble .message-attachments {
-  margin-inline-start: auto;
-  justify-content: flex-end;
-}
-
-.agent-content .message-attachments {
-  margin-inline-end: auto;
-}
-
-.message-attachments .group {
-  border-color: transparent;
-  background: transparent;
-}
-
-/* Memoh content media: natural aspect, never cropped square. */
-.message-content-image {
-  display: block;
-  width: fit-content;
-  max-width: min(28rem, 100%);
-  margin: 0;
-  overflow: hidden;
-  border: 1px solid color-mix(in oklch, var(--md-sys-color-on-surface) 14%, transparent);
-  border-radius: var(--md-sys-shape-corner-small);
-  padding: 0;
-  background: var(--md-sys-color-surface-container-low);
-  cursor: zoom-in;
-}
-
-.message-content-image:focus-visible {
-  outline: 2px solid var(--md-sys-color-primary);
-  outline-offset: 2px;
-}
-
-.message-content-image__media {
-  display: block;
-  width: auto;
-  max-width: 100%;
-  max-height: 20rem;
-  height: auto;
-  object-fit: contain;
-  outline: none;
-}
-
-/* Memoh attachment chip: fixed square (~120px). */
-.message-attachment-chip,
-.attachment-chip {
-  --chat-chip-size: 7.5rem;
-  position: relative;
+/* 查看器铺满视口：顶栏固定在顶部、媒体在其下居中。翻到尺寸不同的下一张时翻页钮不跟着图片挪位置，
+   切原始像素也不会让顶栏从屏幕中间跳到顶端。媒体四周的空白就是查看器本身，点它关闭。 */
+.media-preview {
   display: grid;
-  width: var(--chat-chip-size);
-  height: var(--chat-chip-size);
-  overflow: hidden;
-  border: 1px solid color-mix(in oklch, var(--md-sys-color-on-surface) 14%, transparent);
-  border-radius: var(--md-sys-shape-corner-small);
-  color: var(--md-sys-color-on-surface-variant);
-  background: var(--md-sys-color-surface-container-low);
-  place-items: center;
-  transition-property: border-color;
-  transition-duration: 120ms;
-  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
-}
-
-.message-attachment-chip:hover,
-.attachment-chip:hover,
-.message-attachment-chip:focus-visible,
-.attachment-chip:focus-visible {
-  border-color: color-mix(in oklch, var(--md-sys-color-on-surface) 22%, transparent);
-}
-
-.message-attachment-chip.is-media img,
-.attachment-chip.is-media img {
-  display: block;
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-}
-
-.message-attachment-chip.is-file,
-.attachment-chip.is-file,
-.message-attachment-chip.is-broken {
-  display: grid;
-  align-content: center;
-  justify-items: center;
-  gap: 6px;
-  padding: 10px;
-  text-align: center;
-}
-
-.attachment-chip.is-file .attachment-preview-slot {
-  position: static;
-  width: auto;
-  height: auto;
-}
-
-.attachment-chip.is-file .attachment-preview-icon {
-  position: static;
-}
-
-.attachment-chip.is-file .attachment-remove-inline {
-  position: absolute;
-  inset: auto 4px 4px auto;
-}
-
-.message-attachment-chip.is-file span,
-.attachment-chip.is-file span,
-.message-attachment-chip.is-broken span {
-  max-width: 100%;
-  overflow: hidden;
-  font-size: 0.6875rem;
-  line-height: 1.3;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.message-attachment-chip.is-broken small {
-  color: color-mix(in oklch, var(--md-sys-color-on-surface-variant) 85%, transparent);
-  font-size: 0.625rem;
-}
-
-.previewable-attachment {
-  cursor: zoom-in;
-}
-
-.image-preview-dialog {
-  width: min(94vw, 56rem);
+  width: 100vw;
+  height: 100dvh;
   max-width: none;
-  max-height: 90vh;
+  max-height: none;
+  grid-template-rows: auto minmax(0, 1fr);
+  place-items: center;
+  gap: 0;
+  overflow: hidden;
   border: 0;
-  padding: 0;
+  border-radius: 0;
+  padding: max(4px, env(safe-area-inset-top)) max(8px, 3vw, env(safe-area-inset-right))
+    max(2dvh, env(safe-area-inset-bottom)) max(8px, 3vw, env(safe-area-inset-left));
   background: transparent;
   box-shadow: none;
+  color: rgb(255 255 255 / 0.92);
 }
 
-.image-preview-full {
+.media-preview__bar {
+  display: flex;
+  min-width: 0;
+  justify-self: stretch;
+  padding-block-end: 4px;
+  align-items: center;
+  gap: 4px;
+}
+
+.media-preview__title {
+  flex: 1;
+  min-width: 0;
+  color: inherit;
+  font-size: 0.875rem;
+  font-weight: 500;
+  line-height: 1.4;
+}
+
+.media-preview__bar :is(a, button) {
+  display: grid;
+  width: 40px;
+  height: 40px;
+  flex: 0 0 40px;
+  place-items: center;
+  border-radius: 12px;
+  color: inherit;
+  opacity: 0.82;
+}
+
+.media-preview__bar :is(a, button):hover {
+  opacity: 1;
+  background: rgb(255 255 255 / 0.12);
+}
+
+.media-preview__bar :is(a, button):focus-visible {
+  opacity: 1;
+  outline: 2px solid rgb(255 255 255 / 0.9);
+  outline-offset: 1px;
+}
+
+/* 媒体只用顶栏之下、四侧安全区以内的那块区域（grid 第二行），长图不压顶栏、横屏不进刘海。 */
+.media-preview__media {
   display: block;
   max-width: 100%;
-  max-height: 84vh;
-  margin: 0 auto;
-  border-radius: 14px;
+  max-height: 100%;
+  border-radius: 12px;
   object-fit: contain;
+}
+
+/* 同一条消息里有多张媒体时，顶栏中间是"‹ 2 / 5 ›"：计数用等宽数字，翻页钮与其它顶栏钮同尺寸，到头时退为禁用。 */
+.media-preview__pager {
+  display: flex;
+  align-items: center;
+  font-size: 0.8125rem;
+  font-variant-numeric: tabular-nums;
+}
+.media-preview__pager > span {
+  min-width: 3.5em;
+  text-align: center;
+  opacity: 0.82;
+}
+.media-preview__bar button:disabled {
+  opacity: 0.32;
+  background: none;
+  cursor: default;
+}
+
+/* 图片画框固定占满媒体区，也是原始像素下的滚动容器：两种状态框不动，点击放大时所点细节留在指针下；
+   画框尺寸确定，没有固有宽高的 SVG 也量得出大小。图片用 auto 外边距居中，放大后超出的部分从左上角起可滚到。
+   画框里图片以外的空白同样点了关闭。 */
+.media-preview__frame {
+  display: grid;
+  width: 100%;
+  height: 100%;
+  grid-template: minmax(0, 1fr) / minmax(0, 1fr);
+  overflow: hidden;
+  border-radius: 12px;
+}
+.media-preview__frame > .media-preview__media { margin: auto; }
+/* 横滑交给页面脚本切换上一个/下一个；原始像素画框本身是滚动容器，
+   touch-action 只沿祖先链算到最近的滚动容器，横向平移仍归浏览器。 */
+.media-preview { touch-action: pan-y pinch-zoom; }
+.media-preview__frame.is-actual {
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.media-preview__media.is-scaled { cursor: zoom-in; }
+.media-preview__media.is-actual {
+  max-width: none;
+  max-height: none;
+  border-radius: 0;
+  cursor: zoom-out;
+}
+
+/* 回复正文里的图片可点开看大图（MediaGalleryViewer 委托点击）。 */
+:is(.agent-content, .process-markdown) img:not(:is(a, button) img) {
+  cursor: zoom-in;
+}
+
+/* 视频按视口放大：320px 的录屏也铺到 56rem 宽，等比、不裁切。 */
+.media-preview__media.is-video {
+  width: min(100%, 56rem);
+  height: auto;
+  background: #000;
 }
 
 .composer-reply {
@@ -1090,7 +1894,7 @@ button.tool-step-summary:active {
   gap: 6px;
   padding: 4px 6px 4px 16px;
   color: var(--ak-color-on-action-container);
-  background: color-mix(in oklch, var(--ak-color-action-container) 48%, var(--md-sys-color-surface-container-high));
+  background: color-mix(in oklab, var(--ak-color-action-container) 48%, var(--md-sys-color-surface-container-high));
 }
 
 .composer-reply > svg {
@@ -1119,8 +1923,7 @@ button.tool-step-summary:active {
   white-space: nowrap;
 }
 
-.composer-reply > button,
-.shared-message-actions button {
+.composer-reply > button {
   display: grid;
   width: 40px;
   height: 40px;
@@ -1130,7 +1933,38 @@ button.tool-step-summary:active {
   padding: 0;
   color: var(--md-sys-color-on-surface-variant);
   background: transparent;
-  transition: scale 150ms cubic-bezier(0.2, 0, 0, 1), background-color 150ms cubic-bezier(0.2, 0, 0, 1), color 150ms cubic-bezier(0.2, 0, 0, 1);
+  transition: scale var(--ak-sys-duration-short) var(--ak-sys-motion-standard), background-color var(--ak-sys-duration-short) var(--ak-sys-motion-standard), color var(--ak-sys-duration-short) var(--ak-sys-motion-standard);
+}
+
+/* 次要操作幽灵钮：默认透明，父消息 hover/focus-within 显现；透明边撑热区，视觉保持 24px 见方。 */
+.shared-message-actions button {
+  display: grid;
+  width: var(--shared-action-hit);
+  height: var(--shared-action-hit);
+  place-items: center;
+  border: var(--shared-action-inset) solid transparent;
+  border-radius: calc(var(--shared-action-inset) + 5px);
+  padding: 0;
+  box-sizing: border-box;
+  color: var(--ak-ink-secondary);
+  background: transparent;
+  /* hover 墨底只落在 padding-box（24px 视觉区），不外溢到透明热区。 */
+  background-clip: padding-box;
+  opacity: 0;
+  transition:
+    opacity var(--ak-sys-duration-short) var(--ak-sys-motion-standard),
+    background-color var(--ak-sys-duration-short) var(--ak-sys-motion-standard),
+    color var(--ak-sys-duration-short) var(--ak-sys-motion-standard);
+}
+
+/* 消息容器 hover/focus-within 显现次要操作；focus-within 同时保证键盘 Tab 到达时可见。 */
+.web-message-anchor:focus-within .shared-message-actions button {
+  opacity: 1;
+}
+@media (hover: hover) {
+  .web-message-anchor:hover .shared-message-actions button {
+    opacity: 1;
+  }
 }
 
 .shared-message-actions .lucide-reply,
@@ -1138,13 +1972,30 @@ button.tool-step-summary:active {
   translate: 0.5px -0.25px;
 }
 
-.composer-reply > button:hover,
-.composer-reply > button:active,
-.shared-message-actions button:hover,
-.shared-message-actions button:active {
+.composer-reply > button:active {
   scale: 0.96;
   color: var(--md-sys-color-on-surface);
   background: color-mix(in srgb, var(--md-sys-color-on-surface) 8%, transparent);
+}
+@media (hover: hover) {
+  .composer-reply > button:hover {
+    scale: 0.96;
+    color: var(--md-sys-color-on-surface);
+    background: color-mix(in srgb, var(--md-sys-color-on-surface) 8%, transparent);
+  }
+}
+
+/* 触屏的 :hover 会在点击后粘住，悬停底色只给真正能悬停的指针；按下反馈两者都有。 */
+.shared-message-actions button:active {
+  color: var(--ak-ink-primary);
+  background: color-mix(in oklab, var(--ak-ink-primary) 6%, transparent);
+}
+
+@media (hover: hover) {
+  .shared-message-actions button:hover {
+    color: var(--ak-ink-primary);
+    background: color-mix(in oklab, var(--ak-ink-primary) 6%, transparent);
+  }
 }
 
 .shared-message-meta {
@@ -1164,15 +2015,61 @@ button.tool-step-summary:active {
   flex-direction: row-reverse;
 }
 
+/* 有悬停的宽屏：只有最新一条常驻时间与操作，更早的消息悬停或聚焦时整行显现，行高不变、不推动正文。 */
+@media (hover: hover) and (min-width: 36.0625rem) {
+  .web-message-anchor .shared-message-meta {
+    transition: opacity var(--ak-sys-duration-short) var(--ak-sys-motion-standard);
+  }
+
+  /* 悬停与聚焦写进同一个 :not()：分成两条时 nth-last-child(of) 的特异性更高，悬停永远显不出来。 */
+  .web-message-anchor:not(:nth-last-child(1 of .web-message-anchor), :hover, :focus-within) .shared-message-meta {
+    opacity: 0;
+  }
+}
+
+/* 发送确认通常在一秒内到达：短暂停留时不闪"发送中"，超过 1.2 秒才淡入。 */
+/* 落纸：新挂载的块抬 2px 并带一点模糊落定，只在挂载那一次跑，不逐 token 重放。
+   逐词 cross-blur 会在每个token 上重跑滤镜，成本乘上长回复的长度。 */
+.shared-message-delivery { padding-inline: 4px; color: var(--ak-ink-muted); }
+@media (prefers-reduced-motion: no-preference) {
+  .shared-message-delivery { animation: shared-delivery-reveal 160ms var(--ak-sys-motion-standard) 1.2s both; }
+}
+@keyframes shared-delivery-reveal { from { opacity: 0; translate: 0 2px; filter: blur(3px); } }
+
+/* 热区与视觉尺寸的唯一 owner；窄屏断点只改这两个变量（触控目标 ≥44px，视觉仍 24px）。 */
 .shared-message-actions {
+  --shared-action-hit: 40px;
+  --shared-action-inset: 8px;
   display: flex;
   align-items: center;
   gap: 2px;
 }
 
+/* 复制成功反馈短暂常驻：即使鼠标已移开也保持可见，复位节奏由 copiedMessageId 状态控制。 */
 .shared-message-actions button.copied {
+  opacity: 1;
   color: var(--ak-sys-color-success);
   background: color-mix(in srgb, var(--ak-sys-color-success) 12%, transparent);
+}
+
+/* 触控断点没有 hover：次要操作常驻可见；热区扩到 44px，图形不变。 */
+@media (max-width: 820px), (hover: none) {
+  .shared-message-actions {
+    --shared-action-hit: 44px;
+    --shared-action-inset: 10px;
+  }
+
+  .shared-message-actions button {
+    opacity: 1;
+  }
+
+  /* 左滑引用松手后消息回弹原位。 */
+  .web-message-anchor { transition: translate var(--ak-sys-duration-short) var(--ak-sys-motion-standard, ease); }
+
+  /* 热区互相重叠 12px：图标间距与时间到首个图标同为 18px，每个热区仍是 44px。 */
+  .shared-message-actions button + button {
+    margin-inline-start: -12px;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1185,6 +2082,8 @@ button.tool-step-summary:active {
   .tool-step-summary,
   .tool-step-chevron,
   .tool-step-disclosure,
+  .tool-step-disclosure-inner,
+  .tool-result-more,
   .tool-detail-copy,
   .message-reply-reference,
   .composer-reply > button,
@@ -1243,21 +2142,58 @@ button.tool-step-summary:active {
 /* Message 正文类型只决定布局；作者与来源由消息元数据呈现。 */
 .timeline-message { display: flex; flex-direction: column; gap: 0.5rem; }
 .timeline-input { align-items: flex-end; }
+.timeline-input.timeline-automatic { align-items: stretch; }
+.automatic-input {
+  min-width: 0;
+  border-inline-start: 2px solid var(--ak-rule-strong);
+  padding: 2px 0 2px 12px;
+  color: var(--ak-ink-secondary);
+  font-size: 0.875rem;
+  line-height: 1.5;
+  overflow-wrap: break-word;
+}
 .timeline-message .agent-content { min-width: 0; }
 .timeline-message .user-bubble { min-width: 0; }
+/* 气泡按内容收缩，而代码块、宽表、块公式的宽度又跟着容器走：两者互相依赖时气泡塌到最小内容宽度（只有代码时只剩一条缝）。
+   含这些块的气泡直接占满允许的最大宽度。 */
+.timeline-message .user-bubble:has(pre, table, .code-block-container, .reading-math-display) { width: 100%; }
 .timeline-details { margin-block: 0.5rem; color: var(--ak-color-text-secondary); }
 .timeline-details summary { cursor: pointer; padding-block: 0.5rem; overflow-wrap: anywhere; }
 .timeline-details summary:focus-visible,
 .timeline-result-heading button:focus-visible { outline: 2px solid var(--ak-rule-focus); outline-offset: 3px; }
-.timeline-details pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.8125rem; max-height: 32rem; overflow-y: auto; }
+.timeline-details pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.8125rem; }
 .timeline-details p { overflow-wrap: anywhere; }
 .timeline-control-summary, .timeline-result-heading { border-inline-start: 2px solid var(--ak-color-border-default); padding-inline-start: 0.875rem; }
-.reply-activity { padding-block: 0.75rem; overflow-wrap: anywhere; }
+/* 与落定后的消息同一节奏：只靠列表 gap 分隔，结束换成历史消息时不跳行。 */
+.reply-activity { overflow-wrap: anywhere; }
+.timeline-control-note {
+  margin: 0;
+  color: var(--ak-color-text-secondary);
+  font-size: 0.8125rem;
+  line-height: 1.25rem;
+  overflow-wrap: anywhere;
+}
 .reply-activity-label { display: flex; gap: 0.75rem; color: var(--ak-color-text-secondary); font-size: 0.8125rem; }
 .reply-unavailable { color: var(--ak-color-text-secondary); font-size: 0.8125rem; text-align: center; }
+/* 自动重连：安静的状态行，不用错误色，不给危险按钮；呼吸点表示仍在尝试。 */
+.connection-status { display: flex; align-items: center; justify-content: center; gap: 6px; }
+.connection-status > i {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--ak-color-status-warning);
+  animation: connection-breathe 1.6s var(--ak-sys-motion-standard) infinite;
+}
+.connection-status button {
+  border: 0; padding: 4px 2px; color: var(--ak-ink-primary); background: none; font: inherit;
+  text-decoration: underline; text-underline-offset: 2px; cursor: pointer;
+}
+.connection-status button:focus-visible { outline: 2px solid var(--ak-rule-focus); outline-offset: 2px; border-radius: 4px; }
+@keyframes connection-breathe { 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) { .connection-status > i { animation: none; } }
 .timeline-control-summary strong, .timeline-result-heading strong { font-size: 0.875rem; }
 .timeline-result-heading button { display: block; min-height: 2.75rem; color: var(--ak-ink-secondary); font-size: 0.8125rem; }
-.timeline-result-heading button:hover { color: var(--ak-ink-primary); }
+@media (hover: hover) {
+  .timeline-result-heading button:hover { color: var(--ak-ink-primary); }
+}
 .timeline-result-heading button:disabled { text-decoration: none; color: var(--ak-color-text-secondary); }
 .timeline-state { color: var(--ak-color-text-secondary); font-size: 0.8125rem; }
 .timeline-meta { flex-wrap: wrap; overflow-wrap: anywhere; }
@@ -1291,3 +2227,180 @@ button.tool-step-summary:active {
   0%, 100% { opacity: 0.4; }
   50% { opacity: 1; }
 }
+
+/* 工具数据与聊天正文分开排版；字符串保留换行，窄屏在结果内部滚动。 */
+.tool-result-data { min-width: 0; }
+.tool-result-fields { margin: 0; }
+.tool-result-fields > div { margin-block: 0.5rem; }
+.tool-result-fields dt,
+.tool-result-fields summary {
+  color: var(--ak-ink-secondary);
+  font-family: var(--ak-type-technical);
+  font-size: var(--chat-type-caption);
+  overflow-wrap: anywhere;
+}
+.tool-result-fields dd { margin: 0.25rem 0 0; min-width: 0; }
+.tool-result-fields details { padding-inline-start: 0.75rem; border-inline-start: 1px solid var(--ak-rule-subtle); }
+/* 失败输出照常用正文墨色（整段日志染红只会喧嚣、难读）；错误语义由标题色与左侧 2px 细线承担。 */
+.tool-detail-section.is-error .tool-detail-heading h4 { color: var(--ak-color-status-error); }
+.tool-result-data.error .tool-result {
+  /* 普通结果是 52% 透明墨色；失败原因需要读，提到次级墨色（浅色对比度 ≥4.5:1）。 */
+  color: var(--ak-ink-secondary);
+  padding-inline-start: 0.75rem;
+  border-inline-start: 2px solid color-mix(in oklab, var(--ak-color-status-error) 60%, transparent);
+}
+
+/* 上下文提示：沿用思考行的触发行；原生 details 的三角标记换成右侧 chevron。 */
+.context-notice > summary {
+  display: flex;
+  align-items: center;
+  list-style: none;
+  cursor: pointer;
+}
+
+.context-notice > summary::-webkit-details-marker { display: none; }
+.context-notice[open] .process-chevron { rotate: 180deg; }
+.context-notice > .process-content { margin: 2px 0 6px; }
+
+.retry-status {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--ak-rule-subtle);
+  border-radius: 12px;
+  background: var(--ak-paper-quiet);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+.retry-status__text {
+  display: grid;
+  flex: 1;
+  min-width: 0;
+  gap: 2px;
+}
+
+.retry-status__text strong { font-weight: 600; }
+
+.retry-status__text code {
+  padding: 0;
+  background: none;
+  color: var(--ak-ink-muted);
+  font-family: var(--ak-type-technical);
+  font-size: 0.6875rem;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.retry-status > button {
+  flex: none;
+  min-height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--ak-rule-default);
+  border-radius: 8px;
+  background: var(--ak-paper-canvas);
+  color: var(--ak-ink-primary);
+  font: inherit;
+  cursor: pointer;
+}
+
+@media (hover: hover) {
+  .retry-status > button:hover { background: var(--ak-paper-raised); }
+}
+.retry-status > button:focus-visible { outline: 2px solid var(--ak-rule-focus); outline-offset: 2px; }
+
+.retry-status__text span { color: var(--ak-ink-muted); }
+
+/* 重试中的尝试只占一行次级小字：草稿照常流式，原始错误点开才看。 */
+.attempt-status {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 2px 0 6px;
+  color: var(--ak-ink-muted);
+  font-size: 0.75rem;
+  line-height: 1.5;
+}
+
+.attempt-status > details { flex: 1; min-width: 0; }
+.attempt-status summary { cursor: pointer; list-style: none; overflow-wrap: anywhere; }
+.attempt-status summary::-webkit-details-marker { display: none; }
+.attempt-status summary:focus-visible { outline: 2px solid var(--ak-rule-focus); outline-offset: 2px; border-radius: 4px; }
+
+.attempt-status code {
+  display: block;
+  margin-top: 4px;
+  padding: 0;
+  background: none;
+  font-family: var(--ak-type-technical);
+  font-size: 0.6875rem;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.attempt-status > button {
+  flex: none;
+  min-height: 24px;
+  margin-top: -3px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  color: var(--ak-ink-primary);
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.attempt-status > button:focus-visible { outline: 2px solid var(--ak-rule-focus); outline-offset: 2px; }
+
+@media (max-width: 36rem) {
+  .web-message-anchor:not(:nth-last-child(1 of .web-message-anchor)):not(.is-revealed) .shared-message-meta {
+    display: none;
+  }
+}
+
+/* 插图沿正文左缘，无卡片外壳；降级文字和下载由宿主保留。 */
+.message-figure { position: relative; margin-block: 1.25rem; transition: height var(--ak-sys-duration-medium, 300ms) ease; }
+.message-figure .plugin-ui-host { margin: 0; }
+.message-figure-download { position: absolute; right: 0; top: 0; display: flex; width: 40px; min-height: 40px; align-items: center; justify-content: center;
+  color: var(--ak-color-text-secondary); font-size: 0.8125rem; text-underline-offset: 3px; opacity: 0;
+  transition: opacity var(--ak-sys-duration-short, 150ms); }
+.message-figure:focus-within .message-figure-download { opacity: 1; }
+@media (hover: hover) {
+  .message-figure:hover .message-figure-download { opacity: 1; }
+}
+.message-figure-download:focus-visible { outline: 2px solid var(--ak-color-action-primary); outline-offset: 2px; }
+.attachment-description p:last-child { margin-bottom: 0; }
+@media (hover: none), (max-width: 820px) { .message-figure-download { width: 44px; min-height: 44px; opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .message-figure, .message-figure-download { transition: none; } }
+
+.inline-reply-process { margin-bottom: 1rem; color: var(--ak-color-text-secondary); }
+.inline-reply-process > details > summary { min-height: 40px; }
+.attachment-description h3 { padding-inline-end: 44px; }
+@media (max-width: 820px), (max-height: 30rem) and (pointer: coarse) { .inline-reply-process > details > summary { min-height: 44px; } }
+
+/* 选中回复里一段文字后浮出的"引用"：墨色反白小药丸，深浅主题随墨色与底色自动反转。 */
+.selection-quote {
+  position: fixed;
+  z-index: 50;
+  display: inline-flex;
+  height: 28px;
+  align-items: center;
+  gap: 4px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 999px;
+  color: var(--ak-color-bg-canvas);
+  background: var(--ak-ink-primary);
+  box-shadow: 0 2px 8px color-mix(in oklab, var(--ak-ink-primary) 18%, transparent);
+  font-size: 0.8125rem;
+  cursor: pointer;
+  translate: -50% -100%;
+  animation: selection-quote-in var(--ak-sys-duration-short) var(--ak-sys-motion-standard);
+}
+.selection-quote.is-below { translate: -50% 0; }
+.selection-quote:focus-visible { outline: 2px solid var(--ak-rule-focus); outline-offset: 2px; }
+@keyframes selection-quote-in { from { opacity: 0; } }

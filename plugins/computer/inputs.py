@@ -1,9 +1,9 @@
-from agent.plugin_contracts.tools import (
+from plugins.tools.contract import (
     TOOLS as TOOLS,
     CallSource as CallSource,
     ToolCatalog as ToolCatalog,
 )
-from agent.plugin_contracts.turns import (
+from plugins.turn_projection.contract import (
     TURN_PROJECTION as TURN_PROJECTION,
     Turn as Turn,
     TurnProjection as TurnProjection,
@@ -13,7 +13,7 @@ from agent.plugin_contracts.turns import (
 from dataclasses import dataclass
 from typing import Literal
 
-from agent.plugin_contracts import ContentPart
+from plugins.ledger.contract import ContentPart
 
 
 @dataclass(frozen=True)

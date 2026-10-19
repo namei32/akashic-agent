@@ -1,10 +1,15 @@
 from __future__ import annotations
 
-from agent.plugin_composition.models import MODEL_CALL_STATS, ModelCallStats, ModelUnavailableError
-from agent.plugin_composition.model_settings_http import ModelControlUnavailable
+from plugins.models.contract import ModelError
+from plugins.models.contract import ModelUnavailableError
+from plugins.models.contract import (
+    MODEL_CALL_STATS,
+    ModelCallStats,
+)
+from plugins.models.contract import ModelControlUnavailable
 
 import asyncio
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
 from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,8 +17,12 @@ from typing import Any, cast
 
 import uvicorn
 
-from agent.plugin_composition import MODEL_CATALOG
-from agent.plugin_composition.channels import (
+from agent.plugin_composition import (
+    Context,
+    Effect,
+)
+from plugins.models.contract import MODEL_CATALOG
+from plugins.channels.contract import (
     AttachmentKind,
     AttachmentReadLease,
     AttachmentRef,
@@ -26,7 +35,8 @@ from agent.plugin_composition.channels import (
     ProviderDeliveryRequest,
     StopReceipt,
 )
-from agent.plugin_composition.messages import MESSAGE_CATALOG
+from plugins.ledger.contract import MESSAGE_CATALOG, SESSION_ADMIN
+from plugins.jobs.contract import JOB_NOTICES, JobNotices
 
 from .capabilities import (
     MESSAGE_DISPLAY,
@@ -37,18 +47,21 @@ from .capabilities import (
 )
 from .config import AkashicClientsConfig
 from .navigation import NavigationPreferences
+from .read_marks import ReadMarks
 from .attachments import AttachmentStore
 from .web_chat import WebChatChannel
 from .chat_api import build_chat_server
 from .runtime_inspection import ScopedRpcRuntimeInspection
 from .services import (
+    ActiveSessionsFollowPort,
     MessageCatalogPort,
     ModelCatalogReader,
     ModelSelectionReader,
     ReplyStatusPort,
+    SessionAdminPort,
 )
 from .services import ArtifactReadLeasePort, PluginUiProvider, WebUiProvider
-from agent.plugin_composition.message_view import MessageDisplayReader
+from plugins.ui.contract import MessageDisplayReader
 from .scoped_capabilities import (
     ScopedMessageDisplay,
     ScopedPluginUiProvider,
@@ -187,26 +200,34 @@ class _ClientGeneration:
     # 固定输入与实际 adapter 只属于本次 apply。
     adapters: dict[str, "_GenerationAkashicAdapter"]
     navigation: NavigationPreferences | None
+    read_marks: ReadMarks | None
 
-    def __init__(self, config: AkashicClientsConfig, workspace: Any, navigation: NavigationPreferences | None) -> None:
+    def __init__(self, config: AkashicClientsConfig, workspace: Any, navigation: NavigationPreferences | None,
+                 read_marks: ReadMarks | None = None) -> None:
         self.navigation = navigation
+        self.read_marks = read_marks
         self.config = config
         self.workspace = workspace
         self.adapters = {}
 
 
-def build_akashic_channel_factory(config: AkashicClientsConfig, workspace: Any, navigation: NavigationPreferences | None = None):
+def build_akashic_channel_factory(owner: Context, config: AkashicClientsConfig, workspace: Any, navigation: NavigationPreferences | None = None,
+                                  read_marks: ReadMarks | None = None):
     """为本次 apply 保留固定输入，实际 binding 由贡献 Scope 关闭。"""
-    state = _ClientGeneration(config, workspace, navigation)
+    state = _ClientGeneration(config, workspace, navigation, read_marks)
 
     def build(context: ChannelFactoryContext) -> _GenerationAkashicAdapter:
         if state.adapters:
             raise RuntimeError("本次 apply 的 Channel binding 尚未释放")
-        adapter = _GenerationAkashicAdapter(state, context)
+        adapter = _GenerationAkashicAdapter(state, context, owner=owner)
         state.adapters[context.binding_token] = adapter
         return adapter
 
     return build
+
+
+_JOBS_RETRY_MIN_S = 1.0
+_JOBS_RETRY_MAX_S = 30.0
 
 
 class _GenerationAkashicAdapter:
@@ -216,13 +237,17 @@ class _GenerationAkashicAdapter:
         self,
         state: _ClientGeneration,
         context: ChannelFactoryContext,
+        *, owner: Context,
     ) -> None:
         self._state = state
         self._context = context
+        self._owner = owner
+        self._endpoint: Effect | None = None
         self._binding_token = context.binding_token
         self._config = state.config
         self._workspace = state.workspace
         self._reply_status: ReplyStatusPort | None = None
+        self._follow_active_sessions: ActiveSessionsFollowPort = self._follow_session_activity
         self._model_catalog_reader: ModelCatalogReader | None = None
         self._model_selection_reader: ModelSelectionReader | None = None
         self._runtime_inspection: ScopedRpcRuntimeInspection | None = None
@@ -267,6 +292,7 @@ class _GenerationAkashicAdapter:
                 MESSAGE_DISPLAY,
                 PLUGIN_UI,
                 WEB_UI,
+                SESSION_ADMIN,
             ):
                 _ = scope.require(key)
         self._artifact_store = _ChannelArtifactStore(self._context)
@@ -276,6 +302,8 @@ class _GenerationAkashicAdapter:
         self._web.bind_message_scope(
             self._message_scope,
             reply_status=self._reply_status,
+            jobs=self._follow_jobs,
+            stop_job=self._stop_job,
         )
         self._web.bind_message_display(self._message_display)
 
@@ -302,11 +330,30 @@ class _GenerationAkashicAdapter:
             yield cast(MessageCatalogPort, scope.require(MESSAGE_CATALOG))
 
     @asynccontextmanager
+    async def _session_admin_scope(self) -> AsyncIterator[SessionAdminPort]:
+        """软删/恢复只在一次 HTTP 操作内借用 Core 的窄管理端口。"""
+
+        async with self._open_request_scope() as scope:
+            yield cast(SessionAdminPort, scope.require(SESSION_ADMIN))
+
+    @asynccontextmanager
     async def _plugin_ui_scope(self) -> AsyncIterator[PluginUiProvider]:
         """Expose one exact Plugin UI provider to an HTTP operation."""
 
         async with self._open_request_scope() as scope:
             yield cast(PluginUiProvider, scope.require(PLUGIN_UI))
+
+    async def _follow_session_activity(self) -> AsyncGenerator[frozenset[str] | None, None]:
+        """短借当代 reader，订阅自己拥有生命周期；缺席明确返回不可用。"""
+        async with self._open_request_scope() as scope:
+            with scope.borrow(REPLY_STATUS) as service:
+                reader = service
+        if reader is None:
+            yield None
+            return
+        async with aclosing(reader.follow_active_sessions()) as frames:
+            async for frame in frames:
+                yield frame
 
     async def _follow_reply_status(self, session_id: str):
         """Acquire the reply reader briefly, then own its long follow locally."""
@@ -315,7 +362,13 @@ class _GenerationAkashicAdapter:
         if open_scope is None:
             raise RuntimeError("akashic reply status 缺少 host request scope")
         async with self._open_request_scope() as scope:
-            reader = cast(ReplyStatusPort, scope.require(REPLY_STATUS))
+            with scope.borrow(REPLY_STATUS) as service:
+                reader = None if service is None else cast(ReplyStatusPort, service)
+        # 回复是可选能力；缺席只影响回复状态，不能中断已有消息的只读跟随。
+        if reader is None:
+            yield {"version": 2, "session_id": session_id, "snapshot_id": None,
+                   "available": False, "items": []}
+            return
         async with aclosing(reader.follow(session_id)) as frames:
             async for frame in frames:
                 if isinstance(frame, Mapping):
@@ -333,12 +386,38 @@ class _GenerationAkashicAdapter:
                     "items": [dict(item) for item in frame],
                 }
 
+    # 1. 每代 jobs owner 借一次订阅并长跟随；2. owner 关闭时 follow 结束，先发空快照让前端失效；
+    # 3. 再重新借用，插件缺席期间退避等待，新一代出现后从其基线继续。
+    async def _follow_jobs(self, session_id: str) -> AsyncGenerator[dict[str, object], None]:
+        delay = _JOBS_RETRY_MIN_S
+        while True:
+            async with self._open_request_scope() as scope:
+                with scope.borrow(JOB_NOTICES) as service:
+                    notices = None if service is None else cast(JobNotices, service)
+            if notices is None:
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, _JOBS_RETRY_MAX_S)
+                continue
+            delay = _JOBS_RETRY_MIN_S
+            async with aclosing(notices.follow_jobs(session_id)) as snapshots:
+                async for snapshot in snapshots:
+                    yield {"session_id": session_id, "jobs": [job.to_wire() for job in snapshot]}
+            yield {"session_id": session_id, "jobs": []}
+            await asyncio.sleep(delay)
+
+    async def _stop_job(self, session_id: str, job_id: str) -> bool:
+        async with self._open_request_scope() as scope:
+            with scope.borrow(JOB_NOTICES) as service:
+                if service is None:
+                    return False
+                return await cast(JobNotices, service).stop_job(session_id, job_id)
+
     async def _read_model_call_stats(self, call_id: str) -> ModelCallStats:
         """借用实际统计 owner；缺席不关闭聊天，也不获取模型修改权限。"""
         async with self._open_request_scope() as scope:
             with scope.borrow(MODEL_CALL_STATS) as reader:
                 if reader is None:
-                    raise ModelControlUnavailable("模型调用统计不可用")
+                    raise ModelControlUnavailable("模型调用统计不可用").exception()
                 return reader(call_id)
 
     async def _read_model_catalog(self) -> Any:
@@ -356,8 +435,9 @@ class _GenerationAkashicAdapter:
             selection = scope.require(MODEL_SELECTION).read_saved(metadata)
             try:
                 return scope.require(MODEL_CATALOG).validate_chat_selection(selection)
-            except ModelUnavailableError:
-                # 现有但不可用的选择仍交给 UI 标明原因；执行入口继续拒绝它。
+            except (RuntimeError, TimeoutError) as _model_error:
+                if not (ModelError.matches(_model_error, ModelUnavailableError)):
+                    raise
                 return selection
 
     def attach_runtime(self, ports: ChannelRuntimePorts) -> None:
@@ -407,6 +487,7 @@ class _GenerationAkashicAdapter:
         server = build_chat_server(
             workspace=self._workspace,
             navigation=self._state.navigation,
+            read_marks=self._state.read_marks,
             channel=self._web,
             runtime_inspection=self._runtime_inspection,
             model_catalog_reader=self._model_catalog_reader,
@@ -418,7 +499,9 @@ class _GenerationAkashicAdapter:
             attachment_store=self._upload_store,
             artifact_store=artifact_store,
             reply_status=self._reply_status,
+            follow_active_sessions=self._follow_active_sessions,
             message_scope=self._message_scope,
+            session_admin_scope=self._session_admin_scope,
             uds=str(socket_path),
         )
         await self._start_server(server, name="akashic-web")
@@ -429,6 +512,9 @@ class _GenerationAkashicAdapter:
             public_path.symlink_to(socket_path)
             node = public_path.lstat()
             self._socket_nodes.append((public_path, node.st_dev, node.st_ino))
+
+        self._endpoint = await self._owner.endpoint("client", protocol="http+unix",
+            address=str(socket_path), routes=("/chat", "/settings", "/assets", "/api/chat", "/api/shell/state", "/ws"))
 
     def _close_socket_nodes(self) -> None:
         """listener 排空后只移除本次创建且身份未变的临时节点。"""
@@ -539,6 +625,13 @@ class _GenerationAkashicAdapter:
         if self._stopped:
             return StopReceipt(self._binding_token, resources_closed=True)
         self._stopping = True
+        if self._endpoint is not None:
+            try:
+                await self._endpoint.aclose()
+            except BaseException:
+                self._stopping = False
+                raise
+            self._endpoint = None
         errors: list[BaseException] = []
         remaining_servers: list[tuple[uvicorn.Server, asyncio.Task[None]]] = []
         for server, task in reversed(self._servers):

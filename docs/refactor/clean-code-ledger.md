@@ -2,6 +2,51 @@
 
 本文档记录 `refactor/code-clean` 系列重构的决策依据、能力变化、性能数据和测试调整。每个被接受的提交都必须补充一条记录；没有测量或调用链证据的“优化”不得合并。
 
+## 2026-10-05 熵清理第 4 层：删除 bus/session/scripts 的旧迁移残片
+
+- 基线：`a19f0e23`（`refactor/entropy-pr3-plugin-dead-helpers` 头），分支 `refactor/entropy-pr4-bus-session-legacy`，stacked 清理系列第 4 层，base = 第 3 层 PR 分支。生产 source set 580 文件 / Python 98,229 SLOC；候选 580 文件 / 98,098 SLOC（-0 文件、-131 SLOC；`scripts/` 不在计量口径内，`scripts/build_fts_idf.py` 101 行另计）。恢复点为本 PR 单提交 revert；只改独立 worktree，未操作正式 workspace、服务、数据库、安装 cache 或 Git refs。
+- 删除对象（7 文件净 -160 物理行 + 1 脚本文件 -101 行）：`scripts/build_fts_idf.py` 整文件（向 akasha.db 写 `fts_token_idf` 表的一次性脚本，全仓无任何读者；akasha 现行在 `plugins/akasha/domain/features.py` 内联算 IDF、`plugins/akasha/infrastructure/lexical.py` 切词）；`session/embedding_store.py` `MessageEmbeddingStore.import_legacy_rows_once`（一次性从旧 `akasha_embedding_cache:v1` 导数据的 importer，378 → 327 行，连带随之闲置的 `Iterable` import；迁移标记表 `message_embedding_migrations` 的 CREATE 与 `_messages_table_exists_locked` 保留）；`bus/queue.py` `MessageBus` 四个死公开 API：`durable_session_admission_id`、`durable_inbound_cleanup_pending`、`consume_inbound`、`inbound_size` property（1268 → 1232 行；生产 inbound 现走 `bootstrap/tools.py` 的 InputCustody/durable recoverer，`_reserve_and_queue_durable` 等内部 durable 机制、`cleanup_pending` 字段的读写方全部保留）；`session/log.py` 模块级 `read_persisted_messages`（最后调用方在 #758 移除、其测试在 #768 删除）与 `MessageLog.validate_attachment_bindings`（从未接线）（2040 → 2011 行）；`bus/events.py` `channel_message_from_outbound`（唯一消费者随 #784 的 `infra/mobile_realtime/` 消亡，164 → 139 行；`ChannelMessage`/`ChannelAttachment` dataclass 与 `AttachmentKind`/`AttachmentRef` import 均有其他使用，保留）；`session/store.py` `_validate_source_mutation_digest`（唯一潜在调用方已移除，3518 行，共享正则 `_SOURCE_PLAN_DIGEST_RE` 保留）；`session/identities.py` `ChannelIdentities.migration_completed`（无调用方的读取方法，175 → 168 行；`seed` 仍写 `channel_identity_migrations` 永久标记，保留）；`bus/event_bus.py` `EventBus.handler_count`（382 → 379 行）。
+- 可达性证据：全部 8 个候选在候选 HEAD 逐一重新核验（审计基于旧基线，行号已漂移）。每个符号名（含 `fts_token_idf` 表名）在 Git 跟踪源码、tests、benchmark、eval、docker、scripts、配置与文档中 `git grep` 零命中（仅自身定义）；无动态 `getattr`/字符串装配/import `*` 入口；相关模块无 `__all__` re-export。`consume_inbound`/`inbound_size`/`handler_count` 等同名常见词已按符号全名复核，无跨类误伤。`tests_scenarios/` 目录与 coverage/impact registry 在本基线不存在（与第 1 层结论一致），`.github/workflows` 不引用被删脚本；`jieba` 依赖保留（`plugins/akasha/infrastructure/lexical.py` 使用）。tests 目录对上述符号零引用，无只覆盖被删行为的测试，故无测试删除。
+- 能力不变：语义不变。本次只删除源码级无消费者的 helper/一次性脚本/死公开 API，未触碰任何 migration、SQLite schema、迁移标记表内容或写入路径；`session/manager.py`、`session/activity.py`、`bus/events_lifecycle.py`、`agent/looping/` 按账本保留；无运行时行为、外部发送、插件生命周期或 generation 变化。
+- 登记联动：`plugin_boundary_baseline.toml` 与 `plugin_boundary.toml` 不含被删符号，plugin_boundary 规则无这些路径，无需登记更新；无测试文件只覆盖被删行为，故无测试删除。
+- Gate：`.venv/bin/pytest -q` 定向 tests/test_message_push_plugin.py、test_default_reply.py、test_message_log.py、test_message_metadata.py、test_akasha_execution.py、test_akasha_graphs.py、test_diagnostic_log.py 28 passed；另跑全部 import bus/session 相关测试（test_commands_provider、test_context_history_contract、test_plugin_composition_lifecycle、test_plugin_fresh_root、test_plugin_hot_reload、test_plugin_uninstall_root_drain）33 passed；7 个受影响模块 import 冒烟与 compileall 通过；pyright `--level error` 前后均为 3 errors（同一组 `agent/control/client.py` 的 `akashic_sdk` 解析错误，与删除无关）；`plugin_boundary.py check --base refactor/entropy-pr3-plugin-dead-helpers` 通过（R1/R2/R3 均 0/0）；`check_yoyo_migrations.py --base refactor/entropy-pr3-plugin-dead-helpers` 通过；`git diff --check` 干净；SLOC 计量见基线条。不回填 gate digest。
+- 迁移/持久化/运行 workspace 变化：`none`；未修改 migration、SQLite、正式 workspace、服务、网络、外部发送、generation/snapshot/lease/event 或 Git refs。
+- 残余风险：历史 checkpoint、过期工作 checkout 与远端可能归档的旧代码文本仍在，但不影响本基线；证据只覆盖本机可见快照与当前 Git 跟踪文件，不声称远端生产 fleet 或所有历史归档无消费者。
+
+## 2026-10-05 熵清理第 3 层：删除插件内无消费者的死 helper
+
+- 基线：`d5aab190`（`refactor/entropy-pr2-shell-legacy-backend` 头），分支 `refactor/entropy-pr3-plugin-dead-helpers`，stacked 清理系列第 3 层，base = 第 2 层 PR 分支。生产 source set 580 文件 / Python 98,360 SLOC；候选 580 文件 / 98,229 SLOC（-0 文件、-131 SLOC）。恢复点为本 PR 单提交 revert；只改独立 worktree，未操作正式 workspace、服务、数据库、安装 cache 或 Git refs。
+- 删除对象（12 文件净 -169 物理行，全部位于插件文件内部）：`plugins/akashic_clients/web_chat.py` 旧 v3 前发送 API `save_upload`/`send`/`send_stream`/`send_file`/`send_image`（1362 → 1308 行）；`plugins/akasha/domain/graph.py` `DynamicMemoryGraph.restore_turn_capacity`（1199 → 1190）；`plugins/akasha/infrastructure/persistence.py` `check_memory_schema`（1447 → 1422）；`plugins/akasha/plugin.py` 未使用的 `records_read` 闭包（781 → 778）；`plugins/wake/content.py` `_delivery_metadata` 与 `_proposal_next_due`（198 → 180）；`plugins/models/store.py` `ModelsStore.request_identity`（2063 → 2053）；`plugins/scheduler/schedule.py` `ScheduleCapacityError`（239 → 228，上限拒绝现由 `store.py` 内联 Operation 响应承担）；`plugins/wake/runtime.py` `Runtime.dashboard_view`（462 → 450，dashboard 由 `plugin.py` 直接构造 `DashboardView`）；`plugins/content/plugin.py` `open_content`（365 → 353）；`plugins/prompt/persona.py` `read_veda` 死包装（303 → 299，活路径是 `read_veda_file`）；`plugins/delivery_policy/boundary.py` `DeliveryTask` Protocol（35 → 28，连带删除随之闲置的 `Callable`/`Protocol` import）；`plugins/workloads/definitions.py` `_binding_key`（217 → 213）。保留 `remember_media`、`save_upload_stream`、`deliver_v3`、`grow_turn_capacity`、`_verify` 等活符号。
+- 可达性证据：全部 13 个候选在当前 HEAD 逐一重新核验（审计基于旧基线，行号已漂移）。每个符号在 Git 跟踪源码、tests、benchmark、eval、docker、scripts、配置与 TOML 中 `git grep` 零命中（仅自身定义）；另用未跟踪文件全量 grep 复核，无动态 `getattr`/字符串装配/import `*` 入口；相关模块无 `__all__` re-export（web_chat.py 的 `__all__` 只列类与常量）。`web_chat.py`：v3 适配器 `WebNativeChannelAdapter` 只调用 `deliver_v3`（web_chat.py:179），`chat_api.py` 只调用 `save_upload_stream`/`read_artifact`/`upload_roots`/`has_media`；`docker/debug/notification_feed.py` 与 scripts 场景只实例化 `WebChatChannel` 不触旧 API。`agent/plugins/dashboard_host.py` 的 `request_identity` 是无关同名私有函数。tests 目录对上述符号零引用，无只覆盖被删行为的测试，故无测试删除。
+- 能力不变：语义不变。插件 manifest、声明的工具名/schema、hook 顺序、生命周期与持久格式均未触碰；本次只删除插件文件内部已无消费者的私有/helper 符号，无运行时行为、持久 schema、迁移内容、外部发送或 generation 变化。
+- 登记联动：`plugin_boundary_baseline.toml` 与 `plugin_boundary.toml` 不含被删符号，plugin_boundary 规则无这些路径，无需登记更新；无测试文件只覆盖被删行为，故无测试删除。
+- Gate：`.venv/bin/pytest -q` 定向 46 passed（akasha graphs/learning/execution、wake、interest、content_protocols、delivery_policy、model_content、workload、message_push、update_model_command、default_reply、message_metadata、material_execution）；`python -c "import plugins.akashic_clients.channel, ..."` 10 个受影响插件入口冒烟通过；pyright `--level error` 前后均为 3 errors（同一组 `agent/control/client.py` 的 `akashic_sdk` 解析错误，与删除无关）；`plugin_boundary.py check --base refactor/entropy-pr2-shell-legacy-backend` 通过（R1/R2/R3 均 0/0）；`check_yoyo_migrations.py --base refactor/entropy-pr2-shell-legacy-backend` 通过；`git diff --check` 干净；SLOC 计量见基线条。不回填 gate digest。
+- 迁移/持久化/运行 workspace 变化：`none`；未修改 migration、SQLite、正式 workspace、服务、网络、外部发送、generation/snapshot/lease/event 或 Git refs。
+- 残余风险：历史 checkpoint、过期工作 checkout 与远端可能归档的旧插件文本仍在，但不影响本基线；证据只覆盖本机可见快照与当前 Git 跟踪文件，不声称远端生产 fleet 或所有历史归档无消费者。`web_chat.py` 的 `remember_media` 按审计指示保留，但其唯一调用方恰为本次删除的 `send_file`/`send_image`，严格意义上已无任何活调用方，后续层可单独复核。
+
+## 2026-10-05 熵清理第 2 层：删除 `standard_tools` 旧直连接 Shell 工具实现
+
+- 基线：`d984d439`（`refactor/entropy-pr1-agent-dead-packages` 头），分支 `refactor/entropy-pr2-shell-legacy-backend`，stacked 清理系列第 2 层，base = 第 1 层 PR 分支。生产 source set 580 文件 / Python 98,726 SLOC；候选 580 文件 / 98,360 SLOC（-0 文件、-366 SLOC）。恢复点为本 PR 单提交 revert；只改独立 worktree，未操作正式 workspace、服务、数据库、安装 cache 或 Git refs。
+- 删除对象：`plugins/standard_tools/shell_backend.py` 中旧直连接工具实现，文件 562 → 152 行（-410 物理行）：`_REMOVED_SHELL_ARGUMENTS`（旧参数黑名单）、`_cleanup_diagnostic`（cleanup 降级诊断）、`_LegacyTool` 基类（`validate_params`/`to_schema`）、旧 `ShellTool`（226 行）、`ShellWriteStdinTool`（59 行）、`ShellTaskStopTool`（37 行）、`_owner_session_key` 及其专属常量 `_LOCAL_OWNER_PREFIX`、`_error` 包装、`_validate_command`/`_validate_network_command` 两个别名，以及随删的 import（`json`、`hashlib`、`uuid4`、`typing.Any/Callable`、process_runtime 的 `DEFAULT_*`/`MAX_HARD_TIMEOUT_S`/`ExecutionCleanupReport`/`ShellProcessManager`/`ShellProcessManagerProtocol`/`format_execution_result`、`resolve_shell`、tool_catalog 两个校验/规范化函数、`shell_security` 两个校验函数、`diagnostic_line`、`current_session_key`）。保留 `_log_shell_execution`、`_execution_outcome`、`_shell_env`、PATH 发现助手（`_discover_user_path_entries`/`_discover_nvm_node_bins`/`_node_version_key`/`_prepend_existing_path_entries`）与环境常量。`docs/design/unified-shell-execution.md:16` 把 active `shell` 工具的提供方更正为 `shell.py` 的统一 ShellTool（PROCESSES capability），`shell_backend.py` 只保留环境与日志辅助。
+- 可达性证据：全仓 `git grep`（源码、tests、benchmark、eval、docker、scripts、配置）确认 `shell_backend` 的唯一活消费者是 `plugins/standard_tools/shell.py:44`，且只 import `_log_shell_execution, _shell_env` 两个符号；active 工具路径是 `shell.py` 自己的 `ShellTool`（PROCESSES capability），与 `shell_backend` 的旧工具类无继承或实例关系。全部被删符号（含 `_LOCAL_OWNER_PREFIX`）在模块外零命中；`"ShellTool"`/`"ShellWriteStdinTool"`/`"ShellTaskStopTool"` 字符串字面量注册零命中；相关 `getattr` 动态入口为零；本机 `~/.akashic-plugin/cache` 不存在，无缓存副本引用。旧工具的直接 manager 调用（`exec_command`/`write_stdin`/`terminate_execution`/`terminate_owner`/`shutdown`）在模块外零命中，说明没有其他动态装配路径。
+- 能力不变：语义不变。插件 manifest、声明的工具名/schema、hook 顺序与生命周期均未触碰；现行 `shell`/`write_stdin`/`task_stop` 工具行为由 `shell.py` 统一工具承担，本次只删除其中已无消费者的旧实现副本及其专属 helper。无运行时行为、持久 schema、迁移内容、外部发送或 generation 变化。
+- 登记联动：`plugin_boundary_baseline.toml` 不含被删符号，plugin_boundary 规则无这些路径，无需登记更新；无测试文件只覆盖被删行为（`tests/` 无 shell 命名测试，唯一引用 `standard_tools` 的 `test_default_reply.py` 覆盖的是现行插件装载路径），故无测试删除。
+- Gate：`.venv/bin/pytest -q tests/test_default_reply.py tests/test_message_push_plugin.py` 8 passed；`python -c "import plugins.standard_tools.plugin"` 冒烟通过；pyright `--level error` 前后均为 3 errors（同一组 `agent/control/client.py` 的 `akashic_sdk` 解析错误，与删除无关）；`plugin_boundary.py check --base refactor/entropy-pr1-agent-dead-packages` 通过（R1/R2/R3 均 0/0）；`check_yoyo_migrations.py --base refactor/entropy-pr1-agent-dead-packages` 通过；`git diff --check` 干净；SLOC 计量见基线条。不回填 gate digest。
+- 迁移/持久化/运行 workspace 变化：`none`；未修改 migration、SQLite、正式 workspace、服务、网络、外部发送、generation/snapshot/lease/event 或 Git refs。
+- 残余风险：历史 checkpoint、过期工作 checkout 与远端可能归档的旧 `shell_backend.py` 文本仍在，但不影响本基线；证据只覆盖本机可见快照与当前 Git 跟踪文件，不声称远端生产 fleet 或所有历史归档无消费者。
+
+## 2026-10-05 熵清理第 1 层：删除无消费者的 `agent/turn_events`、`agent/prompting` 与 `agent/control` 旧 DTO
+
+- 基线：`b13be081`（origin/main），分支 `refactor/entropy-pr1-agent-dead-packages`，stacked 清理系列第 1 层，base = main。生产 source set 587 文件 / Python 98,919 SLOC；候选 580 文件 / 98,726 SLOC（-7 文件、-193 SLOC）。恢复点为本 PR 单提交 revert；只改独立 worktree，未操作正式 workspace、服务、数据库、安装 cache 或 Git refs。
+- 删除对象：`agent/turn_events/`（`__init__.py` + `proactive_feedback.py`）、`agent/prompting/`（`__init__.py` + `assembler.py` + `section_names.py`）、`agent/control/events.py`（`TurnEvent` DTO）与 `agent/control/ids.py`（四个 id 工厂），共 7 文件、248 行。`docs/INDEX.md` 路由表把 Prompt 行实现入口从 `agent/prompting/` 更正为现行 owner `plugins/prompt/`。
+- 可达性证据：三个对象的模块路径、全部导出符号（`ProactiveFeedbackCommitted`、`PROACTIVE_FEEDBACK_COMMITTED*`、`PromptSectionRender`、`SYSTEM/LEGACY_CONTEXT_FRAME_*`、`build_context_frame_*`、五个 section name 常量、`TurnEvent`、`new_*_id`）与 wire 字符串 `proactive.feedback.committed` 在 Git 跟踪源码、tests、benchmark、eval、docker、plans、scripts、配置与 TOML 中的 import/字符串命中均为零；`agent/control/__init__.py` 不存在，无 re-export；`importlib`/`getattr` 动态入口为零。`plugins/wake` 的 `new_item_ids` 是参数名，不是 `new_item_id` 工厂。`agent.control` 现存 import 只指向 `client`/`timer`/`scoped_turn`，当前 `agent/control/protocol/` 模型把 `threadId`/`turnId` 作为输入字段，id 由各 owner 内联生成。
+- 外部插件复核：`citation`、`meme`、`plugin_undo`、`status_commands` 的当前 `origin/main` 与 `deploy-20261002` 均已不再 import `agent.prompting`（本机旧 checkout 是过期快照）；外部 `proactive_feedback` 插件源码对 Core DTO 与 wire 字符串零引用；本机无 `~/.akashic-plugin/cache`。唯一残留引用是外部自测 canary `recursive-hello-canary`（独立仓库、单提交、`api_version = 2`），当前插件管理器只接受 `api_version = 3`，该 canary 在现行 runtime 本就无法装载，且其依赖的 `prompt_render.emit` slot 与 `agent.lifecycle.types.PromptRenderCtx` 均不存在于本基线；Core 仓库对它零引用。2026-09-28 条目保留 `agent/prompting/` 的理由（durable delivery 概念测试）在本基线已不成立，全树 grep 无测试消费者。
+- 能力不变：语义不变。Turn 事件投影由 `agent/control/protocol/` 与现有 owner 承担；Prompt 人格与行为规则由 `plugins/prompt/`（api v3）承担；feedback 链路归外部 `proactive_feedback` 插件自有 DB 与 dashboard，Core 本就不读取插件 DB。无运行时行为、持久 schema、迁移内容、外部发送或插件生命周期变化。
+- 登记联动：2026-09-10 先例中的 `tests_scenarios/contracts/impact.toml`、`coverage-baseline.json` 已随目录在本基线移除，`plugin_boundary_baseline.toml` 已清零，三个被删路径均不在任何现存 registry 中，无需登记更新；`plugin_boundary.toml` 规则无这些路径。
+- Gate：`.venv/bin/pytest -q tests/` 108 passed；pyright `--level error` 前后均为 3 errors（同一组 `agent/control/client.py` 的 `akashic_sdk` 解析错误，与删除无关）；`plugin_boundary.py check --base origin/main` 通过（R1/R2/R3 均 0/0）；`check_yoyo_migrations.py --base origin/main` 通过；`git diff --check` 干净。不回填 gate digest。
+- 迁移/持久化/运行 workspace 变化：`none`；未修改 migration、SQLite、正式 workspace、服务、网络、外部发送、generation/snapshot/lease/event 或 Git refs。
+- 残余风险：历史 checkpoint、过期工作 checkout 与上述 api v2 canary 仍保留旧模块文本；检查只覆盖本机可见快照与当前 origin/main，不声称远端生产 fleet 或所有历史归档无消费者。若 canary 需要继续维护，应在它自己的仓库按现行 api v3 重写，不属于本仓库边界。
+
 ## 2026-09-28 · Kimi 正交化报告的无行为变化清理
 
 - 基线：`65cb97bfb714bbb00e6ccd1574050c34543d81f1`。维护者确认本批只修复误扫描、保护本地文件和删除已证明无消费者的代码；业务合同、路由、跨插件字符串及持久 schema 另行评估。
@@ -33,7 +78,7 @@
 - `session/manager.py` 与 `agent/prompting/`：保留的 durable delivery 概念测试仍使用它们；不能按“零 importer”删除。
 - `core/memory/events.py`、`infra/channels/message_view.py`：仍有保留测试消费者。
 - `agent/mcp/`、`agent/workloads/model.py` 和 `agent/tools/`：存在明确归档桥、类型或动态脚本消费者；`scripts/benchmark_host_bridge.py` 仍动态导入旧 unified_exec 路径。
-- `agent/migrations/proactive_island/`：`scripts/proactive_island_handoff.py` 是真实 CLI 入口；是否退役这项操作能力不属于本次行为不变清理。
+- `scripts/proactive_island/`：`scripts/proactive_island_handoff.py` 是真实 CLI 入口；是否退役这项操作能力不属于本次行为不变清理。
 - `agent/runtime_identity.py`：有独立模块 CLI。`agent/looping/`、`session/activity.py`、`bus/events_lifecycle.py`、`core/memory/plugin.py` 与反馈事件保留待核对的外部/历史兼容面；本地外部源码确有旧路径引用，不能把本仓库无消费者等同于全局无消费者。
 - `last_proactive_at` 等 schema、业务 ServiceKey、路由、source 字符串和 `bus/events.py` 不变。删除已有列或改变合同归属需要独立决定。
 - 失效的本地 `private_runtime` checkout 不足以证明可删除 Git submodule；双包管理文件、未提交插件和文档、历史手册及实验数据均未删除。
@@ -529,10 +574,8 @@ SLOC 是有内容的源码行：Python 使用 AST 标出完整 docstring 表达�
 ## 2026-07-23 less-is-more PR27：删除 PersonaMem runtime 转发 wrapper
 
 > 2026-09-24 现状补记：维护者决定退役 LongMemEval；其专属 CLI、数据适配和文档已删除。
-> PersonaMem 仍使用的 runtime、ingest、Turn 数据和纯评分实现已归回 `eval/personamem/`，
-> 没有恢复下述只转发的 wrapper。下面的调用路径、文件计量和测试结果都是 PR27 当时的记录，
-> 不代表当前存在 LongMemEval 包或这些测试。PersonaMem 的旧 CoreRuntime 入口尚未恢复，
-> 具体运行边界见其 README；本次未迁移或删除正式 benchmark 数据。
+> 2026-10-10 勘误：PersonaMem 已按维护者决定完整退役。下文只保留历史改动证据，
+> 不再表示当前存在 benchmark 入口、helper 或验收命令。
 
 ### `PR27` `refactor(eval): remove PersonaMem runtime forwarding wrapper`
 

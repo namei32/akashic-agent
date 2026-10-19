@@ -1,17 +1,32 @@
 import { gfm, gfmHtml } from "micromark-extension-gfm";
 import { micromark } from "micromark";
-import { isConceptLabel, isNumericColumn, isPlainTextLanguage } from "./markdown-reading";
+import { kaomojiLiteralExtension } from "./kaomoji-markdown";
+import { isConceptLabel, isNumericColumn, isPlainTextLanguage, stripConceptSeparator } from "./markdown-reading";
 
 /** Render settled GFM while keeping raw HTML and unsafe protocols inert. */
 export function renderStaticMarkdown(markdown: string) {
   const html = micromark(markdown, {
-    extensions: [gfm()],
-    htmlExtensions: [gfmHtml()],
+    extensions: [gfm(), kaomojiLiteralExtension(markdown)],
+    // 脚注区的隐藏标题与返回链接读屏名默认是英文（Footnotes / Back to reference 1）：与富渲染路径同说"返回引用 1"。
+    htmlExtensions: [gfmHtml({
+      label: "脚注",
+      backLabel: (reference, rereference) => `返回引用 ${reference + 1}${rereference > 1 ? `-${rereference}` : ""}`,
+    })],
   });
   // 1. 只处理 micromark 已转义、已过滤协议的输出；模板不挂到页面。
   const template = document.createElement("template");
   template.innerHTML = html;
   const root = template.content;
+
+  // 与流式正文一致，网页链接在新标签页打开，避免替换对话 iframe。
+  for (const link of root.querySelectorAll<HTMLAnchorElement>("a[href]")) {
+    const href = link.getAttribute("href")!;
+    if (!href || href.startsWith("#") || /^(?:mailto|tel):/iu.test(href)) continue;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    // 链接文字本身就是网址（GFM 自动链接）时按字符折行，见 message-view.css 的 .reading-url。
+    if (/^(?:https?:\/\/|www\.)\S+$/u.test(link.textContent ?? "")) link.classList.add("reading-url");
+  }
 
   for (const paragraph of root.querySelectorAll("p")) {
     const content = Array.from(paragraph.childNodes).filter((child) => child.nodeType !== Node.TEXT_NODE || child.textContent?.trim());
@@ -42,6 +57,13 @@ export function renderStaticMarkdown(markdown: string) {
       const description = document.createElement("div");
       description.className = "reading-concept-description";
       description.append(...item.childNodes);
+      // 松散列表的说明包在首个 <p> 里；冒号去掉后若段落已空，就让嵌套内容直接接上。
+      let lead = description.firstChild;
+      while (lead?.nodeType === Node.TEXT_NODE && !lead.textContent?.trim()) lead = lead.nextSibling;
+      const paragraph = lead instanceof HTMLParagraphElement ? lead : null;
+      const text = paragraph ? paragraph.firstChild : lead;
+      if (text?.nodeType === Node.TEXT_NODE) text.textContent = stripConceptSeparator(text.textContent ?? "");
+      if (paragraph && !paragraph.textContent?.trim() && !paragraph.children.length) paragraph.remove();
       item.append(labelColumn, description);
     });
   }

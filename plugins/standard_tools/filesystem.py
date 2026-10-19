@@ -3,18 +3,27 @@
 from pathlib import Path
 from typing import Any
 
-from agent.host_bridge.filesystem import (
-    LIST_DIR_MAX_BYTES,
-    LIST_DIR_MAX_ENTRIES,
-    EditFileOperation,
-    ListDirOperation,
-    ReadFileOperation,
-    WriteFileOperation,
-)
-from agent.tool_catalog import ToolResult
+from plugins.host_execution.contract import Files, LIST_DIR_MAX_BYTES, LIST_DIR_MAX_ENTRIES
+
+from plugins.host_execution.contract import FileResult
 
 
-class ReadFileTool(ReadFileOperation):
+class _FileTool:
+    def __init__(self, files: Files, allowed_dir: Path | None = None):
+        self._operation = files.open(self.name, allowed_dir)
+
+    @property
+    def name(self) -> str:
+        raise NotImplementedError
+
+    async def execute(self, **arguments: Any) -> FileResult:
+        return await self._operation.execute(**arguments)
+
+    async def aclose(self) -> None:
+        await self._operation.aclose()
+
+
+class ReadFileTool(_FileTool):
     """读取文件内容，支持按行分页，超大文件自动截断。"""
 
     @property
@@ -56,11 +65,9 @@ class ReadFileTool(ReadFileOperation):
             },
             "required": ["path"],
         }
-    async def execute(self, path: str, **kwargs: Any) -> str | ToolResult:
-        return await self.read_raw(path, **kwargs)
 
 
-class WriteFileTool(WriteFileOperation):
+class WriteFileTool(_FileTool):
     """将内容写入文件，自动创建所需的父目录。"""
 
     @property
@@ -90,7 +97,7 @@ class WriteFileTool(WriteFileOperation):
         }
 
 
-class EditFileTool(EditFileOperation):
+class EditFileTool(_FileTool):
     """精确替换文件中的指定文本片段。"""
 
     @property
@@ -131,7 +138,7 @@ class EditFileTool(EditFileOperation):
         }
 
 
-class ListDirTool(ListDirOperation):
+class ListDirTool(_FileTool):
     """列举目录内容。"""
 
     @property

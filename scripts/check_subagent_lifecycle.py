@@ -19,14 +19,17 @@ args = parser.parse_args()
 sys.path.insert(0, str(args.source.resolve()))
 
 from agent.plugin_composition import CompositionRoot, PluginRuntime
-from agent.plugin_composition.archive import PluginArchive
-from agent.plugin_composition.bindings import BINDINGS, Bindings
-from agent.plugin_composition.messages import (
-    MESSAGE_CATALOG, MESSAGE_WRITERS, OWNER_STATE, SESSION_ADMISSION,
-    MessageWriters, OwnerState, SessionAdmission,
+from plugins.ledger.contract import BINDINGS
+from plugins.ledger.bindings import Bindings
+from plugins.ledger.services import MessageWriters, OwnerState, SessionAdmission
+from plugins.ledger.contract import (
+    MESSAGE_CATALOG,
+    MESSAGE_WRITERS,
+    OWNER_STATE,
+    SESSION_ADMISSION,
 )
 from agent.plugin_composition.tasks import TASKS, PluginTasks, TaskServiceClosed
-from agent.plugin_contracts import ContentPart, Control, Input, Output
+from plugins.ledger.contract import ContentPart, Control, Input, Output
 from plugins.content.plugin import Content
 from plugins.conversation.plugin import check_origin
 from plugins.subagent.inputs import CONTENT, CHECK_ORIGIN
@@ -34,7 +37,7 @@ from plugins.subagent.request import PROFILE_TOOLS, Request
 from plugins.subagent.runtime import SUBAGENT_PROGRAM
 from plugins.subagent.tools import Prepared, Spawn
 from plugins.tools.execution import Result, ToolExecution
-from session.log import MessageLog
+from plugins.ledger.log import MessageLog
 
 
 class Fixture:
@@ -47,8 +50,7 @@ class Fixture:
         self.root = CompositionRoot('subagent-' + mode)
         self.log = MessageLog(directory / 'sessions.db')
         self.tasks = PluginTasks()
-        self.archive = PluginArchive(directory / 'archives')
-        self.bindings = Bindings(self.log, self.archive, self.root)
+        self.bindings = Bindings(self.log, self.root.context)
 
     async def open(self):
         """装配真实服务，并固定一个已准备请求的合法 binding 描述符。"""
@@ -71,7 +73,7 @@ class Fixture:
                                                     workspace_roots=('subagent-runs',),
                                                     workspace_files=('memory/spawn_trace.jsonl',)))
         # 1. 隔离准备后的执行边界；不把 fixture 当正式 Manager 安装验收。
-        descriptor = {'version': 1, 'root_ref': self.archive.save_descriptor({'components': ()}),
+        descriptor = {'version': 2, 'origins': {'subagent': 'fixture'},
                       'service': SUBAGENT_PROGRAM.name, 'metadata': {}}
         identity = hashlib.sha256(json.dumps(descriptor, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
         self.log.save_binding(identity, descriptor)

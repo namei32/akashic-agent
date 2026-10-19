@@ -10,29 +10,29 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
-from agent.plugin_contracts import (
+from plugins.ledger.contract import (
     ContentPart,
 )
-from agent.plugin_contracts.content import (
+from plugins.content.contract import (
     CONTENT as CONTENT,
     ContentView as ContentView,
 )
-from agent.plugin_contracts.delivery import (
+from plugins.delivery.contract import (
     DELIVERY_GUARDED_START as DELIVERY,
     DELIVERY_SENDERS as DELIVERY_SENDERS,
     FINAL_OUTPUT_DELIVERY as FINAL_OUTPUT_DELIVERY,
     FinalOutputDelivery as FinalOutputDelivery,
     FinalOutputTurn as FinalOutputTurn,
     FinalOutputWaiter as FinalOutputWaiter,
-    Receipt as ReceiptView,  # noqa: F401 - 显式再导出给本插件消费者。
+    Receipt as ReceiptView,
 )
-from agent.plugin_contracts.tools import (
+from plugins.tools.contract import (
     TOOLS as TOOLS,
     CallSource as CallSource,
     ToolCatalog as ToolCatalog,
     ToolRef as ToolRef,
 )
-from agent.plugin_contracts.turns import (
+from plugins.turn_projection.contract import (
     TURN_PROJECTION as TURN_PROJECTION,
     Turn as ProjectedTurn,  # noqa: F401 - 显式再导出给本插件消费者。
     TurnProjection as TurnProjection,

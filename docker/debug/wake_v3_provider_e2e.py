@@ -24,20 +24,21 @@ if str(_SOURCE_ROOT) not in sys.path:
 import agent.plugins.manager as plugin_manager_module
 import plugins.wake.plugin as wake_plugin_module
 from agent.control.timer import TimerReceipt, TimerStatus
-from agent.plugin_composition import (
-    CHAT_MODELS,
+from plugins.models.contract import (
     LLMResponse,
-    MODEL_CATALOG,
     ToolCall,
 )
-from agent.plugin_composition.rpc import rpc_method_key
+from plugins.models.contract import (
+    CHAT_MODELS,
+    MODEL_CATALOG,
+)
+from plugins.gateway.contract import RpcMethod
 from agent.plugins.manager import PluginManager
 from agent.plugins.reload_journal import ReloadJournal
 from agent.plugins.selection import PluginSelection
-from bus.event_bus import EventBus
-from infra.channels.artifacts import ChannelAttachmentArtifactStore
-from session.artifact_store import ArtifactStore
-from session.log import MessageLog
+from plugins.ledger.attachments import ChannelAttachmentArtifactStore
+from plugins.ledger.artifact_store import ArtifactStore
+from plugins.ledger.log import MessageLog
 from plugins.wake.request import Request, read_request
 from plugins.wake.source import Pointer
 from plugins.wake.state import WakeState
@@ -335,7 +336,6 @@ class RuntimeStack:
     workspace: Path
     timer: ControlledTimer
     provider: CountingProvider
-    event_bus: EventBus
     message_log: MessageLog
     manager: PluginManager
     artifact_metadata: ArtifactStore
@@ -346,17 +346,18 @@ class RuntimeStack:
         selection = PluginSelection(self.workspace)
         stable = selection.read()
         await self.manager.load_all()
+        from plugins.ledger.contract import MESSAGE_CATALOG
+        self.message_log.close()
+        self.message_log = self.manager.live_root.context.require(MESSAGE_CATALOG)._log
         if stable is not None and selection.read() != stable:
             raise GateFailure("RESTART_CHANGED_STABLE_SELECTION")
         if self.after_load is not None:
             await self.after_load()
-        await self.manager.start_runtime()
 
     async def close(self) -> None:
         """Close every isolated runtime owner while preserving its durable workspace."""
 
         await self.manager.terminate_all()
-        await self.event_bus.aclose()
         self.message_log.close()
         self.artifact_metadata.close()
         if self.uses_test_model:
@@ -643,7 +644,6 @@ def _build_stack(
 ) -> RuntimeStack:
     """Assemble the formal MessageLog, Wake, Models, and Delivery chain."""
 
-    event_bus = EventBus()
     message_log = MessageLog(workspace / "sessions.db")
     artifact_metadata = ArtifactStore(workspace / "sessions.db")
     artifacts = ChannelAttachmentArtifactStore(
@@ -653,6 +653,7 @@ def _build_stack(
     plugin_dirs = [
         Path(__file__).resolve().parents[2] / "plugins" / name
         for name in (
+            "ledger",
             "assets",
             "content",
             "context",
@@ -689,10 +690,7 @@ def _build_stack(
     plugin_dirs.extend(model_plugin_dirs)
     manager = PluginManager(
         plugin_dirs=plugin_dirs,
-        event_bus=event_bus,
         workspace=workspace,
-        message_log=message_log,
-        channel_attachment_store=artifacts,
         installed_cache_root=root / "plugin-home" / "cache",
     )
     if not model_plugin_dirs:
@@ -702,7 +700,6 @@ def _build_stack(
         workspace,
         timer,
         provider,
-        event_bus,
         message_log,
         manager,
         artifact_metadata,
@@ -728,8 +725,12 @@ def _write_e2e_fixture_plugin(root: Path, *, include_models: bool) -> Path:
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from agent.plugin_composition import CHAT_MODELS
-from agent.plugin_composition.models import BoundModelDescriptor, CapabilitySources, ModelCapabilities
+from plugins.models.contract import CHAT_MODELS
+from plugins.models.contract import (
+    BoundModelDescriptor,
+    CapabilitySources,
+    ModelCapabilities,
+)
 from plugins.models.content import MODEL_CONTENT, ContentOwner
 from plugins.models.projection import (
     MODEL_CALLS,
@@ -799,8 +800,8 @@ from plugins.delivery.senders import DELIVERY_SENDERS
 from plugins.standard_web.plugin import STANDARD_WEB_TOOLS
 from plugins.tools.api import Result
 from plugins.tools.plugin import TOOLS
-from session.message import ContentPart
-from session.message_codec import encode_body
+from plugins.ledger.contract import ContentPart
+from plugins.ledger.contract import encode_body
 {models}
 api_version = 3
 name = "wake_e2e_{"models" if include_models else "support"}"
@@ -898,7 +899,7 @@ async def _configure_selected_model(manager: PluginManager) -> None:
     if root is None:
         raise RuntimeError("正式 live Root 不可用")
     provider_context, operation = root._service_provider(
-        rpc_method_key("models/command")
+        RpcMethod.key("models/command")
     )
 
     async def command(payload: dict[str, object]) -> dict[str, object]:

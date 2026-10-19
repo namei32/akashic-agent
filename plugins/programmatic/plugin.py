@@ -8,36 +8,40 @@ from agent.plugin_composition import (
     RUNTIME_STOPPING,
     Context,
 )
-from agent.plugin_composition.control_frames import CONTROL_FRAMES
-from agent.plugin_composition.messages import (
+from plugins.gateway.contract import CONTROL_FRAMES
+from plugins.ledger.contract import (
     MESSAGE_CATALOG,
     MESSAGE_WRITERS,
     SESSION_ADMISSION,
     MessageReader,
 )
-from agent.plugin_composition.rpc import rpc_method_key
-from agent.plugin_composition.models import MODEL_CATALOG, ChatModelSelection
+from plugins.gateway.contract import RpcMethod
+from plugins.models.contract import ChatModelSelection
+from plugins.models.contract import MODEL_CATALOG
 from agent.plugin_composition.tasks import (
     RESTART_GATE,
     TASKS,
 )
-from agent.plugin_contracts import (
+from plugins.ledger.contract import (
     ContentPart,
     ContentReferences,
     Control,
     Input,
+    Output,
 )
-from agent.plugin_contracts.models import MODEL_SELECTION
-from agent.plugin_contracts.content import (
+from plugins.models.contract import MODEL_SELECTION
+from plugins.content.contract import (
     CONTENT as CONTENT,
 )
-from agent.plugin_contracts.delivery import (
+from plugins.delivery.contract import (
     FINAL_OUTPUT_DELIVERY as FINAL_OUTPUT_DELIVERY,
     FinalOutputDelivery as FinalOutputDelivery,
     FinalOutputWaiter as FinalOutputWaiter,
 )
-from agent.plugin_contracts.sources import (
+from plugins.conversation.contract import (
     CHECK_ORIGIN as CHECK_ORIGIN,
+)
+from plugins.sources.contract import (
     SOURCE_CHANGED_V3 as SOURCE_CHANGED,
     SOURCE_SESSION_V4 as SOURCE_SESSION,
     SOURCES_V5 as SOURCES,
@@ -46,8 +50,8 @@ from agent.plugin_contracts.sources import (
     GuardedSourceSession as SourceSession,
 )
 
+from .contract import PROGRAMMATIC
 from .control import (
-    PROGRAMMATIC,
     Programmatic,
     check_session,
     rpc_methods,
@@ -103,17 +107,20 @@ async def apply(ctx: Context) -> None:
     programmatic = Programmatic(ctx)
     _ = await ctx.provide(PROGRAMMATIC, programmatic)
     for method, operation in rpc_methods(programmatic).items():
-        _ = await ctx.provide(rpc_method_key(method), operation)
+        _ = await ctx.provide(RpcMethod.key(method), operation)
     catalog = ctx.require(MESSAGE_CATALOG)
+    frames = ctx.require(CONTROL_FRAMES)
     watcher: asyncio.Task[None] | None = None
 
     async def settle_committed_frames() -> None:
         """Follow committed heads so ordinary Output commits release idle routes."""
-        stream = cast(AsyncGenerator[Mapping[str, int], None], catalog.follow())
+        # Turn 只会因 Output 或 Control 结束；其他提交不改变结果。
+        stream = cast(AsyncGenerator[Mapping[str, int], None], catalog.follow(wake_on=(Output, Control)))
         async with aclosing(stream):
             async for heads in stream:
-                for session_id in heads:
-                    await programmatic.settle_changed(catalog.reader(session_id), "programmatic")
+                for session_id in frames.active_session_ids():
+                    if session_id in heads:
+                        await programmatic.settle_changed(catalog.reader(session_id), "programmatic")
 
     async def start(_event: object) -> None:
         nonlocal watcher

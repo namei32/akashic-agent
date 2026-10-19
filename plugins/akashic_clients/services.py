@@ -8,20 +8,25 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
-from agent.plugin_composition.channels import AttachmentRef
-from agent.plugin_composition.message_view import MessageDisplayReader
-from agent.plugin_composition.messages import InvalidPage, MessageConflict, SessionAttributes
-from agent.plugin_composition.model_settings_http import ModelControlUnavailable
-from agent.plugin_composition.models import (
+from plugins.channels.contract import AttachmentRef
+from plugins.ui.contract import MessageDisplayReader
+from plugins.ledger.contract import (
+    InvalidPage,
+    MessageConflict,
+    SessionAttributes,
+    SessionDeleteResult,
+    SessionTitleResult,
+)
+from plugins.models.contract import (
     ChatModelSelection,
     ModelCatalogSnapshot,
 )
-from agent.plugin_composition.ui import (
+from plugins.ui.contract import (
     WebUiProvider as WebUiProvider,
 )
-from agent.plugin_composition.ui_slots import (
+from plugins.ui.contract import (
     PluginUiPluginUnavailable,  # noqa: F401 - 显式再导出给本插件消费者。
     PluginUiQueryOverloaded,  # noqa: F401 - 显式再导出给本插件消费者。
     PluginUiQueryTimeout,  # noqa: F401 - 显式再导出给本插件消费者。
@@ -29,8 +34,8 @@ from agent.plugin_composition.ui_slots import (
     PluginUiRpcInvalidRequest,  # noqa: F401 - 显式再导出给本插件消费者。
     PluginUiStaleRevision,  # noqa: F401 - 显式再导出给本插件消费者。
 )
-from agent.plugin_contracts.message import Message
-from agent.plugin_contracts.ui import (
+from plugins.ledger.contract import Message
+from plugins.ui.contract import (
     PluginUiProvider as PluginUiProvider,
 )
 
@@ -54,6 +59,7 @@ class SessionEntryPort(Protocol):
     message_count: int
     head_seq: int
     first_message: Message | None
+    title: str | None
 
 
 class SessionPagePort(Protocol):
@@ -95,6 +101,10 @@ class MessageReaderPort(Protocol):
     @property
     def attributes(self) -> SessionAttributes: ...
     @property
+    def deleted(self) -> bool: ...
+    @property
+    def title(self) -> str | None: ...
+    @property
     def session_id(self) -> str: ...
     def head(self) -> int: ...
     def follow(self, *, after_seq: int = -1) -> AsyncGenerator[Message, None]: ...
@@ -104,12 +114,25 @@ class MessageReaderPort(Protocol):
     def read_page(self, *, after_seq: int = -1, through_seq: int | None = None, limit: int = 50) -> MessagePagePort: ...
 
 
+class SessionAdminPort(Protocol):
+    """用户显式的会话数据管理操作；软删/恢复与标题覆盖，没有消息或物理删除权限。"""
+
+    async def set_deleted(self, session_key: str, *, deleted: bool) -> SessionDeleteResult: ...
+    async def set_title(self, session_key: str, title: str | None) -> SessionTitleResult: ...
+
+
 class MessageCatalogPort(Protocol):
     def reader(self, session_id: str) -> MessageReaderPort: ...
     def sessions(self, *, prefix: str, visibility: str, after: tuple[str, str] | None, limit: int) -> SessionPagePort: ...
+    def follow_metadata(self) -> AsyncGenerator[None, None]: ...
+    def follow(self, *, poll_interval: float | None = None,
+               prefix: str = "", visibility: Literal["listed", "internal"] | None = None,
+               ) -> AsyncGenerator[Mapping[str, int], None]: ...
 
 
 ReplyStatusPort = Callable[[str], AsyncGenerator[dict[str, object], None]]
+# 产出 None 表示回复插件未加载，无法判断哪些会话在运行。
+ActiveSessionsFollowPort = Callable[[], AsyncGenerator[frozenset[str] | None, None]]
 ModelCatalogReader = Callable[[], Awaitable[ModelCatalogSnapshot]]
 ModelSelectionReader = Callable[[Mapping[str, object]], Awaitable[ChatModelSelection]]
 
@@ -147,10 +170,10 @@ def project_unavailable_chat_runtimes(snapshot: ModelCatalogSnapshot) -> list[di
             "id": model.model_id,
             "model": model.model,
             "sourceName": connections[model.connection_id].name,
-            "availability": model.availability.value,
+            "availability": model.availability,
         }
         for model in snapshot.models
-        if model.kind.value == "chat" and model.availability.value != "available"
+        if model.kind == "chat" and model.availability != "available"
     ]
 
 
@@ -162,7 +185,7 @@ def project_chat_runtimes(snapshot: ModelCatalogSnapshot) -> list[dict[str, obje
     connections = {item.connection_id: item for item in snapshot.connections}
     result: list[dict[str, object]] = []
     for model in snapshot.models:
-        if model.kind.value != "chat" or model.availability.value != "available":
+        if model.kind != "chat" or model.availability != "available":
             continue
         connection = connections[model.connection_id]
         capabilities = model.capabilities
@@ -193,8 +216,9 @@ def project_chat_runtimes(snapshot: ModelCatalogSnapshot) -> list[dict[str, obje
 __all__ = [
     "ArtifactReadLeasePort", "ArtifactStorePort", "AttachmentStorePort",
     "InvalidPage", "MessageCatalogPort", "MessageConflict", "MessageDisplayReader",
-    "MessagePagePort", "MessageReaderPort", "SessionEntryPort", "SessionPagePort", "Message",
-    "ModelCatalogReader", "ModelCatalogSnapshot", "ModelControlUnavailable",
+    "MessagePagePort", "MessageReaderPort", "SessionAdminPort",
+    "SessionEntryPort", "SessionPagePort", "Message",
+    "ModelCatalogReader", "ModelCatalogSnapshot",
     "ModelSelectionReader", "RuntimeInspectionError", "RuntimeInspectionService",
     "default_chat_model_id", "project_chat_runtimes",
 ]

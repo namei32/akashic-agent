@@ -9,14 +9,14 @@ import sqlite3
 import pytest
 
 from agent.plugin_composition import ServiceKey
-from agent.plugin_composition.bindings import BINDINGS
-from agent.plugin_contracts.tools import ALL_TOOLS, TOOLS, CallSource
-from agent.plugin_contracts.context import MATERIALS_V4 as MATERIALS
+from plugins.ledger.contract import BINDINGS
+from plugins.tools.contract import ALL_TOOLS, TOOLS, CallSource
+from plugins.context.contract import MATERIALS_V4 as MATERIALS
 from plugins.akasha.infrastructure.persistence import load_consumption
 from plugins.akasha.scopes import ScopePolicies, graph_key, graph_path
 from plugins.content.plugin import check_text
-from session.log import SessionAttributes
-from session.message import CallRef, ContentPart, Input, Output, ToolCall
+from plugins.ledger.log import SessionAttributes
+from plugins.ledger.contract import CallRef, ContentPart, Input, Output, ToolCall
 from plugins.tools.plugin import open_tool
 from tests.test_default_reply import application
 
@@ -34,8 +34,9 @@ def add_memory(sources: Path) -> None:
 original_apply = apply
 async def apply(ctx):
     import asyncio
-    from agent.plugin_composition import EMBEDDINGS
-    from agent.plugin_composition.models import EmbeddingSpaceDescriptor, EmbeddingResult
+    from plugins.models.contract import EMBEDDINGS
+    from plugins.models.contract import EmbeddingResult
+    from plugins.models.contract import EmbeddingSpaceDescriptor
     await original_apply(ctx)
     ready = asyncio.Event()
     class Embedding:
@@ -68,7 +69,7 @@ def add_gated_memory(sources: Path) -> None:
 memory_apply = apply
 async def apply(ctx):
     import asyncio
-    from agent.plugin_composition import EMBEDDINGS
+    from plugins.models.contract import EMBEDDINGS
     await memory_apply(ctx)
     entered, release = asyncio.Event(), asyncio.Event()
     fast, slow_second = asyncio.Event(), asyncio.Event()
@@ -104,7 +105,7 @@ async def apply(ctx):
 async def test_slow_graph_does_not_block_another_graph_publication(tmp_path):
     """O / MEM-013: graph-local time advances in order while a neighbor waits."""
     memory = tmp_path / "workspace/memory/akasha.db"
-    async with application(tmp_path, replying=False, start=False, extra_sources=add_gated_memory) as (log, host):
+    async with application(tmp_path, replying=False, extra_sources=add_gated_memory) as (log, host):
         policies = ScopePolicies(log.owner("plugin:akasha:scope-policy"), log.catalog())
         for name in ("slow", "fast"):
             policies.set("project", name, "isolated")
@@ -119,7 +120,6 @@ async def test_slow_graph_does_not_block_another_graph_publication(tmp_path):
                 name + "-output" + suffix, Output((ContentPart("text", "remembered"),), "complete"))
 
         append_pair("slow", "1")
-        await host.start_runtime()
         root = host.live_root
         assert root is not None
         entered = root.context.require(ServiceKey("fixture.slow-entered"))
@@ -129,7 +129,7 @@ async def test_slow_graph_does_not_block_another_graph_publication(tmp_path):
             append_pair("slow", "2")
             append_pair("fast", "1")
             await asyncio.wait_for(root.context.require(ServiceKey("fixture.fast")).wait(), 2)
-            async with root.context.require(MATERIALS).bind() as materials:
+            async with root.context.open_service(MATERIALS) as service, service.bind() as materials:
                 await asyncio.wait_for(materials.prepare(log.reader("fast").snapshot(), "conversation"), 2)
             state = load_consumption(graph_path(memory, graph_key((("project", "fast"),))))
             assert state is not None
@@ -137,7 +137,7 @@ async def test_slow_graph_does_not_block_another_graph_publication(tmp_path):
         finally:
             release.set()
         await asyncio.wait_for(root.context.require(ServiceKey("fixture.slow-second")).wait(), 2)
-        async with root.context.require(MATERIALS).bind() as materials:
+        async with root.context.open_service(MATERIALS) as service, service.bind() as materials:
             await materials.prepare(log.reader("slow").snapshot(), "conversation")
         state = load_consumption(graph_path(memory, graph_key((("project", "slow"),))))
         assert state is not None
@@ -157,7 +157,7 @@ async def test_unavailable_graph_does_not_stop_other_graphs(tmp_path: Path, brok
         connection.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT)")
         connection.commit()
     original_graph = broken_path.read_bytes()
-    async with application(tmp_path, replying=False, start=False, extra_sources=add_memory) as (log, host):
+    async with application(tmp_path, replying=False, extra_sources=add_memory) as (log, host):
         policy = ScopePolicies(log.owner("plugin:akasha:scope-policy"), log.catalog())
         if broken_scope is not None:
             policy.set("project", broken_scope, "isolated")
@@ -171,12 +171,11 @@ async def test_unavailable_graph_does_not_stop_other_graphs(tmp_path: Path, brok
         log.writer("healthy", author="assistant", source="conversation", body_types=(Output,),
                    content={"text": check_text}).append(
             "healthy-output", Output((ContentPart("text", "remembered fact"),), "complete"))
-        await host.start_runtime()
         root = host.live_root
         assert root is not None
         # 2. 由真实后台学习触发 embedding；材料读取的同图锁等待发布完成。
         await asyncio.wait_for(root.context.require(ServiceKey("fixture.embedding-ready")).wait(), 5)
-        async with root.context.require(MATERIALS).bind() as materials:
+        async with root.context.open_service(MATERIALS) as service, service.bind() as materials:
             _ = await materials.prepare(log.reader("healthy").snapshot(), "conversation")
             failed = await materials.prepare(log.reader("broken").snapshot(), "conversation")
         state = load_consumption(graph_path(memory, graph_key((("project", "healthy"),))))
@@ -187,7 +186,7 @@ async def test_unavailable_graph_does_not_stop_other_graphs(tmp_path: Path, brok
         log.writer("healthy", author="user", source="conversation", body_types=(Input,),
                    content={"text": check_text}).append(
             "healthy-next", Input((ContentPart("text", "what was that fact?"),)))
-        async with root.context.require(MATERIALS).bind() as materials:
+        async with root.context.open_service(MATERIALS) as service, service.bind() as materials:
             recalled = await materials.prepare(log.reader("healthy").snapshot(), "conversation")
         assert broken_path.read_bytes() == original_graph
         assert "healthy-output" in str(recalled)
@@ -205,7 +204,7 @@ async def test_unavailable_graph_does_not_stop_other_graphs(tmp_path: Path, brok
                    content={"text": check_text}, check_call=lambda call: None).append(
             "feedback", Output(tuple(ToolCall(identity, arguments) for identity in tool_ids), "continue"))
         for index, identity in enumerate(tool_ids):
-            async with open_tool(bindings, identity) as tool:
+            async with root.context.open_service(TOOLS), open_tool(bindings, identity) as tool:
                 with pytest.raises(RuntimeError, match=re.escape(broken_key) + ".*重建"):
                     await tool.prepare(arguments, CallSource(CallRef("feedback", index),
                                                             log.reader("broken").snapshot()))

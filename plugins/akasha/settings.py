@@ -6,11 +6,12 @@ from typing import Any, cast
 from pydantic import BaseModel
 from agent.plugin_composition import Context, ServiceKey
 from agent.plugin_composition.context import FiberHandle
-from agent.plugin_composition.models import MODEL_CATALOG, ModelCatalogSnapshot, ModelAvailability
+from plugins.models.contract import ModelCatalogSnapshot
+from plugins.models.contract import MODEL_CATALOG
 from agent.plugin_composition.plugin_config import PLUGIN_CONFIG
 from agent.plugin_composition.runtime_catalog import RUNTIME_CATALOG
-from agent.plugin_contracts.configuration import Configuration
-from agent.plugin_contracts.onboarding import ONBOARDING, Step
+from plugins.ui.contract import Configuration
+from plugins.onboarding.contract import ONBOARDING, Ability, PreviewLine, Step
 
 SETTINGS = ServiceKey[Configuration]("akasha.settings.v1")
 
@@ -32,7 +33,7 @@ class Settings:
             blocked = bool(missing)
             if missing:
                 reason = "缺少前置能力：" + "、".join(missing)
-            elif model is None or not model.default_embedding_model_id or model.model(model.default_embedding_model_id).availability != ModelAvailability.AVAILABLE:
+            elif model is None or not model.default_embedding_model_id or model.model(model.default_embedding_model_id).availability != 'available':
                 reason = "请先在模型设置中选择向量模型"
             enabled = config["enabled"]
             return {**self.ctx.require(PLUGIN_CONFIG).read(self.ctx), "enabled": enabled,
@@ -66,6 +67,11 @@ async def mount(ctx: Context, model: type[BaseModel], function: FiberHandle) -> 
         await child.effect(attach, label="model-readiness")
     await ctx.inject((MODEL_CATALOG,), models, name="model-status")
     async def contribute(child: Context):
-        await child.require(ONBOARDING).group(child, "memory", "情景记忆")
+        await child.require(ONBOARDING).group(child, "memory", "Akasha 情景记忆", Ability(
+            pitch="记住你们聊过的事",
+            benefit="对话会沉淀成情景记忆，之后聊到相关的事时它会自己想起来。需要一个向量模型。",
+            preview=(PreviewLine("你", "上次说的那家拉面店叫什么来着？"),
+                     PreviewLine("Akashic", "是「风云儿」，你上个月去过，说汤头偏咸但面很好。")),
+        ))
         await child.require(ONBOARDING).register(child, Step("configure", "Akasha 情景记忆", "memory", "akasha-settings", settings.read, (function.fiber_id,)))
     await ctx.inject((ONBOARDING,), contribute, name="onboarding")

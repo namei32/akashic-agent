@@ -55,4 +55,7 @@ def test_core_only_cli_restarts_after_creating_runtime_data(
     assert set(_applied_ids(workspace / "migrations.sqlite3")) == {
         "20260921_01_plugin_update_input_ref",
         "20260928_01_plugin_config_updates",
+        "20261006_01_config_update_receipts",
+        "20261011_01_plugin_contract_restart",
     }
+    assert not (workspace / "sessions.db").exists()

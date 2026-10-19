@@ -10,7 +10,8 @@ ENV HOME=/home/huashen \
     PATH=/opt/venv/bin:/home/huashen/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    AKASHIC_DISTRIBUTION=/opt/akashic/distribution
+    AKASHIC_DISTRIBUTION=/opt/akashic/distribution \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/akashic/browsers
 
 RUN printf '%s\n' \
         'CacheServer = https://mirrors.tuna.tsinghua.edu.cn/archlinux/$repo/os/$arch' \
@@ -20,6 +21,21 @@ RUN printf '%s\n' \
     && pacman -Syyu --noconfirm \
     && pacman -S --noconfirm --needed \
         ca-certificates \
+        alsa-lib \
+        at-spi2-core \
+        cairo \
+        libcups \
+        libdrm \
+        libxcomposite \
+        libxdamage \
+        libxfixes \
+        libxkbcommon \
+        libxrandr \
+        mesa \
+        nss \
+        pango \
+        ttf-liberation \
+        wqy-zenhei \
         curl \
         git \
         python \
@@ -38,13 +54,15 @@ RUN printf '%s\n' \
 WORKDIR /opt/akashic
 
 COPY requirements.lock /opt/akashic/distribution/requirements.lock
-ARG AKASHIC_PYPI_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
+ARG AKASHIC_PYPI_INDEX_URL=https://pypi.org/simple
 ARG AKASHIC_REQUIREMENTS_SHA256
-RUN printf '%s  %s\n' "${AKASHIC_REQUIREMENTS_SHA256}" /opt/akashic/distribution/requirements.lock | sha256sum -c - \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    export PIP_CACHE_DIR=/root/.cache/pip \
+    && printf '%s  %s\n' "${AKASHIC_REQUIREMENTS_SHA256}" /opt/akashic/distribution/requirements.lock | sha256sum -c - \
     && python -m venv /opt/venv \
     && /opt/venv/bin/python -m pip install \
         --index-url "${AKASHIC_PYPI_INDEX_URL}" \
-        --no-cache-dir --require-hashes \
+        --require-hashes \
         -r /opt/akashic/distribution/requirements.lock \
     && /opt/venv/bin/python -c "import site; from pathlib import Path; Path(site.getsitepackages()[0], 'akashic-sdk.pth').write_text('/opt/akashic/source/sdk/python/src\\n')"
 
@@ -56,7 +74,7 @@ ARG AKASHIC_CORE_SHA256
 # The only source material copied into this image is the generated Core tar.
 COPY core.tar /opt/akashic/distribution/core.tar
 COPY distribution.json /opt/akashic/distribution/distribution.json
-COPY profiles /opt/akashic/distribution/profiles
+COPY bundles /opt/akashic/distribution/bundles
 COPY sources /opt/akashic/distribution/sources
 COPY *.bundle /opt/akashic/distribution/
 COPY Dockerfile.distribution /opt/akashic/distribution/Dockerfile.distribution
@@ -74,12 +92,15 @@ RUN test -n "${AKASHIC_SOURCE_COMMIT}" \
     && /opt/venv/bin/python -c "from pathlib import Path; assert Path('/opt/akashic/distribution/requirements.lock').read_bytes() == Path('/opt/akashic/source/docker/host-runtime/requirements.lock').read_bytes(), 'Build lock differs from Core lock'" \
     && /opt/venv/bin/python -c "import akashic_sdk; assert akashic_sdk.__file__.startswith('/opt/akashic/source/sdk/python/src/')"
 
-RUN mkdir -p /tmp/akashic-distribution-workspace /tmp/akashic-distribution-plugins \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    export PIP_CACHE_DIR=/root/.cache/pip \
+    && mkdir -p /tmp/akashic-distribution-workspace /tmp/akashic-distribution-plugins \
     && /opt/venv/bin/python /opt/akashic/source/scripts/distribution_runtime.py prepare-wheels \
         --distribution /opt/akashic/distribution \
+    && /opt/venv/bin/python -m playwright install --only-shell chromium \
     && /opt/venv/bin/python /opt/akashic/source/scripts/install_plugin_distribution.py \
         --distribution /opt/akashic/distribution \
-        --profile /opt/akashic/distribution/profiles/default.json \
+        --bundle /opt/akashic/distribution/bundles/base.toml \
         --workspace /tmp/akashic-distribution-workspace \
         --plugins-home /tmp/akashic-distribution-plugins \
         --verify-only \
@@ -102,4 +123,4 @@ LABEL org.opencontainers.image.revision="${AKASHIC_SOURCE_COMMIT}"
 USER huashen:huashen
 ENV AKASHIC_PLUGIN_DISTRIBUTION=/opt/akashic/distribution
 ENTRYPOINT ["/opt/akashic/distribution-entrypoint.sh"]
-CMD ["supervise"]
+CMD ["gateway"]

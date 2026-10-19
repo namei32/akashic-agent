@@ -152,13 +152,16 @@ def build_distribution_release(
     output_manifest: Path,
     base_image: str,
     arch_snapshot: str,
-    pypi_index_url: str = "https://mirrors.aliyun.com/pypi/simple",
+    pypi_index_url: str = "https://pypi.org/simple",
 ) -> dict[str, Any]:
     """Build the formal Core-plus-bundles image without a checkout fallback."""
 
     repository = repository.resolve(strict=True)
     commit, tree = _resolve_commit(repository, requested_commit)
     _assert_release_paths_safe(repository, commit)
+    _ = subprocess.run(
+        ["docker", "buildx", "version"], check=True, capture_output=True, text=True
+    )
     with tempfile.TemporaryDirectory(prefix="akashic-distribution-runtime-") as temporary:
         context = Path(temporary) / "distribution"
         source = _create_context(repository, commit, tree, context)
@@ -173,7 +176,9 @@ def build_distribution_release(
             "AKASHIC_SOURCE_TREE": tree,
             "AKASHIC_CORE_SHA256": core_sha256,
         }
-        command = ["docker", "build", "--pull=false", "--tag", image_tag]
+        command = [
+            "docker", "buildx", "build", "--load", "--pull=false", "--tag", image_tag
+        ]
         for key, value in build_arguments.items():
             command.extend(("--build-arg", f"{key}={value}"))
         command.extend(("--file", str(context / "Dockerfile.distribution"), str(context)))
@@ -327,7 +332,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--pypi-index-url",
-        default="https://mirrors.aliyun.com/pypi/simple",
+        default="https://pypi.org/simple",
     )
     args = parser.parse_args()
     if args.legacy_checkout:

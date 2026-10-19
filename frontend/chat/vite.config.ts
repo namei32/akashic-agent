@@ -40,16 +40,48 @@ function serveLocalPluginUi(): Plugin {
   };
 }
 
+// 阅读字体此前要等 CSS 下载解析后才被发现，首屏文本先以系统字体渲染再 swap。
+// 构建期把已成形的字体资产以 preload 注入 HTML，让字体下载与 JS 并行开始。
+// 只预载首屏必用的：Source Serif 4 正常体、Noto Serif SC 首屏层（标点/假名/全角）与一级常用字、JetBrains Mono；
+// 二级字、生僻字分片与斜体仍按需加载，不为可能不渲染的字形提前占带宽。
+function preloadReadingFonts(): Plugin {
+  const wanted = [
+    /^source-serif(?!-italic)-[A-Za-z0-9_-]+\.woff2$/u,
+    /^noto-serif-sc-(?:core|common-1)-[A-Za-z0-9_-]+\.woff2$/u,
+    /^JetBrainsMono-[A-Za-z0-9_-]+\.woff2$/u,
+  ];
+  return {
+    name: "preload-reading-fonts",
+    apply: "build",
+    transformIndexHtml: {
+      order: "post",
+      handler(_html, ctx) {
+        return Object.keys(ctx.bundle ?? {})
+          .filter((key) => wanted.some((re) => re.test(key)))
+          .map((key) => ({
+            tag: "link",
+            attrs: { rel: "preload", href: `/assets/${key}`, as: "font", type: "font/woff2", crossorigin: true },
+            injectTo: "head-prepend" as const,
+          }));
+      },
+    },
+  };
+}
+
 export default defineConfig({
   root: here,
   base: "/assets/",
-  plugins: [react(), emitThemeCatalog(), serveLocalPluginUi()],
+  plugins: [react(), emitThemeCatalog(), serveLocalPluginUi(), preloadReadingFonts()],
   resolve: {
+    // 代码高亮的 Worker 与主线程渲染器（经 stream-diffs）必须是同一份 @pierre/diffs，否则两边消息协议可能对不上。
+    dedupe: ["@pierre/diffs"],
     alias: {
       "@": resolve(here, "src"),
       mermaid: resolve(here, "src", "mermaid-stub.ts"),
     },
   },
+  // 代码高亮 Worker 里按需加载语法与正则引擎（动态导入），只能产出 ES 模块格式。
+  worker: { format: "es" },
   build: {
     outDir: resolve(repoRoot, "static", "chat"),
     emptyOutDir: true,

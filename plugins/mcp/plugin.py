@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 from agent.plugin_composition import Context
 from agent.plugin_composition.model import FiberState
 from agent.plugin_composition.execution import EXECUTION
-from agent.plugin_composition.mcp_slots import MCP_SERVERS, McpServerDefinition, McpSessionFailure
+from plugins.mcp.contract import MCP_SERVERS, McpServerDefinition, McpSessionFailure, MCP_DETAIL, McpDetailUnavailable
 from .definitions import McpServerBinding, _descriptor, _normalize_definition, _ENV_NAME, _RESERVED_ENV
 from .host import McpGenerationHost, McpMaterializedCommand
 
@@ -38,16 +38,15 @@ class Session:
         self._closed = False
         self._failure = None
         self._reason = None
-        self._effect = None
-        health, ctx = registration.health, registration.ctx
+        ctx = registration.ctx
         self._host = McpGenerationHost(
             registration.grant,
             on_health=self._health,
-            on_incident=lambda _id, _name, kind, reason: ctx.report_incident(kind, reason))
+            on_incident=lambda generation_id, server_name, kind, message: ctx.report_incident(kind, message))
 
-    def _health(self, _identity, _name, ready, reason):
+    def _health(self, generation_id: str, server_name: str, healthy: bool, reason: str) -> None:
         # 正常按调用退出不会使注册目标失效；并发失败会话仍保持降级。
-        self._reason = None if ready or reason == "stopped" else reason
+        self._reason = None if healthy or reason == "stopped" else reason
         self._provider.refresh_health(self._entry)
 
     async def start(self):
@@ -140,7 +139,7 @@ class McpServers:
     async def open(self, ctx: Context, name: str):
         self.check(ctx)
         async with ctx.runtime_scope():
-            ctx.require_runtime_owner(MCP_SERVERS, self)
+            ctx.require_runtime_identity(MCP_SERVERS, self)
             entry = self._entries[name]
             if entry.token is not ctx.fiber.activation_token or entry.ctx.runtime.plugin_id != ctx.runtime.plugin_id:
                 raise PermissionError("MCP 目标不属于当前 Context activation")
@@ -149,7 +148,6 @@ class McpServers:
                 self._sessions[owner.identity] = owner
                 return owner.aclose
             effect = await ctx.effect(setup, label="mcp-session:" + owner.identity)
-            owner._effect = effect
             try:
                 yield await owner.start()
             finally:
@@ -170,16 +168,6 @@ class McpServers:
             str(owner._failure) or type(owner._failure).__name__)
             for owner in self._sessions.values() if owner._failure is not None)
 
-    async def retry_cleanup(self, ctx: Context, identity: str):
-        """只重试本 Context 的保留句柄，不重开会话或重放工具。"""
-        self.check(ctx)
-        owner = self._sessions[identity]
-        if owner._entry.ctx is not ctx:
-            raise PermissionError("MCP 清理句柄不属于当前 Context")
-        if owner._failure is None:
-            raise RuntimeError("MCP 会话没有失败的清理责任")
-        await owner._effect.aclose()
-
     def catalog(self):
         """List registered targets without claiming a live tool directory."""
         return [
@@ -187,18 +175,11 @@ class McpServers:
             for name, entry in sorted(self._entries.items())
         ]
 
-    async def inspect(
-        self, caller: Context, reader: object, owner_id: str, name: str,
-    ) -> list[dict[str, object]]:
+    async def inspect(self, owner_id: str, name: str) -> list[dict[str, object]]:
         """Read real tools in one session owned by the original contribution."""
-        from agent.plugin_composition.runtime_catalog import RUNTIME_MCP_DETAIL, RuntimeCatalogUnavailable
-
-        if caller.root_instance_token is not self.root_instance_token:
-            raise PermissionError("MCP provider 不能跨 Root")
-        caller.require_declared_runtime_owner(RUNTIME_MCP_DETAIL, reader)
         entry = self._entries.get(name)
         if entry is None or entry.ctx.runtime.plugin_id != owner_id:
-            raise RuntimeCatalogUnavailable("mcp_not_found", f"MCP server 不存在: {owner_id}/{name}")
+            raise McpDetailUnavailable("mcp_not_found", f"MCP server 不存在: {owner_id}/{name}")
         # open checks the original activation and holds its Fiber until close.
         async with self.open(entry.ctx, name) as server:
             return [
@@ -221,4 +202,6 @@ def _plain_schema(value):
 
 
 async def apply(ctx: Context):
-    await ctx.provide(MCP_SERVERS, McpServers(ctx))
+    servers = McpServers(ctx)
+    await ctx.provide(MCP_SERVERS, servers)
+    await ctx.provide(MCP_DETAIL, ctx.entrypoint(servers.inspect))

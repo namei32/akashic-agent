@@ -5,8 +5,8 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import cast
 
-from agent.plugin_composition.models import ModelRequest
-from agent.plugin_contracts import (
+from plugins.models.contract import ModelRequest
+from plugins.ledger.contract import (
     CallRef,
     ContentPart,
     ContentReferences,
@@ -16,16 +16,10 @@ from agent.plugin_contracts import (
     ToolCall,
     ToolResult,
 )
-from agent.plugin_contracts.context import (
-    SummaryReducer as SummaryReducer,
-)
-from agent.plugin_contracts.models import ContextModel as ContextModel
-
-MaterialData = Mapping[str, object]
-SummaryData = Mapping[str, object]
+from plugins.context.contract import MaterialData
 
 
-def settled_prefixes(messages: tuple[Message, ...]) -> tuple[int, ...]:
+def settled_prefixes(messages: Sequence[Message]) -> tuple[int, ...]:
     """返回工具已结算或被明确放弃的前缀长度；不伪造任何工具结果。"""
     pending: dict[CallRef, Message] = {}
     ends: list[int] = []
@@ -55,7 +49,14 @@ def check_summary(part: ContentPart) -> ContentReferences:
     return ContentReferences(binding_ids=(value["reference"],))
 
 
-def summary_range(snapshot: tuple[Message, ...], source_message_ids: tuple[str, ...]) -> range:
+def check_notice(part: ContentPart) -> ContentReferences:
+    """上下文诊断是可见执行记录，不是用户输入或模型材料。"""
+    if not isinstance(part.value, str) or not part.value.strip():
+        raise ValueError("context.notice 必须是非空诊断正文")
+    return ContentReferences()
+
+
+def summary_range(snapshot: Sequence[Message], source_message_ids: tuple[str, ...]) -> range:
     """按真实身份定位摘要的连续区间；窗口外旧消息不冒充摘要来源。"""
     identities = tuple(message.message_id for message in snapshot)
     if not source_message_ids or source_message_ids[0] not in identities:
@@ -95,6 +96,7 @@ class Reminder:
     name: str
     text: str
     priority: int
+    replay: bool = True
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name.strip():
@@ -103,6 +105,8 @@ class Reminder:
             raise TypeError("提醒正文必须是字符串")
         if type(self.priority) is not int:
             raise TypeError("提醒 priority 必须是整数")
+        if type(self.replay) is not bool:
+            raise TypeError("提醒 replay 必须是 bool")
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,10 +117,13 @@ class Materials:
     reminders: tuple[Reminder, ...] = ()
     summary: Summary | None = None
     references: tuple[Mapping[str, object], ...] = ()
+    notices: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.system_prompt, str):
             raise TypeError("system Prompt 必须是字符串")
+        if any(not isinstance(item, str) or not item.strip() for item in self.notices):
+            raise ValueError("上下文诊断必须是非空正文")
         parts = tuple(self.reminders)
         if any(not isinstance(part, Reminder) for part in parts):
             raise TypeError("提醒必须是已校验的文本块")
@@ -173,18 +180,21 @@ def _summary(value: object) -> Summary | None:
 
 def _reminder(value: object) -> Reminder:
     data = _object(value, "reminder")
-    if set(data) != {"name", "text", "priority"}:
+    if set(data) not in ({"name", "text", "priority"}, {"name", "text", "priority", "replay"}):
         raise ValueError("reminder 字段无效")
     name, text, priority = data["name"], data["text"], data["priority"]
     if not isinstance(name, str) or not isinstance(text, str) or type(priority) is not int:
         raise TypeError("reminder 的 name/text/priority 类型无效")
-    return Reminder(name, text, priority)
+    replay = data.get("replay", True)
+    if type(replay) is not bool:
+        raise TypeError("reminder.replay 必须是 bool")
+    return Reminder(name, text, priority, replay)
 
 
 def decode_material(value: object) -> Materials:
     """在 Context 边界把 provider 的普通映射转换为内部材料值。"""
     data = _object(value, "materials")
-    unknown = set(data) - {"system_prompt", "reminders", "summary", "references"}
+    unknown = set(data) - {"system_prompt", "reminders", "summary", "references", "notices"}
     if unknown:
         raise ValueError(f"materials 包含未知字段: {sorted(unknown)}")
     prompt = data.get("system_prompt", "")
@@ -193,7 +203,10 @@ def decode_material(value: object) -> Materials:
     reminders = tuple(_reminder(item) for item in _sequence(data.get("reminders", ()), "materials.reminders"))
     summary = _summary(data.get("summary"))
     references = tuple(_reference(item) for item in _sequence(data.get("references", ()), "materials.references"))
-    return Materials(prompt, reminders, summary, references)
+    notices = _sequence(data.get("notices", ()), "materials.notices")
+    if any(not isinstance(item, str) for item in notices):
+        raise TypeError("materials.notices 必须是字符串数组")
+    return Materials(prompt, reminders, summary, references, cast(tuple[str, ...], notices))
 
 
 def material_data(materials: Materials) -> MaterialData:
@@ -205,9 +218,11 @@ def material_data(materials: Materials) -> MaterialData:
     }
     return {
         "system_prompt": materials.system_prompt,
-        "reminders": tuple({"name": item.name, "text": item.text, "priority": item.priority} for item in materials.reminders),
+        "reminders": tuple({"name": item.name, "text": item.text, "priority": item.priority,
+                            **({"replay": False} if not item.replay else {})} for item in materials.reminders),
         "summary": summary,
         "references": tuple(dict(item) for item in materials.references),
+        **({"notices": materials.notices} if materials.notices else {}),
     }
 
 

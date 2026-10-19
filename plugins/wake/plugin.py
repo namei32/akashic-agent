@@ -12,18 +12,18 @@ from agent.plugin_composition import (
     Context,
     ServiceKey,
 )
-from agent.plugin_composition.bindings import BINDINGS
-from agent.plugin_composition.messages import (
+from plugins.ledger.contract import BINDINGS
+from plugins.ledger.contract import (
     MESSAGE_CATALOG,
     MESSAGE_WRITERS,
     OWNER_STATE,
     SESSION_ADMISSION,
 )
 from agent.plugin_composition.tasks import TASKS
-from agent.plugin_composition.timers import TIMERS
-from agent.plugin_composition.ui import UI
-from agent.plugin_contracts.models import MODEL_CONTENT, MODEL_SELECTION
-from agent.plugin_composition.models import MODEL_CATALOG
+from plugins.timer.contract import TIMERS
+from plugins.ui.contract import UI
+from plugins.models.contract import MODEL_CONTENT, MODEL_SELECTION
+from plugins.models.contract import MODEL_CATALOG
 
 from ._boundary import (
     ALL_TOOLS,
@@ -31,7 +31,6 @@ from ._boundary import (
     DELIVERY,
     DELIVERY_READ,
     DELIVERY_SENDERS,
-    DRIFT_CHANGED,
     SEMANTIC_INTEREST,
     TOOLS,
     ToolRef,
@@ -158,7 +157,6 @@ async def start_function(ctx: Context) -> None:
     _ = await ctx.on(RUNTIME_STARTED, start)
     _ = await ctx.on(RUNTIME_STOPPING, stop)
     _ = await ctx.on(EVENTMAIL_CHANGED, changed)
-    _ = await ctx.on(DRIFT_CHANGED, changed)
 
 
 
@@ -167,17 +165,19 @@ async def _register_ui(ctx: Context) -> None:
     await ctx.require(UI).register(
         ctx, web="web_module.js",
         dashboard=lambda: import_module(".dashboard", __package__),
-        requires=("workbench.panels.v2", "shell.pages.v1"),
+        requires=("shell.settings-plugins.v1",),
         provides=(),
         contract_digests={
-            "workbench.panels.v2": "fb6417c9bf532c1fdb344767d06065d5d3293da85deb64eff1e8088889a33bcb",
+            "shell.settings-plugins.v1": "1823b19c778297893495ca9193d688e24c99d079effbaf5ecf0d1148ae0a1aa2",
         },
     )
 
 
 from agent.plugin_composition.plugin_config import PLUGIN_CONFIG
 from agent.plugin_composition.runtime_catalog import RUNTIME_CATALOG
-from agent.plugin_contracts.delivery import sender_key
+from plugins.delivery.contract import (
+    SenderDefinition,
+)
 
 inject = (PLUGIN_CONFIG, RUNTIME_CATALOG, MESSAGE_CATALOG, OWNER_STATE)
 
@@ -207,7 +207,7 @@ async def apply(ctx: Context) -> None:
     dashboard = DashboardView(state.read_only(), ctx.entrypoint(source.read),
         ctx.entrypoint(lambda session, message: catalog.reader(session).get(message)), delivery_status)
     await ctx.provide(WAKE_DASHBOARD, lambda: dashboard)
-    dependencies = function_inject + (() if config.delivery is None else (sender_key(config.delivery.channel),))
+    dependencies = function_inject + (() if config.delivery is None else (SenderDefinition.key(config.delivery.channel),))
     async def worker(child: Context):
         await start_function(child)
     function = await ctx.inject(dependencies, worker, name="function")

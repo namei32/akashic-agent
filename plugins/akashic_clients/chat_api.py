@@ -1,32 +1,41 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from agent.plugin_composition.models import ModelCallStats
+from plugins.models.contract import ModelCallStats
 
+import asyncio
 import hashlib
 import json
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
+from urllib.parse import quote
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
-from agent.plugin_composition.message_view import read_message_rows, session_row
+from plugins.models.contract import (
+    ModelControlUnavailable,
+    ModelError,
+)
+
+from .static import register_chat_assets
+from plugins.ui.contract import read_message_rows, session_row
 from .navigation import NavigationPreferences, PinUpdate, check_project_pin, session_pin_row
 from .notifications import NotificationFeed, NotificationRequest, notification_events
+from .read_marks import ReadMarks
+from .session_activity import follow_session_activity
 from .services import AttachmentStorePort as AttachmentStore
 from .services import (
+    ActiveSessionsFollowPort,
     InvalidPage,
     MessageCatalogPort as MessageCatalog,
     MessageDisplayReader,
     ModelCatalogSnapshot,
     ChatModelSelection,
-    ModelControlUnavailable,
     ModelCatalogUnavailable,
     PluginUiPluginUnavailable,
     PluginUiProvider,
@@ -35,6 +44,7 @@ from .services import (
     PluginUiRpcExecutionError,
     PluginUiRpcInvalidRequest,
     PluginUiStaleRevision,
+    SessionAdminPort,
     default_chat_model_id,
     project_chat_runtimes,
     project_unavailable_chat_runtimes,
@@ -63,9 +73,18 @@ class WebPluginUiQueryPayload(BaseModel):
         "turn.before_tool",
         "turn.after_answer",
         "drawer.panel",
+        "message.attachment",
     ]
     session_id: str | None = Field(default=None, max_length=512)
     turn_id: str | None = Field(default=None, max_length=128)
+
+
+class RenameSessionRequest(BaseModel):
+    """标题覆盖请求：空串或全空白清除覆盖；长度上限与服务端合同一致。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    title: str = Field(default="", max_length=512)
 
 
 class WebUiProvider(Protocol):
@@ -74,11 +93,18 @@ class WebUiProvider(Protocol):
     async def state(self) -> dict[str, str | bool]: ...
 
 
+class ReadMarkUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    session_id: str = Field(min_length=1, max_length=512)
+    seq: int = Field(ge=-1)
+
+
 def create_chat_app(
     *,
     workspace: Path,
     channel: WebChatChannel,
     navigation: NavigationPreferences | None = None,
+    read_marks: ReadMarks | None = None,
     runtime_inspection: RuntimeInspectionService | None = None,
     message_display: MessageDisplayReader | None = None,
     plugin_ui_provider: PluginUiProvider | None = None,
@@ -91,7 +117,9 @@ def create_chat_app(
     ] | None = None,
     messages: MessageCatalog | None = None,
     reply_status: Callable[[str], AsyncGenerator[dict[str, object], None]] | None = None,
+    follow_active_sessions: ActiveSessionsFollowPort | None = None,
     message_scope: Callable[[], Any] | None = None,
+    session_admin_scope: Callable[[], Any] | None = None,
     attachment_store: AttachmentStore | None = None,
     artifact_store: ChannelAttachmentArtifactStore | None = None,
 ) -> FastAPI:
@@ -128,20 +156,56 @@ def create_chat_app(
             raise HTTPException(status_code=503, detail="会话日志不可用")
         yield messages
 
-    project_root = Path(__file__).resolve().parent.parent
-    static_dir = project_root / "static" / "chat"
-    index_file = static_dir / "index.html"
-    app.mount(
-        "/assets",
-        StaticFiles(directory=static_dir, check_dir=False),
-        name="chat_assets",
-    )
+    async def session_activity_stream() -> AsyncGenerator[dict[str, object], None]:
+        """短借目录后独立跟随；订阅不持有请求 scope 或消息写权限。"""
+        async def reply_activity() -> AsyncGenerator[frozenset[str] | None, None]:
+            if follow_active_sessions is None:
+                yield None
+                return
+            async with aclosing(follow_active_sessions()) as frames:
+                async for frame in frames:
+                    yield frame
 
-    @app.get("/", response_model=None)
-    def chat_index() -> FileResponse | dict[str, str]:
-        if index_file.exists():
-            return FileResponse(index_file)
-        return {"status": "ok", "channel": channel.name}
+        marks = await ready_read_marks()
+        async with open_message_catalog() as catalog:
+            heads = catalog.follow(prefix=f"{channel.name}:", visibility="listed", poll_interval=60)
+        async with aclosing(follow_session_activity(
+            heads, reply_activity(), prefix=f"{channel.name}:", reads=None if marks is None else marks.follow(),
+        )) as frames:
+            async for frame in frames:
+                yield frame
+
+    # 首次使用时以当时的会话水位为基线；之后出现的新会话从头算未读。
+    async def ready_read_marks() -> ReadMarks | None:
+        if read_marks is None:
+            return None
+        if not read_marks.has_baseline():
+            read_marks.ensure_baseline(await NotificationFeed(open_message_catalog, prefix=f"{channel.name}:").baseline())
+        return read_marks
+
+    if messages is not None or message_scope is not None:
+        channel.bind_session_activity(session_activity_stream)
+
+    @asynccontextmanager
+    async def open_session_admin() -> AsyncGenerator[SessionAdminPort, None]:
+        """会话软删/恢复是显式数据管理操作，只在一次 HTTP 操作内借用窄端口。"""
+
+        if session_admin_scope is None:
+            raise HTTPException(status_code=503, detail="会话管理暂不可用")
+        async with session_admin_scope() as admin:
+            yield cast(SessionAdminPort, admin)
+
+    register_chat_assets(app, Path(__file__).resolve().parent / "static/chat")
+
+    @app.get("/api/shell/state")
+    async def client_state() -> dict[str, object]:
+        try:
+            async with open_message_catalog():
+                ready = True
+        except RuntimeError:
+            ready = False
+        return {"status": "ready" if ready else "unavailable",
+                "configured": True, "chatReady": ready}
 
     @app.get("/api/chat/health")
     async def chat_health() -> dict[str, str]:
@@ -210,15 +274,73 @@ def create_chat_app(
                 "next_cursor": None if page.next_cursor is None else {
                     "updated_at": page.next_cursor[0], "session_id": page.next_cursor[1]}}
 
+    async def _set_session_deleted(session_key: str, *, deleted: bool) -> dict[str, object]:
+        if not session_key.startswith(f"{channel.name}:"):
+            raise HTTPException(status_code=400, detail="只能管理当前聊天目录中的会话")
+        try:
+            async with open_session_admin() as admin:
+                result = await admin.set_deleted(session_key, deleted=deleted)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="会话不存在") from error
+        return {"key": result.session_key, "deleted": result.deleted,
+                "deleted_at": result.deleted_at}
+
+    @app.post("/api/chat/sessions/{session_key:path}/delete")
+    async def delete_session(session_key: str) -> dict[str, object]:
+        """软删当前聊天目录中的会话；幂等，消息物理保留，可随时恢复。"""
+
+        return await _set_session_deleted(session_key, deleted=True)
+
+    @app.post("/api/chat/sessions/{session_key:path}/undelete")
+    async def undelete_session(session_key: str) -> dict[str, object]:
+        """恢复已软删的会话；幂等，只清除 deleted_at 标记。"""
+
+        return await _set_session_deleted(session_key, deleted=False)
+
+    @app.post("/api/chat/sessions/{session_key:path}/rename")
+    async def rename_session(session_key: str, payload: RenameSessionRequest) -> dict[str, object]:
+        """覆盖会话显示标题；空标题清除覆盖回到首条消息推导，幂等。"""
+        if not session_key.startswith(f"{channel.name}:"):
+            raise HTTPException(status_code=400, detail="只能管理当前聊天目录中的会话")
+        try:
+            async with open_session_admin() as admin:
+                result = await admin.set_title(session_key, payload.title)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="会话不存在") from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return {"key": result.session_key, "title": result.title}
+
     @app.post("/api/chat/notifications/stream")
     async def notification_stream(payload: NotificationRequest) -> StreamingResponse:
         feed = NotificationFeed(open_message_catalog, prefix=f"{channel.name}:")
         cursor = await feed.baseline() if payload.cursor is None else payload.cursor
+        marks = await ready_read_marks()
         return StreamingResponse(
-            notification_events(feed, cursor),
+            notification_events(feed, cursor, reads=None if marks is None else marks.read_all,
+                                read_events=payload.read_events and marks is not None),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
         )
+
+    @app.post("/api/chat/sessions/read")
+    async def mark_session_read(payload: ReadMarkUpdate) -> dict[str, object]:
+        marks = await ready_read_marks()
+        if marks is None:
+            raise HTTPException(status_code=503, detail="已读状态暂不可用")
+        if not payload.session_id.startswith(f"{channel.name}:"):
+            raise HTTPException(status_code=400, detail="只能标记本通道的会话")
+        # 水位不超过已提交消息，避免客户端把尚未出现的消息提前标为已读。
+        async with open_message_catalog() as catalog:
+            try:
+                reader = catalog.reader(payload.session_id)
+                deleted, head = reader.deleted, reader.head()
+            except (KeyError, ValueError) as error:
+                raise HTTPException(status_code=404, detail="会话不存在") from error
+            if deleted:
+                raise HTTPException(status_code=404, detail="会话不存在")
+        seq = marks.mark(payload.session_id, min(payload.seq, head))
+        return {"session_id": payload.session_id, "seq": seq}
 
     async def read_pins() -> dict[str, object]:
         if navigation is None:
@@ -278,7 +400,9 @@ def create_chat_app(
                 selection = await model_selection_reader(
                     metadata if metadata is not None else {}
                 )
-            except ModelControlUnavailable as error:
+            except RuntimeError as error:
+                if not ModelError.matches(error, ModelControlUnavailable):
+                    raise
                 raise HTTPException(
                     status_code=503,
                     detail="模型选择服务不可用",
@@ -392,7 +516,9 @@ def create_chat_app(
             return asdict(await model_call_stats_reader(call_id))
         except KeyError as error:
             raise HTTPException(status_code=404, detail="模型调用记录不存在") from error
-        except ModelControlUnavailable as error:
+        except RuntimeError as error:
+            if not ModelError.matches(error, ModelControlUnavailable):
+                raise
             raise HTTPException(status_code=503, detail=str(error)) from error
 
     @app.get("/api/chat/runtime/documents")
@@ -456,24 +582,27 @@ def create_chat_app(
     ) -> dict[str, object]:
         async with open_message_catalog() as catalog:
             try:
-                page = catalog.reader(session_key).read_tail(
+                reader = catalog.reader(session_key)
+                page = reader.read_tail(
                     before_seq=before_seq, through_seq=through_seq, limit=page_size)
                 items = await read_message_rows(
                     cast(Any, page),
                     display_only=True,
                     reader=channel.message_display,
                 )
+                # 软删会话仍物理存在：如实返回消息并标记 deleted，供前端只读展示。
+                deleted = reader.deleted
             except KeyError as error:
                 raise HTTPException(status_code=404, detail="会话不存在") from error
             except InvalidPage as error:
                 raise HTTPException(status_code=422, detail=str(error)) from error
         return {"version": 2, "items": items, "through_seq": page.through_seq,
-                "has_more": page.has_more,
+                "has_more": page.has_more, "deleted": deleted,
                 "before_seq": page.messages[0].seq if page.has_more else None}
 
     @app.websocket("/ws")
-    async def chat_ws(websocket: WebSocket) -> None:
-        await channel.handle_websocket(websocket)
+    async def chat_ws(websocket: WebSocket, watch_sessions: bool = False) -> None:
+        await channel.handle_websocket(websocket, watch_sessions=watch_sessions)
 
     @app.post("/api/chat/uploads")
     async def upload_file(
@@ -512,7 +641,15 @@ def create_chat_app(
         if filename:
             safe_filename = Path(filename).name.replace('"', "").replace("\r", "").replace("\n", "")
             if safe_filename:
-                headers["Content-Disposition"] = f'inline; filename="{safe_filename}"'
+                encoded_filename = quote(safe_filename, safe="")
+                headers["Content-Disposition"] = (
+                    f"inline; filename*=utf-8''{encoded_filename}"
+                    if encoded_filename != safe_filename
+                    else f'inline; filename="{safe_filename}"'
+                )
+        # Any attachment can be opened as a document, including XHTML and XML.
+        headers["Content-Security-Policy"] = "sandbox allow-scripts"
+        headers["X-Content-Type-Options"] = "nosniff"
         return Response(
             content=data,
             media_type=media_type or "application/octet-stream",
@@ -536,6 +673,7 @@ def build_chat_server(
     workspace: Path,
     channel: WebChatChannel,
     navigation: NavigationPreferences | None = None,
+    read_marks: ReadMarks | None = None,
     runtime_inspection: RuntimeInspectionService | None = None,
     message_display: MessageDisplayReader | None = None,
     plugin_ui_provider: PluginUiProvider | None = None,
@@ -548,7 +686,9 @@ def build_chat_server(
     ] | None = None,
     messages: MessageCatalog | None = None,
     reply_status: Callable[[str], AsyncGenerator[dict[str, object], None]] | None = None,
+    follow_active_sessions: ActiveSessionsFollowPort | None = None,
     message_scope: Callable[[], Any] | None = None,
+    session_admin_scope: Callable[[], Any] | None = None,
     attachment_store: AttachmentStore | None = None,
     artifact_store: ChannelAttachmentArtifactStore | None = None,
     uds: str,
@@ -558,6 +698,7 @@ def build_chat_server(
             workspace=workspace,
             channel=channel,
             navigation=navigation,
+            read_marks=read_marks,
             runtime_inspection=runtime_inspection,
             message_display=message_display,
             plugin_ui_provider=plugin_ui_provider,
@@ -568,7 +709,9 @@ def build_chat_server(
             model_selection_reader=model_selection_reader,
             messages=messages,
             reply_status=reply_status,
+            follow_active_sessions=follow_active_sessions,
             message_scope=message_scope,
+            session_admin_scope=session_admin_scope,
             attachment_store=attachment_store,
             artifact_store=artifact_store,
         ),
@@ -577,7 +720,43 @@ def build_chat_server(
         access_log=False,
         timeout_graceful_shutdown=10,
     )
-    return uvicorn.Server(config)
+    return ChatApiServer(config)
+
+
+class ChatApiServer(uvicorn.Server):
+    """Chat API 的退出请求立即进入 uvicorn 优雅关闭。"""
+
+    def __init__(self, config: uvicorn.Config) -> None:
+        self._exit_loop: asyncio.AbstractEventLoop | None = None
+        self._exit_event: asyncio.Event | None = None
+        self._exit_requested = False
+        super().__init__(config)
+
+    @property
+    def should_exit(self) -> bool:
+        return self._exit_requested
+
+    # uvicorn 只轮询该标志；置位时同时通知主循环，可能来自信号处理器。
+    @should_exit.setter
+    def should_exit(self, value: bool) -> None:
+        self._exit_requested = value
+        loop, event = self._exit_loop, self._exit_event
+        if value and loop is not None and event is not None and not loop.is_closed():
+            _ = loop.call_soon_threadsafe(event.set)
+
+    # 未请求退出时保持 uvicorn 每 0.1s 一次的 on_tick 节拍。
+    async def main_loop(self) -> None:
+        self._exit_event = asyncio.Event()
+        self._exit_loop = asyncio.get_running_loop()
+        counter = 0
+        should_exit = await self.on_tick(counter)
+        while not should_exit:
+            counter = (counter + 1) % 864000
+            try:
+                _ = await asyncio.wait_for(self._exit_event.wait(), timeout=0.1)
+            except TimeoutError:
+                pass
+            should_exit = await self.on_tick(counter)
 
 
 def _require_runtime_inspection(

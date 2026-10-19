@@ -339,13 +339,10 @@ context.build → model.complete → content.decode
 
 transport retry 由 Model owner 实施；context overflow 是明确的可恢复错误，由 ReAct 请 context 用同一输入快照准备更小请求，最多按已声明预算重试；Tool effect 恢复由 Tool owner 实施。这三类重试不进入一个万能 RetryManager。
 
-Models 的带 request key 聊天调用默认最多 3 次尝试（首次加 2 次安全重试）。
-连接的 driver_config.max_attempts 显式值优先，旧 max_retries 按 N+1 次尝试解释；
-设置 max_attempts=1 可关闭自动重试。这些字段由公开 Models 设置命令的连接配置拥有，
-driver 每次仍只发送一次。只有发送边界明确证明 unsent/rejected 且错误可重试时才继续；
-5xx、流中断、读写超时和取消等效果不确定的失败不因默认额度增加而重发。
-每次尝试与 next_attempt_at 在 Models 账本中记录，同 key 的重调或重启不刷新额度，
-没有 key 的调用仍只尝试一次。此额度不是精确费用上限。
+Models 的模型生成恢复按 [0092](../decisions/0092-model-generation-recovers-until-output.md)：
+默认最多重试 10 次暂时错误（共 11 次尝试），显式 max_attempts 或 max_retries 可改上限。每次物理调用与
+next_attempt_at 在原账本记录，driver 单次发送，ReAct 不重复 transport retry。
+失败流的瞬态草稿撤下，完整响应后才提交和分发工具；未知 usage 不等于零计费。
 
 Models 聊天的调用读取、开始、首字与终结记账使用现有有界磁盘线程，完整事务内部不跨 await。
 同 key 的活 owner 在等待存储前登记；Context、选择、driver 与活 attempt 登记仍留在 loop。
@@ -457,16 +454,18 @@ U2(conversation) → conversation head 变成 2
 普通 Tool execution 插件对稳定调用 key 保持一个 receipt。对话 key 是 call_ref，独立程序的 key 来自其领域请求；两者固定实际参数、授权/binding 与 effect 是否已跨过外部边界。模型提出的参数保留在 call 消息中；经过合法 prepare 得到的执行参数保存在 receipt，这是不同事实，不是正文副本。
 
 ```text
-call 已提交
-    ▼
-requested（请求身份、结果消息身份）
-    ▼ prepare
-prepared（最终参数、exact binding）
+默认消息调用             独立调用 / 自定义结果身份
+    │                         ▼
+    │                 requested（额外请求事实）
+    └─────────┬───────────────┘
+              ▼ prepare
+prepared（最终参数、exact binding、结果身份）
     ▼ durable start intent
 started ── 外部调用 ──▶ result / unknown
 ```
 
 - 当前没有 receipt：在验证权限、控制状态和已耐久固定的 binding 后可以 prepare；缺失旧绑定必须失败，不重绑最新版。
+- 默认消息调用的请求事实由已提交 ToolCall 拥有，结果身份由 CallRef 确定；不再另写一份 requested。独立调用或自定义结果身份仍先保存 requested。prepare 成功后固定最终参数，拒绝或失败则直接提交终态；旧 requested 回执继续恢复，不改写或删除。
 - 已有 terminal ToolResult：返回原结果，不执行。
 - 有 started 而无结果：优先 query；provider 支持相同幂等 key 才可重试；否则产生真实 unknown，终止该调用的自动重试，并把结果交给模型检查。
 - 工具异常只能由能解释它的边界转成 denied/error；内部不变量损坏 fail-loud。
@@ -636,7 +635,7 @@ Turn projection / Akasha 只读消费 MessageLog
 - `Message` 的 `message_id + seq`、SessionDB schema/yoyo lineage、附件与 plugin-data 恢复材料继续由原 owner 管理；删除代码不减少既有消息、学习、附件或插件数据。
 - `plugins.tools` 的 `TOOLS`、`CallSource`、`MessageReply`、`Result`、`BoundTool` 和 `plugins.delivery` 的 `DELIVERY` / `DELIVERY_READ` 是当前插件边界。manager/snapshot 中仍可见的 `TOOL_CATALOG`、旧 delivery 导出与兼容类型只表示保留内部图，不能写成新的插件入口。
 - `RUNTIME_STARTING`、`RUNTIME_STARTED`、`RUNTIME_STOPPING` 和 `SNAPSHOT_SEALING` 仍是当前生命周期信号；旧 `AFTER_TURN_COMMITTED`、旧 retrieval/observe 名称和测试残留不证明新 Core 会发布这些事实。新来源变化使用来源插件自己的 typed signal。
-- `agent/control/frame_book.py` 是 control frame 的唯一 owner：它按 `(session_id, input_id)` 定位唯一短命 route，并保存 `connection_id` 作为 owner；依据已提交 Message 页识别 complete Output，并等待该 Output 的实际 writer drain。`FrameClaim` 只为一个精确 `CallRef` 延长这段 drain；连接失败时 active route 被移除，原始异常保留在 claim 直到 watcher `consume` 或 `abort`，它不是新的 Turn、Delivery 或 supervisor 状态。
+- `agent/plugin_composition/control_frames.py` 是 control frame 的唯一 owner：它按 `(session_id, input_id)` 定位唯一短命 route，并保存 `connection_id` 作为 owner；依据已提交 Message 页识别 complete Output，并等待该 Output 的实际 writer drain。`FrameClaim` 只为一个精确 `CallRef` 延长这段 drain；连接失败时 active route 被移除，原始异常保留在 claim 直到 watcher `consume` 或 `abort`，它不是新的 Turn、Delivery 或 supervisor 状态。
 - programmatic 来源的 ACK 只表示 Input/Control 已由 Message writer 提交；`programmatic/message/result` 从同一日志快照读取 `complete`、`pause`、`failure` 或 `open`。回复完成、渠道送达、完整 frame drain 和 restart claim 是四个独立事实。
 - Mobile 已移除旧的 stop/interrupt 注入和 `_Bus` 生产假设；生产 `MobileRealtimeChannel` 通过真实 MessageCatalog、MessageBus recoverer 与 `ChannelRuntimePorts` 接线。旧测试辅助对象不构成新的运行时 API。
 - Web 新实时链路只由 Message log 的 `session.follow`、`messages.appended` 和 `reply.status` 提供。`messages.appended` 是可按 seq 重读的持久事实，`reply.status` 是当前 generation 的短命只读活动；旧 `message.final` 不属于当前 Web API 合同。
@@ -827,8 +826,8 @@ Observe 不依靠最终 Turn 事件夹带整份 context/tool/model 状态。Mode
 - `Content.register(..., prepare=...)` 在每次 `bind()` 内一次性固定动态 TextProtocol 的提示与 decoder。prepare 不能改变协议名或内容 schema；归档声明不保存可变分类提示。分类与选图仍由协议插件拥有。
 - `Tools.register_authorize(...)` 为工具登记最终参数的限制 owner。工具 prepare 后依次执行固定 binding 中的限制和调用程序的 authorize；缺少已固定的限制时明确失败，旧 binding 不借用当前规则。
 - `COMPACTION_SUMMARIES.head(session_id)` 只读当前发布摘要，状态命令用其确切 source message IDs 计算覆盖，不获得发布或模型权限。
-- Models 的 `MODEL_CALL_HISTORY(after_id, limit)` 返回调用账分页快照，包括尚未结算和未产生 Message 的请求；原 `MODEL_CALLS(id)` 仍负责点读。分页按 ID 排列，每轮必须从头开始，不能把 ID 或秒级时间戳当作跨轮提交游标。`started` 后续可更新，`error` 不能展示为已知零费用。
-- Markdown Memory 的 `MEMORY_WRITES(after, limit)` 返回 `(source_ref, kind)` 排序的独立 receipt 副本，包含 payload 与 done_at。每轮重新扫描；消费者按双键去重。draft、backup、applied 分别陈述准备、恢复点和实际文件应用事实，不能把 draft 当作写入成功。
+- 历史方案（2026-10-15 随 Observe 退役删除，调用账保留）：Models 的 `MODEL_CALL_HISTORY(after_id, limit)` 返回调用账分页快照，包括尚未结算和未产生 Message 的请求；原 `MODEL_CALLS(id)` 仍负责点读。分页按 ID 排列，每轮必须从头开始，不能把 ID 或秒级时间戳当作跨轮提交游标。`started` 后续可更新，`error` 不能展示为已知零费用。
+- 历史方案（2026-10-15 随 Observe 退役删除，写入回执保留）：Markdown Memory 的 `MEMORY_WRITES(after, limit)` 返回 `(source_ref, kind)` 排序的独立 receipt 副本，包含 payload 与 done_at。每轮重新扫描；消费者按双键去重。draft、backup、applied 分别陈述准备、恢复点和实际文件应用事实，不能把 draft 当作写入成功。
 
 分页上限为 1000。以上接口不授予 SQL、修改、删除或外部发送能力。Observe 自有幂等记录与统计在同一事务提交；无新 Message 的诊断通过定期读取 owner 记录发现。原 trace 历史继续由 Observe 保留，Core 不迁入第二份统计账。
 
@@ -1333,7 +1332,7 @@ MessageReader 的前向页和倒向页在同一 SQLite 读事务固定 through_s
 
 ### 共享历史展示与 Web 查询（第 10 层部分接线）
 
-`infra/channels/message_view.py` 只消费固定 MessagePage，按原 seq 返回 input/output/tool_result/control、author/source、时间和有序附件引用。模型 owner 只公开调用记录 ID 与思考，工具 owner 只公开原 binding 名称；provider continuation、tool id 和恢复配置不进入页面。已批准迁移产生的四种 history 内容在原 Message 内作为 archive 保存，未知类型明确标为不可展示，不能按任意类型名前缀公开载荷。
+`agent/plugin_composition/message_view.py` 只消费固定 MessagePage，按原 seq 返回 input/output/tool_result/control、author/source、时间和有序附件引用。模型 owner 只公开调用记录 ID 与思考，工具 owner 只公开原 binding 名称；provider continuation、tool id 和恢复配置不进入页面。已批准迁移产生的四种 history 内容在原 Message 内作为 archive 保存，未知类型明确标为不可展示，不能按任意类型名前缀公开载荷。
 
 Web 历史接口显式返回 version 2、through_seq、before_seq 与 has_more；目录使用时间和 Session ID cursor，保留空文字会话。请求范围错误返回 422，未知 Session 返回 404，损坏持久记录保持服务端失败。两处接口不再使用 SessionManager，也不从旧 Turn 或 tool_chain 重造执行事实。
 
@@ -1832,7 +1831,7 @@ Delivery 恢复 unknown 且 query 无新证据时保留原 receipt，防止丢�
 | 问题 | 备选 | 选择与理由 |
 | --- | --- | --- |
 | 默认插件入口 | 测试改写 manifest；真实默认配置切换 | Akasha、Compaction、Markdown memory、Scheduler、Wake 的实际 manifest 选择 Message 入口，首次初始化与完整 App 都读取这些文件 |
-| readiness | 后台获得一次调度机会；等待生命周期完成 | 已有启动方法公开为 `PluginManager.start_runtime()`；App 等待真正 `RUNTIME_STARTED` 完成后才进入 ready，长期服务随后复用同一生命周期 |
+| readiness | 后台获得一次调度机会；等待生命周期完成 | `PluginManager.load_all()` 等待各 Fiber 完成 `RUNTIME_STARTED` 与 required health；App 再监督宿主任务并发布 ready，冷启动与局部换代共用 Fiber 生命周期 |
 | 默认 Context 授权 | 内核硬编码可信材料；初始化普通插件配置 | `init` 与 yoyo 只在配置不存在时写默认 Prompt/Markdown memory/Compaction 授权。操作者已有配置不覆盖，Core 不认识材料名称 |
 | 原生收件和发送 | 隐式复制 token；启用后检查实际注册 | 收件与 Sender 各自配置，ChannelHost 声明要求同名 Sender 的渠道；App 在 `start_all` 前核对实际注册名，缺失立即失败且尚未收件 |
 | embedding 尚未配置 | 整体启动失败；可见的可选服务不可用 | Akasha 使用 optional health，材料明确返回 `akasha.status available=false`；模型设置页仍可打开，工具不可用是明确错误，不伪造召回结果 |

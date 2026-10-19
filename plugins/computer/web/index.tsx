@@ -1,649 +1,382 @@
-import RFB from "@novnc/novnc";
-
+import type { ConversationTabView } from "@akashic/conversation-tools-v2";
 import type { WebHostContextV1, WebUiDisposer } from "@akashic/web-ui-v1";
-
-import {
-  BACKGROUND_HOLD_MS,
-  reconnectDelay,
-  shouldOpenForActivity,
-} from "./connection.js";
-import {
-  clipboardShortcut,
-  keysymForKey,
-  pasteKeySequence,
-} from "./remote-input.js";
+import { ComputerDisplay } from "./display";
+import { ClipboardPopover } from "./clipboard";
+import { ComputerEvents, type ComputerState } from "./computer-events";
+import { canInputDirectly, present, type ActionId, type ControlState, type LinkState, type PanelFacts, type RuntimeState } from "./panel-state";
+import { PanelSurface, type NavAction, type Target, type ToolId } from "./panel-view";
+import { keysymForKey } from "./remote-input.js";
 import "./style.css";
 
-interface ConversationTabView {
-  readonly active: boolean;
-  onActiveChange(listener: (active: boolean) => void): WebUiDisposer;
-  requestAttention(noticeId: string): void;
+// 这三种连接结果需要用户明确处理，轮询不自动重连。
+const SETTLED_LINKS: readonly LinkState[] = ["failed", "stale"];
+
+// 地址栏输入：带协议的地址原样打开；像域名、localhost 或 IP 的补上协议；其余当作搜索词。
+function addressToUrl(text: string): string {
+  const value = text.trim();
+  if (/^(https?:\/\/|about:blank$)/i.test(value)) return value;
+  if (/^(localhost|\d{1,3}(\.\d{1,3}){3}|\[[0-9a-f:]+\])(:\d+)?([/?#].*)?$/i.test(value)) return `http://${value}`;
+  if (!/\s/.test(value) && /^[^/?#]+\.[a-z]{2,}(:\d+)?([/?#].*)?$/i.test(value)) return `https://${value}`;
+  return `https://www.google.com/search?q=${encodeURIComponent(value)}`;
 }
 
-interface ComputerActivity {
-  readonly noticeId: number;
-  readonly active: boolean;
-}
+/** 控制器：采集事实、维持连接、执行动作。呈现规则在 panel-state，DOM 在 panel-view。 */
+function renderComputer(ctx: WebHostContextV1, host: HTMLElement, rawView: unknown): WebUiDisposer {
+  const view = rawView as ConversationTabView;
+  if (!view || typeof view.active !== "boolean" || typeof view.onActiveChange !== "function"
+    || typeof view.requestAttention !== "function") throw new Error("Computer 缺少 conversation.tools.v2 view");
+  const surface = new PanelSurface(id => void perform(id), id => {
+    for (const turn of turns) manualTurns.add(turn);
+    void select(id);
+  }, id => void tool(id), (action, value) => void navigate(action, value));
+  const screen = surface.screen;
+  const clipboard = new ClipboardPopover(surface.clipboardToggle, {
+    paste: text => paste(text),
+    takeControl: () => void perform("take"),
+  });
+  surface.stage.append(clipboard.element);
+  host.replaceChildren(surface.root);
 
-function checkView(value: unknown): ConversationTabView {
-  if (!value || typeof value !== "object") {
-    throw new Error("Computer 缺少 conversation.tools.v1 view");
-  }
-  const view = value as Partial<ConversationTabView>;
-  if (typeof view.active !== "boolean"
-    || typeof view.onActiveChange !== "function"
-    || typeof view.requestAttention !== "function") {
-    throw new Error("Computer conversation.tools.v1 view 无效");
-  }
-  return view as ConversationTabView;
-}
-
-function iconButton(label: string, path: string): HTMLButtonElement {
-  const button = document.createElement("button");
-  button.type = "button";
-  button.className = "computer-icon-button";
-  button.setAttribute("aria-label", label);
-  button.title = label;
-  button.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${path}"/></svg>`;
-  return button;
-}
-
-function checkedActivity(value: unknown): ComputerActivity {
-  if (!value || typeof value !== "object") throw new Error("Computer activity 回执无效");
-  const activity = value as Partial<ComputerActivity>;
-  if (!Number.isInteger(activity.noticeId) || typeof activity.active !== "boolean") {
-    throw new Error("Computer activity 回执无效");
-  }
-  return activity as ComputerActivity;
-}
-
-function renderComputer(
-  ctx: WebHostContextV1,
-  host: HTMLElement,
-  rawView: unknown,
-): WebUiDisposer {
-  const view = checkView(rawView);
-  const root = document.createElement("div");
-  root.className = "computer-view";
-
-  const desktop = document.createElement("div");
-  desktop.className = "computer-desktop";
-  const screen = document.createElement("div");
-  screen.className = "computer-screen";
-  screen.tabIndex = 0;
-  screen.setAttribute("role", "group");
-  screen.setAttribute(
-    "aria-label",
-    "Computer 远程桌面。点击后，鼠标和键盘会直接操作这台 Computer。",
-  );
-
-  const empty = document.createElement("div");
-  empty.className = "computer-connection-state";
-  empty.setAttribute("role", "status");
-  const emptyTitle = document.createElement("strong");
-  emptyTitle.textContent = "正在连接 Computer";
-  const emptyDetail = document.createElement("span");
-  emptyDetail.textContent = "桌面准备好后会自动出现";
-  const retry = document.createElement("button");
-  retry.type = "button";
-  retry.textContent = "重新连接";
-  retry.hidden = true;
-  empty.append(emptyTitle, emptyDetail, retry);
-
-  const status = document.createElement("div");
-  status.className = "computer-status";
-  status.setAttribute("role", "status");
-  const statusDot = document.createElement("span");
-  statusDot.className = "computer-status-dot";
-  const statusText = document.createElement("span");
-  statusText.textContent = "正在连接";
-  status.append(statusDot, statusText);
-
-  const actions = document.createElement("div");
-  actions.className = "computer-actions";
-  const clipboardButton = iconButton(
-    "打开剪贴板",
-    "M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2m1-2h6a1 1 0 0 1 1 1v2a1 1 0 0 1-1 1H9a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1Z",
-  );
-  clipboardButton.setAttribute("aria-expanded", "false");
-  const fullscreenButton = iconButton(
-    "全屏显示 Computer",
-    "M8 3H5a2 2 0 0 0-2 2v3m13-5h3a2 2 0 0 1 2 2v3M8 21H5a2 2 0 0 1-2-2v-3m13 5h3a2 2 0 0 0 2-2v-3",
-  );
-  actions.append(clipboardButton, fullscreenButton);
-
-  const clipboard = document.createElement("section");
-  clipboard.className = "computer-clipboard";
-  clipboard.id = "computer-clipboard-panel";
-  clipboard.hidden = true;
-  clipboard.setAttribute("aria-label", "Computer 剪贴板");
-  clipboardButton.setAttribute("aria-controls", clipboard.id);
-  const clipboardHeader = document.createElement("div");
-  clipboardHeader.className = "computer-clipboard-header";
-  const clipboardTitle = document.createElement("strong");
-  clipboardTitle.textContent = "剪贴板";
-  const clipboardClose = iconButton(
-    "关闭剪贴板",
-    "M18 6 6 18M6 6l12 12",
-  );
-  clipboardHeader.append(clipboardTitle, clipboardClose);
-  const clipboardHelp = document.createElement("p");
-  clipboardHelp.textContent = "在这里粘贴文字，可发送到 Computer；也可取回 Computer 中复制的文字。";
-  const clipboardText = document.createElement("textarea");
-  clipboardText.rows = 6;
-  clipboardText.maxLength = 65_536;
-  clipboardText.spellcheck = false;
-  clipboardText.setAttribute("aria-label", "剪贴板文字");
-  const clipboardStatus = document.createElement("p");
-  clipboardStatus.className = "computer-clipboard-status";
-  clipboardStatus.setAttribute("role", "status");
-  clipboardStatus.setAttribute("aria-live", "polite");
-  const clipboardFooter = document.createElement("div");
-  clipboardFooter.className = "computer-clipboard-footer";
-  const readClipboard = document.createElement("button");
-  readClipboard.type = "button";
-  readClipboard.textContent = "读取本机";
-  const writeClipboard = document.createElement("button");
-  writeClipboard.type = "button";
-  writeClipboard.textContent = "复制到本机";
-  const sendClipboard = document.createElement("button");
-  sendClipboard.type = "button";
-  sendClipboard.className = "is-primary";
-  sendClipboard.textContent = "发送到 Computer";
-  const ctrlAltDelete = document.createElement("button");
-  ctrlAltDelete.type = "button";
-  ctrlAltDelete.textContent = "发送 Ctrl Alt Delete";
-  clipboardFooter.append(readClipboard, writeClipboard, sendClipboard, ctrlAltDelete);
-  clipboard.append(
-    clipboardHeader,
-    clipboardHelp,
-    clipboardText,
-    clipboardStatus,
-    clipboardFooter,
-  );
-
-  const toolbar = document.createElement("div");
-  toolbar.className = "computer-toolbar";
-  toolbar.append(status, actions);
-  desktop.append(screen, empty);
-  root.append(toolbar, desktop, clipboard);
-  host.replaceChildren(root);
-
-  let rfb: RFB | null = null;
+  let targets: Target[] = [];
+  // 正在画面里的标签；以状态流里的 front 为准，点击切换时先乐观更新。
+  let selected = "";
+  // 跟随 Agent：它新开标签时画面切过去；你手动选过标签后本轮不再跟随，Agent 开始新一轮时恢复。
+  const manualTurns = new Set<string>();
+  let turns: readonly string[] = [];
+  let known = new Set<string>();
+  let receivedTargets = false;
+  // 正在切换的标签；请求结束前状态流里的旧 front 不覆盖它。
+  let showing = "";
+  let runtime: RuntimeState = "loading";
+  let runtimeError = "";
+  let wakeError = "";
+  let wakeRequested = false;
+  let restartRequested = false;
+  // 人工打开面板时还没收到首个状态，等状态到达后再决定是否唤醒。
+  let wakeOnState = false;
+  let statusError = "";
+  let link: LinkState = "idle";
+  let linkError = "";
+  let control = "";
+  let busy = false;
+  let agentActive = false;
+  // 当前键鼠是否送到浏览器：接管后始终可以；没接管时 Agent 空闲就可以直接操作。
+  let inputOn = false;
   let active = view.active;
   let disposed = false;
-  let reconnectAttempt = 0;
-  let reconnectTimer = 0;
-  let backgroundTimer = 0;
   let lastNotice: number | null = null;
-  let agentActive = false;
-  let catalogStale = false;
-  const heldKeys = new Map<string, { keysym: number; code: string }>();
-  let pasteAttempt: {
-    readonly id: number;
-    readonly code: string;
-    finished: boolean;
-    keyReleased: boolean;
-  } | null = null;
-  let pasteAttemptId = 0;
-  let pasteFallbackTimer = 0;
-  let clipboardWriteQueue = Promise.resolve(false);
-  let latestRemoteClipboard: string | null = null;
-  let remoteClipboardId = 0;
+  let display: ComputerDisplay | null = null;
+  let retry = 0;
+  let attempt = 0;
+  const events = new ComputerEvents(ctx);
+  const held = new Map<string, number>();
 
-  function setStatus(state: "connecting" | "connected" | "waiting" | "failed") {
-    status.dataset.state = state;
-    statusText.textContent = agentActive && state === "connected"
-      ? "Agent 正在操作"
-      : {
-          connecting: "正在连接",
-          connected: "已连接",
-          waiting: "已暂停",
-          failed: "连接中断",
-        }[state];
+  function facts(): PanelFacts {
+    const target = targets.find(item => item.id === selected);
+    const controlState: ControlState = control ? (link === "connected" ? "mine" : "taking") : busy ? "other" : "none";
+    return { runtime, runtimeError: runtimeError || wakeError, link, linkError, control: controlState, agentActive,
+      agentTurn: turns.length > 0, anonymous: target?.anonymous ?? false, wakeRequested, restartRequested, statusError };
   }
 
-  function showConnection(title: string, detail: string, canRetry: boolean) {
-    empty.hidden = false;
-    emptyTitle.textContent = title;
-    emptyDetail.textContent = detail;
-    retry.hidden = !canRetry;
+  function update() {
+    if (disposed) return;
+    const current = facts();
+    surface.render(present(current));
+    const direct = canInputDirectly(current);
+    const next = (Boolean(control) && link === "connected") || direct;
+    // 输入权限收回前先松开按住的键，避免远端留下按下状态。
+    if (inputOn && !next) releaseKeys();
+    inputOn = next;
+    display?.setInput(inputOn);
+    surface.renderNav(runtime === "ready" && (current.control === "mine" || (current.control === "none"
+      && !current.agentActive && !current.agentTurn)));
+    clipboard.setCanPaste(inputOn);
   }
 
-  function clearTimers() {
-    if (reconnectTimer) window.clearTimeout(reconnectTimer);
-    if (backgroundTimer) window.clearTimeout(backgroundTimer);
-    reconnectTimer = 0;
-    backgroundTimer = 0;
+  function releaseKeys() {
+    for (const [code, keysym] of held) display?.sendKey(keysym, code, false);
+    held.clear();
   }
 
-  function scheduleReconnect() {
-    if (disposed || catalogStale || !active || reconnectTimer || rfb) return;
-    const delay = reconnectDelay(reconnectAttempt++);
-    reconnectTimer = window.setTimeout(() => {
-      reconnectTimer = 0;
-      connect();
-    }, delay);
+  function disconnect() {
+    attempt++;
+    releaseKeys();
+    display?.disconnect();
+    display = null;
+    control = "";
   }
 
-  function connect() {
-    if (disposed || catalogStale || !active || rfb) return;
-    if (backgroundTimer) window.clearTimeout(backgroundTimer);
-    backgroundTimer = 0;
-    screen.replaceChildren();
-    showConnection("正在连接 Computer", "正在建立安全的远程桌面会话", false);
-    setStatus("connecting");
-
-    let next: RFB;
-    try {
-      next = new RFB(
-        screen,
-        ctx.http.webSocketUrl("/api/dashboard/computer/display"),
-        { shared: true, wsProtocols: ["binary"] },
-      );
-    } catch {
-      showConnection("无法连接 Computer", "请检查插件是否正在运行", true);
-      setStatus("failed");
-      scheduleReconnect();
+  function inputKey(event: KeyboardEvent) {
+    // Ctrl/Cmd+L 和本地浏览器一样聚焦地址栏；kiosk 模式的 Chromium 没有自己的地址栏。
+    if (event.type === "keydown" && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "l") {
+      event.preventDefault();
+      releaseKeys();
+      surface.focusAddress();
       return;
     }
-    rfb = next;
-    next.scaleViewport = true;
-    next.resizeSession = false;
-    next.clipViewport = false;
-    next.focusOnClick = true;
-    next.viewOnly = false;
-    next.showDotCursor = true;
-    next.qualityLevel = 7;
-    next.compressionLevel = 2;
+    if (!inputOn) return;
+    // Ctrl/Cmd+T 新建标签走面板，和标签条的“+”一致：新窗口铺满并聚焦地址栏。
+    if (event.type === "keydown" && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "t") {
+      event.preventDefault();
+      releaseKeys();
+      void navigate("open");
+      return;
+    }
+    event.preventDefault();
+    if (event.type === "keydown" && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "v") {
+      releaseKeys();
+      void navigator.clipboard.readText().then(paste).catch(error => clipboard.report(String(error)));
+      return;
+    }
+    const keysym = keysymForKey(event.key, event.code);
+    if (keysym == null) return;
+    if (event.type === "keydown") held.set(event.code, keysym);
+    else held.delete(event.code);
+    display?.sendKey(keysym, event.code, event.type === "keydown");
+  }
 
+  async function paste(value: string) {
+    if (!inputOn || !display) throw new Error("Agent 正在使用浏览器，先接管再粘贴");
+    await display.clipboardPasteFrom(value);
+    display.sendKey(0xffe3, "ControlLeft", true);
+    display.sendKey(0x76, "KeyV", true);
+    display.sendKey(0x76, "KeyV", false);
+    display.sendKey(0xffe3, "ControlLeft", false);
+  }
+
+  function connect(token = "") {
+    if (!active || runtime !== "ready" || disposed || SETTLED_LINKS.includes(link)) return;
+    disconnect();
+    control = token;
+    link = "connecting";
+    const current = ++attempt;
+    const next = new ComputerDisplay(screen, ctx, { keydown: inputKey, keyup: inputKey,
+      blur: releaseKeys, paste: event => {
+        event.preventDefault();
+        void paste(event.clipboardData?.getData("text/plain") ?? "").catch(error => clipboard.report(String(error)));
+      } }, events, token, selected);
+    display = next;
     next.addEventListener("connect", () => {
-      if (rfb !== next) return;
-      reconnectAttempt = 0;
-      empty.hidden = true;
-      setStatus("connected");
-      if (active) next.focus({ preventScroll: true });
+      if (attempt !== current) return;
+      link = "connected";
+      update();
     });
-    next.addEventListener("clipboard", (event) => {
-      void receiveRemoteClipboard(event.detail.text);
+    next.addEventListener("clipboard", event => clipboard.receive((event as CustomEvent<{ text: string }>).detail.text));
+    next.addEventListener("error", event => {
+      if (attempt !== current) return;
+      link = "failed";
+      linkError = (event as CustomEvent<{ reason: string }>).detail.reason;
+      update();
     });
-    next.addEventListener("securityfailure", (event) => {
-      showConnection(
-        "Computer 拒绝了连接",
-        event.detail.reason || "远程桌面安全握手失败",
-        true,
-      );
+    // 画面同一时刻只给一个窗口：被别的窗口接走后不自动抢回，避免两边来回顶替。
+    next.addEventListener("superseded", () => {
+      if (attempt !== current) return;
+      link = "failed";
+      linkError = "另一个窗口正在看这个浏览器。点“重新连接”在这里继续看。";
+      update();
+    });
+    next.addEventListener("stale", () => {
+      if (attempt !== current) return;
+      link = "stale";
+      update();
     });
     next.addEventListener("disconnect", () => {
-      if (rfb !== next) return;
-      rfb = null;
-      if (disposed) return;
-      if (catalogStale) {
-        showConnection("界面已更新", "请刷新页面以使用新的 Computer", false);
-        setStatus("failed");
-        return;
-      }
-      if (!active) {
-        showConnection("Computer 已暂停", "重新展开时会恢复连接", false);
-        setStatus("waiting");
-        return;
-      }
-      showConnection("连接已中断", "正在自动重新连接", true);
-      setStatus("failed");
-      void loadActivity();
-      scheduleReconnect();
+      if (attempt !== current) return;
+      display = null;
+      control = "";
+      if (!SETTLED_LINKS.includes(link)) link = "lost";
+      update();
+      // 画面断开不会带来新的状态事件，自己隔一秒重连。
+      window.clearTimeout(retry);
+      retry = window.setTimeout(() => { if (link === "lost") connect(); }, 1000);
     });
+    update();
   }
 
-  function setActive(next: boolean) {
-    active = next;
-    if (reconnectTimer) window.clearTimeout(reconnectTimer);
-    reconnectTimer = 0;
-    if (active) {
-      if (backgroundTimer) window.clearTimeout(backgroundTimer);
-      backgroundTimer = 0;
-      if (rfb) rfb.focus({ preventScroll: true });
-      else connect();
-      return;
-    }
-    releaseRemoteKeys();
-    rfb?.blur();
-    if (backgroundTimer || !rfb) return;
-    backgroundTimer = window.setTimeout(() => {
-      backgroundTimer = 0;
-      rfb?.disconnect();
-    }, BACKGROUND_HOLD_MS);
-  }
-
-  async function loadActivity() {
-    if (disposed || catalogStale) return;
+  // 地址栏、前进后退、新开和关闭标签：Agent 在用时后端返回 409，提示先接管。
+  async function navigate(action: NavAction, value = "") {
+    const path = action === "open" ? "open" : action === "close" ? "close" : "navigate";
+    const body = action === "open" ? {} : action === "close" ? { target: value }
+      : { target: selected, action, ...(action === "go" ? { url: addressToUrl(value) } : {}) };
     try {
-      const response = await ctx.http.request("/api/dashboard/computer/activity", {
-        cache: "no-store",
-      });
-      if (response.headers.get("X-Akashic-Web-Stale") === "1") {
-        catalogStale = true;
-        clearTimers();
-        rfb?.disconnect();
-        showConnection("界面已更新", "请刷新页面以使用新的 Computer", false);
-        setStatus("failed");
-        return;
+      const response = await ctx.http.request(`/api/dashboard/computer/${path}`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...body, ...(control ? { control } : {}) }) });
+      if (response.status === 409) throw new Error("浏览器正在被使用，请在此窗口接管后再操作");
+      if (!response.ok) {
+        const detail = await response.json().then((data: { detail?: unknown }) => data.detail, () => undefined);
+        throw new Error(typeof detail === "string" && detail ? detail : `操作失败（${response.status}）`);
       }
-      if (!response.ok) throw new Error(`activity ${response.status}`);
-      const activity = checkedActivity(await response.json());
-      agentActive = activity.active;
-      if (shouldOpenForActivity(lastNotice, activity.noticeId, activity.active)) {
-        view.requestAttention(`computer:${activity.noticeId}`);
+      // 新开的标签立即选中并聚焦地址栏，像本地浏览器的 Ctrl+T。
+      if (action === "open") {
+        const { target } = await response.json() as { target?: string };
+        if (target) { selected = target; surface.renderTargets(targets, selected); }
+        surface.focusAddress();
       }
-      lastNotice = activity.noticeId;
-      if (rfb) setStatus("connected");
-    } catch {
-      if (!catalogStale && rfb === null) setStatus("failed");
+    } catch (error) {
+      surface.notify(error instanceof Error ? error.message : String(error));
     }
   }
 
-  function setClipboardOpen(open: boolean, returnToDesktop = false) {
-    if (open) {
-      releaseRemoteKeys();
-      rfb?.blur();
-    }
-    clipboard.hidden = !open;
-    clipboardButton.setAttribute("aria-expanded", String(open));
-    if (open) clipboardText.focus();
-    else if (returnToDesktop) rfb?.focus({ preventScroll: true });
-    else clipboardButton.focus();
-  }
-
-  function releaseRemoteKeys() {
-    if (rfb) {
-      for (const { keysym, code } of heldKeys.values()) {
-        rfb.sendKey(keysym, code, false);
-      }
-    }
-    heldKeys.clear();
-  }
-
-  function clearPasteAttempt() {
-    if (pasteFallbackTimer) window.clearTimeout(pasteFallbackTimer);
-    pasteFallbackTimer = 0;
-    pasteAttempt = null;
-  }
-
-  function hasHeldControl() {
-    return heldKeys.has("ControlLeft") || heldKeys.has("ControlRight");
-  }
-
-  function sendPasteKeys(controlHeld: boolean) {
-    if (!rfb) return;
-    const metaCodes = [...heldKeys.values()]
-      .map((value) => value.code)
-      .filter((code) => code === "MetaLeft" || code === "MetaRight");
-    for (const event of pasteKeySequence(controlHeld, metaCodes)) {
-      rfb.sendKey(event.keysym, event.code, event.down);
-    }
-  }
-
-  function finishRemotePaste(attemptId: number, rawText: string) {
-    const attempt = pasteAttempt;
-    if (!attempt || attempt.id !== attemptId || attempt.finished || !rfb) return;
-    attempt.finished = true;
-    clipboardText.value = rawText;
-    rfb.clipboardPasteFrom(rawText);
-    sendPasteKeys(hasHeldControl());
-    clipboardStatus.textContent = "已粘贴到 Computer。";
-    if (attempt.keyReleased) clearPasteAttempt();
-  }
-
-  function beginRemotePaste(event: KeyboardEvent) {
-    event.stopPropagation();
-    if (event.repeat) {
-      event.preventDefault();
-      return;
-    }
-    clearPasteAttempt();
-    const attempt = {
-      id: ++pasteAttemptId,
-      code: event.code || "KeyV",
-      finished: false,
-      keyReleased: false,
-    };
-    pasteAttempt = attempt;
-
-    // Keep the default action alive so the browser emits a trusted paste event.
-    const clipboardApi = navigator.clipboard;
-    if (clipboardApi?.readText) {
-      void clipboardApi.readText()
-        .then((text) => finishRemotePaste(attempt.id, text))
-        .catch(() => undefined);
-    }
-    pasteFallbackTimer = window.setTimeout(() => {
-      if (pasteAttempt?.id !== attempt.id || pasteAttempt.finished) return;
-      clearPasteAttempt();
-      setClipboardOpen(true);
-      clipboardStatus.textContent = "浏览器未允许直接读取。请在文本框中按 Ctrl+V。";
-    }, 1_000);
-  }
-
-  function onRemotePaste(event: ClipboardEvent) {
-    if (!rfb) return;
-    event.preventDefault();
-    event.stopPropagation();
-    const text = event.clipboardData?.getData("text/plain");
-    if (text === undefined) return;
-    if (!pasteAttempt) {
-      pasteAttempt = {
-        id: ++pasteAttemptId,
-        code: "KeyV",
-        finished: false,
-        keyReleased: true,
-      };
-    }
-    finishRemotePaste(pasteAttempt.id, text);
-  }
-
-  async function writeTextToLocal(text: string): Promise<boolean> {
-    const clipboardApi = navigator.clipboard;
-    if (!clipboardApi?.writeText) return false;
+  // 切换标签只把它提到屏幕最前，画面连接不动；失败时回到状态流里的 front。
+  async function select(id: string) {
+    if (id === selected) return;
+    const previous = selected;
+    selected = id;
+    showing = id;
+    surface.renderTargets(targets, selected);
+    update();
     try {
-      await clipboardApi.writeText(text);
-      return true;
-    } catch {
-      return false;
+      const response = await ctx.http.request("/api/dashboard/computer/show", {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ target: id }) });
+      if (!response.ok) throw new Error(`切换失败（${response.status}）`);
+    } catch (error) {
+      selected = targets.find(target => target.front)?.id ?? previous;
+      surface.renderTargets(targets, selected);
+      surface.notify(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (showing === id) showing = "";
     }
   }
 
-  async function receiveRemoteClipboard(rawText: string) {
-    const clipboardId = ++remoteClipboardId;
-    latestRemoteClipboard = rawText;
-    const editing = document.activeElement === clipboardText;
-    if (!editing) clipboardText.value = rawText;
-    const write = clipboardWriteQueue.then(() => writeTextToLocal(rawText));
-    clipboardWriteQueue = write;
-    const copied = await write;
-    if (clipboardId !== remoteClipboardId) return;
-    readClipboard.textContent = "读取本机";
-    if (copied) {
-      latestRemoteClipboard = null;
-      clipboardStatus.textContent = "已复制到本机剪贴板。";
-      return;
+  async function perform(id: ActionId) {
+    // 1. 控制权：接管、交还和取消都以新的连接身份重连，旧连接的输入立即失效。
+    if (id === "take" || id === "release" || id === "cancel") {
+      if (id === "take" && SETTLED_LINKS.includes(link)) link = "idle";
+      connect(id === "take" ? crypto.randomUUID() : "");
+    } else if (id === "reconnect") {
+      link = "idle";
+      connect();
+    } else if (id === "reload") location.reload();
+    else if (id === "copy-error") await navigator.clipboard.writeText(runtimeError || wakeError);
+    else if (id === "restart") {
+      // 3. 重启同样是长请求；失败时后端回到 failed 并带上原因，由状态流呈现。
+      restartRequested = true;
+      wakeError = "";
+      update();
+      try {
+        const response = await ctx.http.request("/api/dashboard/computer/restart", { method: "POST" });
+        if (!response.ok) wakeError = `重启请求失败（${response.status}）`;
+      } catch (error) { wakeError = String(error); }
+      restartRequested = false;
+      update();
+    } else if (id === "wake") {
+      // 2. 唤醒是长请求；期间轮询会看到 starting，失败原因留在本地直到下次尝试。
+      wakeRequested = true;
+      wakeError = "";
+      update();
+      try {
+        const response = await ctx.http.request("/api/dashboard/computer/wake", { method: "POST" });
+        if (!response.ok) wakeError = `唤醒请求失败（${response.status}）`;
+      } catch (error) { wakeError = String(error); }
+      wakeRequested = false;
+      update();
     }
-    if (editing) {
-      readClipboard.textContent = "载入 Computer 文字";
-      clipboardStatus.textContent = "Computer 有新的复制内容，尚未覆盖你正在编辑的文字。";
-      return;
+  }
+
+  // 状态流的每个快照：只观察；休眠需明确唤醒，通知不修改面板和观看目标。
+  function apply(state: ComputerState) {
+    statusError = "";
+    runtime = state.browser.state as RuntimeState;
+    runtimeError = state.browser.error;
+    if (wakeOnState) { wakeOnState = false; wakeIfSleeping(); }
+    agentActive = state.active;
+    turns = state.turns;
+    busy = state.control;
+    if ((lastNotice !== null && lastNotice !== state.noticeId) || (lastNotice === null && state.active))
+      view.requestAttention(`computer:${state.noticeId}`);
+    lastNotice = state.noticeId;
+    const front = showing || (state.targets.find(target => target.front)?.id ?? selected);
+    const opened = state.targets.filter(target => target.agent && !known.has(target.id)).at(-1);
+    const first = !receivedTargets;
+    receivedTargets = true;
+    known = new Set(state.targets.filter(target => target.agent).map(target => target.id));
+    if (JSON.stringify(targets) !== JSON.stringify(state.targets) || front !== selected) {
+      targets = state.targets;
+      selected = front;
+      surface.renderTargets(targets, selected);
     }
-    latestRemoteClipboard = null;
-    clipboardStatus.textContent = "Computer 已复制文字。点击“复制到本机”即可取回。";
+    if (active && link === "connected" && !busy && opened?.turn && !manualTurns.has(opened.turn)
+      && !first && opened.id !== front) void select(opened.id);
+    if (runtime !== "ready") {
+      if (display) disconnect();
+      if (link !== "stale") link = "idle";
+    } else if (active && !display) connect();
+    update();
   }
 
-  function sendRemoteKey(event: KeyboardEvent, down: boolean) {
-    event.preventDefault();
-    event.stopPropagation();
-    if (!rfb) return;
-    const id = event.code || event.key;
-    if (down && event.repeat) return;
-    const held = heldKeys.get(id);
-    if (!down && !held) return;
-    const keysym = held?.keysym ?? keysymForKey(event.key, event.code);
-    if (keysym === null) return;
-    const code = held?.code ?? event.code;
-    rfb.sendKey(keysym, code, down);
-    if (down) heldKeys.set(id, { keysym, code });
-    else heldKeys.delete(id);
-  }
+  events.addEventListener("state", event => apply((event as CustomEvent<ComputerState>).detail));
+  // 读取失败与画面连接无关：不改写 link，已确定的 stale 等终态保持不变。
+  events.addEventListener("error", event => {
+    statusError = (event as CustomEvent<string>).detail;
+    update();
+  });
+  events.addEventListener("stale", () => {
+    disconnect();
+    link = "stale";
+    update();
+  });
 
-  function onRemoteKeyDown(event: KeyboardEvent) {
-    if (clipboardShortcut(event.key, event.ctrlKey, event.metaKey, event.altKey) === "paste") {
-      beginRemotePaste(event);
-      return;
-    }
-    sendRemoteKey(event, true);
-  }
-
-  function onRemoteKeyUp(event: KeyboardEvent) {
-    if (pasteAttempt && (event.code || event.key) === pasteAttempt.code) {
-      event.preventDefault();
-      event.stopPropagation();
-      pasteAttempt.keyReleased = true;
-      if (pasteAttempt.finished) clearPasteAttempt();
-      return;
-    }
-    sendRemoteKey(event, false);
-  }
-
-  function onWindowBlur() {
-    releaseRemoteKeys();
-    rfb?.blur();
-  }
-
-  function onVisibilityChange() {
-    if (document.visibilityState === "hidden") onWindowBlur();
-  }
-
-  function selectClipboardText() {
-    clipboardText.focus();
-    clipboardText.select();
-  }
-
-  async function readLocalClipboard() {
-    const clipboardApi = navigator.clipboard;
-    if (!clipboardApi?.readText) {
-      selectClipboardText();
-      clipboardStatus.textContent = "请在文本框中按 Ctrl+V 粘贴本机文字。";
-      return;
-    }
+  // 头部工具：都只读当前画面或地址，不改变控制权与连接。
+  async function tool(id: ToolId) {
+    const url = targets.find(item => item.id === selected)?.url ?? "";
     try {
-      clipboardText.value = await clipboardApi.readText();
-      clipboardText.focus();
-      clipboardStatus.textContent = "已读取本机剪贴板。";
-    } catch {
-      selectClipboardText();
-      clipboardStatus.textContent = "浏览器未允许读取。请在文本框中按 Ctrl+V。";
-    }
+      if (id === "fullscreen")
+        await (document.fullscreenElement ? document.exitFullscreen() : surface.root.requestFullscreen());
+      else if (id === "open-url") window.open(url, "_blank", "noopener");
+      else if (id === "copy-url") { await navigator.clipboard.writeText(url); surface.notify("已复制链接"); }
+      else if (id === "shot") {
+        if (!display || link !== "connected") throw new Error("画面还没连上");
+        save(await display.snapshot());
+        surface.notify("截图已保存");
+      }
+    } catch (error) { surface.notify(`${id === "shot" ? "截图" : "操作"}失败：${error instanceof Error ? error.message : String(error)}`); }
   }
 
-  async function writeLocalClipboard() {
-    if (await writeTextToLocal(clipboardText.value)) {
-      clipboardStatus.textContent = "已复制到本机剪贴板。";
-      return;
-    }
-    selectClipboardText();
-    if (document.execCommand("copy")) {
-      clipboardStatus.textContent = "已复制到本机剪贴板。";
-      return;
-    }
-    clipboardStatus.textContent = "文字已选中。请按 Ctrl+C 复制。";
+  function save(blob: Blob) {
+    const link = document.createElement("a");
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[-:]/g, "").replace("T", "-");
+    link.href = URL.createObjectURL(blob);
+    link.download = `computer-${stamp}.${blob.type === "image/jpeg" ? "jpg" : blob.type === "image/webp" ? "webp" : "png"}`;
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(link.href), 1000);
   }
 
-  screen.addEventListener("focus", () => rfb?.focus({ preventScroll: true }));
-  screen.addEventListener("keydown", onRemoteKeyDown, true);
-  screen.addEventListener("keyup", onRemoteKeyUp, true);
-  screen.addEventListener("paste", onRemotePaste, true);
-  window.addEventListener("blur", onWindowBlur);
-  document.addEventListener("visibilitychange", onVisibilityChange);
-  retry.addEventListener("click", () => {
-    reconnectAttempt = 0;
-    rfb?.disconnect();
-    if (!rfb) connect();
-  });
-  clipboardButton.addEventListener("click", () => setClipboardOpen(clipboard.hidden));
-  clipboardClose.addEventListener("click", () => setClipboardOpen(false));
-  clipboard.addEventListener("keydown", (event) => {
-    if (event.key !== "Escape") return;
-    event.preventDefault();
-    setClipboardOpen(false);
-  });
-  readClipboard.addEventListener("click", () => {
-    if (latestRemoteClipboard !== null) {
-      clipboardText.value = latestRemoteClipboard;
-      latestRemoteClipboard = null;
-      readClipboard.textContent = "读取本机";
-      clipboardText.focus();
-      clipboardStatus.textContent = "已载入 Computer 复制的文字。";
-      return;
-    }
-    void readLocalClipboard();
-  });
-  writeClipboard.addEventListener("click", () => void writeLocalClipboard());
-  sendClipboard.addEventListener("click", () => {
-    if (!rfb) {
-      clipboardStatus.textContent = "Computer 尚未连接。";
-      return;
-    }
-    rfb.clipboardPasteFrom(clipboardText.value);
-    clipboardStatus.textContent = "已发送到 Computer。关闭后在 Computer 中按 Ctrl+V 粘贴。";
-  });
-  ctrlAltDelete.addEventListener("click", () => {
-    rfb?.sendCtrlAltDel();
-    setClipboardOpen(false, true);
-  });
-  function syncFullscreenLabel() {
-    const fullscreen = document.fullscreenElement === root;
-    const label = fullscreen ? "退出全屏" : "全屏显示 Computer";
-    fullscreenButton.setAttribute("aria-label", label);
-    fullscreenButton.title = label;
+  screen.addEventListener("keydown", inputKey, true);
+  screen.addEventListener("keyup", inputKey, true);
+  // 画面被挡住时点它不会有任何效果：闪一下状态胶囊，说明 Agent 在用、要先接管。
+  screen.addEventListener("pointerdown", () => { if (!inputOn && link === "connected") surface.nudge(); });
+  // 0084：人工打开面板唤醒一次。注册时的首次回调只报告现状，不算打开；
+  // 之后保持打开不会再次唤醒，休眠后由用户点"唤醒浏览器"。
+  function wakeIfSleeping() {
+    if (runtime === "loading") wakeOnState = true;
+    else if (runtime === "sleeping" && !runtimeError && !wakeError && !wakeRequested) void perform("wake");
   }
-  document.addEventListener("fullscreenchange", syncFullscreenLabel);
-  fullscreenButton.addEventListener("click", () => {
-    const operation = document.fullscreenElement
-      ? document.exitFullscreen()
-      : root.requestFullscreen();
-    void operation.catch(() => {
-      status.dataset.state = "failed";
-      statusText.textContent = "无法进入全屏";
-    });
+
+  let registered = false;
+  const stopActive = view.onActiveChange(value => {
+    const opened = registered && value && !active;
+    active = value;
+    if (!active) { disconnect(); link = SETTLED_LINKS.includes(link) ? link : "idle"; wakeOnState = false; }
+    else connect();
+    update();
+    if (opened) wakeIfSleeping();
   });
-
-  const stopActive = view.onActiveChange(setActive);
-  const activityPoll = window.setInterval(() => void loadActivity(), 1_000);
-  void loadActivity();
-
+  registered = true;
+  update();
   return () => {
     disposed = true;
+    events.close();
+    window.clearTimeout(retry);
     stopActive();
-    window.clearInterval(activityPoll);
-    document.removeEventListener("fullscreenchange", syncFullscreenLabel);
-    screen.removeEventListener("keydown", onRemoteKeyDown, true);
-    screen.removeEventListener("keyup", onRemoteKeyUp, true);
-    screen.removeEventListener("paste", onRemotePaste, true);
-    window.removeEventListener("blur", onWindowBlur);
-    document.removeEventListener("visibilitychange", onVisibilityChange);
-    releaseRemoteKeys();
-    clearPasteAttempt();
-    clearTimers();
-    rfb?.disconnect();
-    rfb = null;
+    disconnect();
     host.replaceChildren();
   };
 }
 
 export function activate(ctx: WebHostContextV1): WebUiDisposer {
-  return ctx.ui.inject("conversation.tools.v1", (mount) => mount.register({
-    id: "computer",
-    label: "Computer",
-    order: 10,
-    render(host, _entryView, props) {
-      return renderComputer(ctx, host, props);
-    },
+  return ctx.ui.inject("conversation.tools.v2", mount => mount.register({
+    id: "computer", label: "浏览器", order: 10, hint: "带你登录态的浏览器，Agent 和你都能用", shortcut: "Mod+Shift+D", background: true,
+    icon: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>',
+    render(host, _entryView, props) { return renderComputer(ctx, host, props); },
   }));
 }

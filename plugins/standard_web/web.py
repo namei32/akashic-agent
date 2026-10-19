@@ -8,15 +8,15 @@ from typing import Any, cast
 import httpx
 
 from agent.plugin_composition import Context
-from agent.tool_catalog import (
+from plugins.tools.contract import (
     normalize_tool_parameters,
     validate_tool_parameters,
 )
 from .fetch import WebFetchTool
 from .search import WebSearchTool
 from core.net.http import HttpRequester, RequestBudget, RetryPolicy
-from agent.plugin_contracts import ContentPart
-from agent.plugin_contracts import json_value
+from plugins.ledger.contract import ContentPart
+from plugins.ledger.contract import json_value
 
 from ._tool_boundary import CallSource, TOOLS, ToolRef, ToolResultValue
 

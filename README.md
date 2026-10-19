@@ -4,65 +4,90 @@
 
 Akashic 是一个会主动找你的 AI 伙伴。它可以对话，也能根据订阅的信息源判断何时主动发消息，并在空闲时执行后台任务。
 
-## 普通启动
+## 快速开始
 
-需要 Git、Python 3.12+ 和 Node.js 20+。适用于 Linux；Windows 使用 WSL2。
+只需要 [Docker](https://docs.docker.com/get-docker/)（Compose 2.20+）。Windows 和 macOS 使用 Docker Desktop 即可。
 
 ```bash
-git clone https://github.com/kachofugetsu09/akashic-agent.git
+mkdir akashic && cd akashic
+curl -fsSLO https://github.com/kachofugetsu09/akashic-agent/releases/latest/download/compose.yaml
+docker compose up -d --wait
+```
+
+首次启动会拉取镜像并安装默认功能，需要几分钟。命令返回后打开 <http://localhost:2236>，在“功能设置”→“初始配置”里连接模型，然后开始对话。
+
+启动失败时查看 `docker compose logs --tail=200`，处理后重新运行同一条启动命令。
+
+## 日常使用
+
+```bash
+docker compose stop            # 停止
+docker compose up -d --wait    # 启动
+docker compose logs -f         # 查看日志
+```
+
+- 配置、会话和插件都保存在 `data` 数据卷里。**不要运行 `docker compose down -v`，它会删除所有数据。**
+- 端口 2236 被占用时，在同一目录创建 `.env`，写入 `AKASHIC_PORT=2237`，再重新启动。
+- 更新：先停止并备份数据，再下载新版 `compose.yaml` 覆盖旧文件，运行启动命令。
+
+```bash
+docker compose stop
+docker run --rm -v akashic_data:/data -v "$PWD":/backup alpine tar czf /backup/akashic-data.tgz -C /data .
+curl -fsSLO https://github.com/kachofugetsu09/akashic-agent/releases/latest/download/compose.yaml
+docker compose up -d --wait
+```
+
+数据卷名是“目录名_data”，上例目录为 `akashic`。
+
+## 通过域名访问
+
+网页默认只在本机开放：在运行 Akashic 的机器上打开 `http://localhost:2236` 即可，不需要额外配置。
+
+想在其他设备上通过域名访问时，用 Cloudflare Tunnel、nginx、Caddy 等工具把域名转发到这台机器的 `localhost:2236`。
+
+### 网页登录
+
+网页可以执行 Shell 和读写文件，所以默认带登录门（`web-auth` 插件），只有主人能进：
+
+- **第一次**：启动时随机生成初始密码，只写在启动日志里（`docker compose logs akashic | grep 初始密码`），不会发到任何聊天渠道。用户名 `akashic`。首次登录后需要设置自己的密码（至少 10 个字符）。
+- **本机免密**：在运行 Akashic 的机器上，`./start` 会自动帮浏览器登录。也可以运行下面的命令，得到一条 2 分钟内有效、只能用一次的登录链接：
+
+  ```bash
+  python main.py web-login                              # ./start 安装
+  docker compose exec akashic python main.py web-login  # Docker
+  ```
+
+- **记住设备**：默认 90 天内免登录，到期后重新登录一次。在别人的电脑上登录时，取消勾选“记住这台设备”。
+- **忘记密码**：运行 `python main.py web-passwd`（Docker 前面加 `docker compose exec akashic`），会重置为临时密码，所有设备退出。也可以在 Telegram/QQ 里让 Akashic 帮你执行。
+
+程序调用（SDK、CLI、programmatic）走本机 unix socket，不经过这道门。反向代理需要把原始 Host 转给 Akashic，例如 nginx 写 `proxy_set_header Host $host;`，否则网页的写操作和实时连接会被同源检查拒绝。公网访问请用 HTTPS。
+
+## 其他启动方式
+
+<details>
+<summary>不使用 Docker：<code>./start</code>（Linux / WSL2）</summary>
+
+需要 Git、Python 3.12+ 和 Node.js 20+。
+
+```bash
+git clone --branch v0.2.0 https://github.com/kachofugetsu09/akashic-agent.git
 cd akashic-agent
 ./start
 ```
 
-终端会显示启动进度：首次自动安装 Python 依赖、构建网页和插件发行包、创建数据目录并安装默认功能。等服务和插件界面就绪后，启动器会打开 <http://127.0.0.1:2236>，并在终端打印访问地址。失败时会显示原因和日志路径，处理后重新运行同一命令。无需手动运行 `init`、`npm ci` 或插件安装命令。
+首次运行会安装依赖并构建网页，就绪后自动打开 <http://127.0.0.1:2236>。按 Ctrl+C 停止；`--no-browser` 不打开浏览器，`--port 2237` 换端口。运行数据在 `~/.akashic`。
 
-以后仍运行 `./start`，同一版本会复用构建结果。终端按 Ctrl+C 停止服务；关闭浏览器不会停止服务。无桌面环境或 Agent 使用 `./start --no-browser`，失败返回非零退出码。端口被占用时可用 `--port 2237`。
+</details>
 
-运行数据默认在 `~/.akashic`（配置、workspace 和 plugin-home）；构建缓存位于 checkout 的 `.akashic-start`。试用独立实例可运行 `./start --state /path/to/empty-directory --port 2237`。启动器不会接管已有的手工安装，也不会覆盖关闭或卸载选择。不要删除运行数据来解决构建问题。
+源码构建镜像、开发调试与升级细节见[启动与部署说明](./docs/design/product-startup.md)；已有 Host Bridge 部署见[部署操作手册](./docs/design/operator-deployment.md)。
 
-## Docker Compose 启动
-
-只需 Docker 和 Compose v2 或更新版本。在仓库目录运行：
-
-```bash
-docker compose up --build
-```
-
-首次会在终端构建镜像并显示安装进度；看到“WebUI 已就绪”后打开 <http://localhost:2236>。此命令保持前台运行，Ctrl+C 停止；需要后台运行可用 `docker compose up -d`，进度在 Docker Desktop 的日志中查看。无需模型 Key、宿主 Python/Node、Host Bridge、systemd 单元或手动创建网络。
-
-构建默认从本仓库 `main` 取得固定提交；本地未提交改动不会进入镜像。需要复现某个版本时设置 `AKASHIC_REVISION=<完整的 40 位 commit>`。镜像内包含已构建的网页和插件包，重启不重新编译。`AKASHIC_PORT=2237 docker compose up -d` 可更换本机端口。
-
-更新已有实例时，将构建参数固定到拉取后的提交，避免 Docker 复用 `main` 构建层：
-
-```bash
-git pull --ff-only
-AKASHIC_REVISION="$(git rev-parse HEAD)" docker compose up -d --build
-```
-
-新镜像的内置代码会替换旧版本，已退役内置停止加载；外置版本、停用选择、配置和运行数据保留。仅重启原镜像不会取得新代码。新版启动前会先执行必要的 Core/内置 Yoyo；外置插件自行负责数据迁移。迁移失败则停止发布与启动，按[部署手册](docs/design/operator-deployment.md)检查实际状态，不要删除卷、cache 或改启动标记来绕过。
-
-数据保存在此 Compose project 的 `data` 卷。独立实例使用不同的 `docker compose -p <名称>`；同一项目名称表示管理同一个实例。用 Docker Desktop 的启动、停止和日志操作管理服务，或运行 `docker compose stop` / `docker compose up -d`。`docker compose down` 保留数据；**不要加 `-v`，它会删除数据卷**。默认仅向本机开放网页，文件和 Shell 工具在容器内部运行。
-
-## 在网页中开始使用
-
-1. 在“初始配置”连接模型：选择服务商或登录方式，验证后保存。
-2. 根据需要明确开启或关闭 Telegram、Akasha 情景记忆、Wake 主动联系；依赖未满足时页面会说明原因。
-3. 进入对话。以后可在“功能设置”中修改配置，凭据不会在页面回显。
-
-默认组合包含 Web 壳、工作台、对话和首次配置插件。尚未提供模型凭据时也能打开配置页面。
-
-## 开发、升级和宿主机集成
-
-启动器运行当前**已提交版本**的发行制品；有未提交改动时会提示使用开发入口。源码调试、版本升级及 Host Bridge 正式部署见[启动与部署说明](./docs/design/product-startup.md)。普通启动不隐式更新已有插件或批准数据迁移；换版本试用时使用独立数据目录，现有安装通过正式发布流程升级。
-
-已有 hua-home / Host Bridge 发行继续按[部署操作手册](./docs/design/operator-deployment.md)管理。它与本页面向首次使用的 Compose 是不同的执行环境，不应同时操作同一份运行数据。
+## 文档
 
 | 主题 | 文档 |
 | --- | --- |
-| 插件开发与安装 | [插件教程](./_handbook/plugins-tutorial.md) |
+| 插件开发与安装 | [插件能力手册](./docs/design/plugin-v3-capabilities.md)；Agent 自己扩展能力用内置 Skill [`develop-akashic-plugin`](./skills/develop-akashic-plugin/SKILL.md) |
 | 手机接入 | [Android Shell](https://github.com/kachofugetsu09/akashic-android-shell) |
-| 主动推送 | [Proactive 指南](./_handbook/proactive-guide.md) |
-| 记忆与 Drift | [记忆手册](./_handbook/memory-markdown.md)、[Drift 指南](./_handbook/drift-guide.md) |
+| 记忆 | [记忆手册](./_handbook/memory-markdown.md) |
 | Python 客户端与协议 | [Python SDK](./sdk/python/README.md)、[协议 schema](./schema/app-server-v2.json) |
 | 数据位置与恢复 | [持久状态地图](./docs/design/persistence-state-map.md) |
 | 项目需求与开发流程 | [工作手册索引](./docs/INDEX.md) |

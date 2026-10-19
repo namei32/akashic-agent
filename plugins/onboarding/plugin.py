@@ -4,8 +4,8 @@ from __future__ import annotations
 from importlib import import_module
 from agent.plugin_composition import Context
 from agent.plugin_composition.runtime_catalog import RUNTIME_CATALOG
-from agent.plugin_composition.ui import UI
-from agent.plugin_contracts.onboarding import ONBOARDING
+from plugins.ui.contract import UI
+from plugins.onboarding.contract import ONBOARDING
 from .projection import Registry
 
 api_version = 3
@@ -23,4 +23,5 @@ async def apply(ctx: Context) -> None:
 
 async def register_ui(ctx: Context) -> None:
     await ctx.require(UI).register(ctx, web="web_module.js",
-        dashboard=lambda: import_module(".dashboard", __package__), requires=("shell.pages.v1",))
+        dashboard=lambda: import_module(".dashboard", __package__), requires=("shell.settings.v1",),
+        contract_digests={"shell.settings.v1": "1f4dd2eaee9118c799590a36745975150c46979a3f62b431f73aa29e949ce189"})

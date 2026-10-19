@@ -5,19 +5,19 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
-from agent.plugin_contracts import ContentPart, Message
-from agent.plugin_contracts.content import (
+from plugins.ledger.contract import ContentPart, Message
+from plugins.content.contract import (
     CONTENT as CONTENT,
     Content as ContentCapability,  # noqa: F401 - 显式再导出给本插件消费者。
 )
-from agent.plugin_contracts.tools import (
+from plugins.tools.contract import (
     TOOLS as TOOLS,
     CallSource as CallSource,
     ToolCatalog as ToolCatalog,
     ToolRef as ToolRef,
     ToolView as ToolView,
 )
-from agent.plugin_contracts.turns import (
+from plugins.turn_projection.contract import (
     TURN_PROJECTION as TURN_PROJECTION,
     Turn as Turn,
     TurnProjection as TurnProjection,

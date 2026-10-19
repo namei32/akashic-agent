@@ -6,13 +6,15 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from agent.plugin_composition import CompositionRoot, ServiceKey
-from agent.plugin_composition.channel_io import unavailable
+from plugins.ledger.contract import unavailable
 from agent.plugin_composition.model import PluginRuntime
-from agent.plugin_contracts.context import MATERIALS_V4
+from plugins.context.contract import MATERIALS_V4
 from plugins.context import plugin as context
 from plugins.context.materials import ContextMaterials
 from plugins.reply_program import plugin as reply
-from agent.plugin_contracts.reply import REPLY_EXECUTE_V4
+from plugins.reply_program.contract import (
+    REPLY_EXECUTE_V4,
+)
 
 REPLY_EXECUTE = ServiceKey[object]("reply.execute.v1")
 REPLY_EXECUTE_V2 = ServiceKey[object]("reply.execute.v2")

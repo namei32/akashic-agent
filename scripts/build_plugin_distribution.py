@@ -24,18 +24,16 @@ if str(_SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(_SOURCE_ROOT))
 
 from agent.plugins.static_manifest import load_static_plugin_manifest
+from utils.timing import measure
 
 
 # 只打包宿主运行入口；业务 plugins/ 不进入 Core，也没有开发源码路径。
 CORE_PATHS = (
     "agent",
     "bootstrap",
-    "bus",
     "core",
     "infra",
-    "session",
     "utils",
-    "host_bridge",
     "migrations",
     "main.py",
     "config.example.toml",
@@ -43,13 +41,14 @@ CORE_PATHS = (
     "requirements.txt",
     "requirements-dev.txt",
     "sdk/python",
+    "skills",
     "scripts/install_plugin_distribution.py",
     "scripts/distribution_runtime.py",
     "scripts/start.py",
     "docker/host-runtime",
 )
 
-_DEFAULT_PROFILE_PATH = Path("docker/host-runtime/profiles/default.json")
+_BUNDLE_PATHS = tuple(Path("bundles") / (mode + ".toml") for mode in ("base", "headless", "minimal"))
 _RUNTIME_WIRING = (
     ("docker/host-runtime/Dockerfile.distribution", "Dockerfile.distribution"),
     ("docker/host-runtime/distribution-entrypoint.sh", "distribution-entrypoint.sh"),
@@ -158,21 +157,17 @@ def _run_web_command(
     cwd: Path,
     env: dict[str, str],
 ) -> None:
-    result = subprocess.run(
-        command,
-        cwd=cwd,
-        env=env,
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-    if result.returncode:
-        output = result.stdout[-4000:]
-        raise RuntimeError(
-            "固定提交的 Web 资产构建失败: "
-            f"command={' '.join(command)} exit={result.returncode}\n{output}"
+    with measure("build.web", command=" ".join(command)):
+        result = subprocess.run(
+            command, cwd=cwd, env=env, check=False,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         )
+        if result.returncode:
+            output = result.stdout[-4000:]
+            raise RuntimeError(
+                "固定提交的 Web 资产构建失败: "
+                f"command={' '.join(command)} exit={result.returncode}\n{output}"
+            )
 
 
 def _build_web_assets(
@@ -234,6 +229,8 @@ def _build_web_assets(
             text=True,
         ).stdout.strip()
 
+    shutil.copytree(asset_root / "dashboard", source / "plugins/ui/static/dashboard")
+    shutil.copytree(asset_root / "chat", source / "plugins/akashic_clients/static/chat")
     return asset_root, source / "plugins", {
         "enabled": True,
         "source_commit": commit,
@@ -302,47 +299,18 @@ def _append_bytes(
     return stream.getvalue()
 
 
-def _append_tree(
-    archive: bytes,
-    root: Path,
-    prefix: str,
-    *,
-    mtime: int,
-) -> bytes:
-    result = archive
-    for path in sorted(root.rglob("*")):
-        relative = path.relative_to(root).as_posix()
-        name = f"{prefix.rstrip('/')}/{relative}"
-        if path.is_dir():
-            result = _append_bytes(
-                result,
-                name + "/",
-                b"",
-                mtime=mtime,
-                mode=0o755,
-                type=tarfile.DIRTYPE,
-            )
-            continue
-        if not path.is_file():
-            raise RuntimeError(f"Web 静态产物含不支持的文件类型: {path}")
-        result = _append_bytes(
-            result,
-            name,
-            path.read_bytes(),
-            mtime=mtime,
-            mode=0o755 if os.access(path, os.X_OK) else 0o644,
-        )
-    return result
-
-
-def _copy_profile(repository: Path, commit: str, output: Path) -> dict[str, str] | None:
-    content = _git_file(repository, commit, _DEFAULT_PROFILE_PATH.as_posix())
-    if content is None:
-        return None
-    profile = output / "profiles" / "default.json"
-    profile.parent.mkdir(parents=True, exist_ok=True)
-    profile.write_bytes(content)
-    return {"path": "profiles/default.json", "sha256": _hash_bytes(content)}
+def _copy_bundles(repository: Path, commit: str, output: Path) -> list[dict[str, str]]:
+    """发布固定提交的完整声明文件，不在构建时替用户选择 mode。"""
+    records = []
+    for path in _BUNDLE_PATHS:
+        content = _git_file(repository, commit, path.as_posix())
+        if content is None:
+            raise ValueError(f"固定提交缺少 bundle: {path}")
+        target = output / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        records.append({"path": path.as_posix(), "sha256": _hash_bytes(content)})
+    return records
 
 
 def _copy_runtime_wiring(
@@ -385,6 +353,10 @@ def _bundle_plugin(
                 generated = generated_plugin / name
                 if generated.is_file():
                     (package / name).write_bytes(generated.read_bytes())
+        if generated_plugins_root is not None:
+            static = generated_plugins_root / Path(root).name / "static"
+            if static.is_dir():
+                shutil.copytree(static, package / "static", dirs_exist_ok=True)
         manifest = load_static_plugin_manifest(package)
         if manifest.name in names:
             raise ValueError(f"发布插件名称重复: {manifest.name}")
@@ -407,10 +379,15 @@ def _bundle_plugin(
             "GIT_AUTHOR_DATE": stamp,
             "GIT_COMMITTER_DATE": stamp,
         }
+        # 临时仓库随 with 块删除；关闭自动 gc/maintenance，避免后台进程在清理时仍写对象库。
         git(
             package,
             "-c",
             "commit.gpgSign=false",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "maintenance.auto=false",
             "commit",
             "-m",
             f"Build {root} from {commit}",
@@ -434,7 +411,7 @@ def _bundle_plugin(
 
 
 def build(repository: Path, revision: str, output: Path) -> dict[str, object]:
-    """固定源提交生成 Core、插件 bundle、profile 和身份报告。"""
+    """固定源提交生成 Core、插件制品、组合 bundle 和身份报告。"""
 
     # 1. 固定源提交；输出必须新建，失败产物保留供检查，不覆盖旧恢复材料。
     commit = git(
@@ -465,31 +442,20 @@ def build(repository: Path, revision: str, output: Path) -> dict[str, object]:
     ]
     core = git(repository, "archive", "--format=tar", commit, "--", *core_paths)
 
-    # 2. Web 构建完全在临时源码副本执行；只把生成的静态目录带入 Core tar。
+    # 2. Web 构建完全在临时源码副本执行；把生成的静态目录交给实际插件制品。
     with tempfile.TemporaryDirectory(prefix="akashic-distribution-web-") as directory:
         asset_root, generated_plugins_root, web = _build_web_assets(
             repository, commit, Path(directory)
         )
-        runtime_metadata = {**runtime_dependencies, "web": web}
         core = _append_bytes(
             core,
             "runtime-dependencies.json",
             (
-                json.dumps(runtime_metadata, ensure_ascii=False, indent=2, sort_keys=True)
+                json.dumps(runtime_dependencies, ensure_ascii=False, indent=2, sort_keys=True)
                 + "\n"
             ).encode(),
             mtime=commit_epoch,
         )
-        if asset_root is not None:
-            core = _append_tree(
-                core, asset_root / "chat", "static/chat", mtime=commit_epoch
-            )
-            core = _append_tree(
-                core,
-                asset_root / "dashboard",
-                "static/dashboard",
-                mtime=commit_epoch,
-            )
         # 3. 插件 bundle 使用同一次隔离构建生成的前端资产。
         names: set[str] = set()
         rows = [
@@ -510,7 +476,7 @@ def build(repository: Path, revision: str, output: Path) -> dict[str, object]:
         git(repository, "show", f"{commit}:docker/host-runtime/requirements.lock")
     )
     report: dict[str, object] = {
-        "schema_version": 2,
+        "schema_version": 3,
         "source_commit": commit,
         "source_tree": tree,
         "core": {
@@ -518,19 +484,15 @@ def build(repository: Path, revision: str, output: Path) -> dict[str, object]:
             "sha256": hashlib.sha256(core).hexdigest(),
             "source_paths": core_paths,
             "config_example": "config.example.toml" in core_paths,
-            "web": web,
         },
+        "web": web,
         "runtime_dependencies": runtime_dependencies,
         "plugins": rows,
     }
 
     # 4. 独立 Git 源保留来源证明；安装仍走原有 clone、校验及 artifact 发布链。
-    profile = _copy_profile(repository, commit, output)
-    if profile is None:
-        raise ValueError(
-            f"固定提交缺少正式产品 profile: {_DEFAULT_PROFILE_PATH.as_posix()}"
-        )
-    report["profiles"] = [profile]
+    report["bundles"] = _copy_bundles(repository, commit, output)
+    report["marketplace"] = "release"
     report["runtime_wiring"] = _copy_runtime_wiring(repository, commit, output)
     (output / "distribution.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n",

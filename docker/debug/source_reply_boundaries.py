@@ -23,7 +23,7 @@ from types import SimpleNamespace
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--slow-writes", action="store_true")
 parser.add_argument("--source", type=Path, default=Path(__file__).resolve().parents[2])
-parser.add_argument("--owner", choices=("scheduler", "subagent", "wake"))
+parser.add_argument("--owner", choices=("subagent", "wake"))
 parser.add_argument("--case", choices=("fresh", "recovered", "newer-input", "newer-control", "two-phases"))
 args = parser.parse_args()
 if args.slow_writes and args.case not in {None, "fresh", "two-phases"}:
@@ -31,21 +31,29 @@ if args.slow_writes and args.case not in {None, "fresh", "two-phases"}:
 sys.path.insert(0, str(args.source))
 
 from agent.plugin_composition import CompositionRoot, PluginRuntime
-from agent.plugin_composition.archive import PluginArchive
-from agent.plugin_composition.bindings import BINDINGS, Bindings
-from agent.plugin_composition.messages import (
+from plugins.ledger.contract import BINDINGS
+from plugins.ledger.bindings import Bindings
+from plugins.ledger.contract import (
     MESSAGE_CATALOG, MESSAGE_WRITERS, OWNER_STATE, SESSION_ADMISSION,
     MessageWriters, OwnerState, SessionAdmission,
 )
-from agent.plugin_composition.models import (
-    BoundModelDescriptor, CapabilitySources, LLMResponse, ModelCapabilities,
+from plugins.models.contract import LLMResponse
+from plugins.models.contract import (
+    BoundModelDescriptor,
+    CapabilitySources,
+    ModelCapabilities,
 )
 from agent.plugin_composition.tasks import TASKS, PluginTasks
-from agent.plugin_contracts import ContentPart, ContentReferences, Control, Input, Output
-from agent.plugin_contracts.content import CONTENT
-from agent.plugin_contracts.delivery import DELIVERY_GUARDED_START as DELIVERY, DELIVERY_SENDERS
-from agent.plugin_contracts.models import MODEL_SELECTION
-from agent.plugin_contracts.sources import CHECK_ORIGIN
+from plugins.ledger.contract import ContentPart, ContentReferences, Control, Input, Output
+from plugins.content.contract import CONTENT
+from plugins.delivery.contract import (
+    DELIVERY_GUARDED_START as DELIVERY,
+    DELIVERY_SENDERS,
+)
+from plugins.models.contract import MODEL_SELECTION
+from plugins.conversation.contract import (
+    CHECK_ORIGIN,
+)
 from plugins.content.plugin import _decode_text, check_text
 from plugins.content.api import check_artifact
 from plugins.context.api import Materials, material_data
@@ -57,9 +65,6 @@ from plugins.models.state import _BoundChat
 from plugins.models.store import ModelsStore
 from plugins.react.plugin import react
 from plugins.reply_program.program import run_reply
-from plugins.scheduler.runtime import SchedulerRuntime
-from plugins.scheduler.schedule import ScheduledJob
-from plugins.scheduler.store import JobStore
 from plugins.sources.session import check_source
 from plugins.subagent.request import PROFILE_TOOLS, Request as SubagentRequest
 from plugins.subagent.runtime import SUBAGENT_PROGRAM, Subagents
@@ -68,7 +73,7 @@ from plugins.wake.api import DeliveryTarget
 from plugins.wake.request import Request as WakeRequest, WAKE_PROGRAM
 from plugins.wake.source import Source as WakeSource
 from plugins.wake.state import WakeState
-from session.log import MessageLog, SessionAttributes
+from plugins.ledger.log import MessageLog, SessionAttributes
 
 
 class TextContent:
@@ -170,7 +175,7 @@ async def check(directory: Path, kind: str, mode: str):
     root = CompositionRoot("source-boundary-scenario")
     tasks = PluginTasks()
     writers, state = MessageWriters(log), OwnerState(log)
-    bindings = Bindings(log, PluginArchive(directory / "archives"), root)
+    bindings = Bindings(log, root.context)
     calls = []
     receipts = []
     inputs = []
@@ -276,26 +281,7 @@ async def check(directory: Path, kind: str, mode: str):
         log._write = slow_write
     try:
         async with ctx.runtime_scope():
-            if kind == "scheduler":
-                store = JobStore(directory / "schedules.json")
-                job = ScheduledJob(id="schedule", trigger="at", tier="soft", channel="local", chat_id="one",
-                                   prompt="scheduled input", fire_at=datetime.now(UTC))
-                await store.add("add", job, "scheduled")
-                fire = await store.start_fire(job)
-                assert fire is not None
-                if mode == "recovered":
-                    log.ensure_session(fire.session_id, SessionAttributes(visibility="internal", learning="excluded"))
-                    log.writer(fire.session_id, author="scheduler", source="scheduler", body_types=(Input,),
-                               content={"text": check_text}).append("scheduler-input:" + fire.key,
-                                                                      Input((ContentPart("text", job.prompt),)))
-                runtime = SchedulerRuntime(ctx, store, lambda task, reader: reply(task, reader, "scheduler"))
-                task = await runtime.start(fire)
-                try:
-                    await task.join()
-                except asyncio.CancelledError:
-                    assert stale, "valid scheduler input was rejected before the model"
-                assert store.read().fires[fire.key].status == ("pending" if stale else "delivered")
-            elif kind == "subagent":
+            if kind == "subagent":
                 request = SubagentRequest(job_id="a" * 32, label="scenario", profile="research", background=False,
                     retry_count=0, parent_session_id="parent", parent_message_id="parent-input", parent_part_index=0,
                     origin=None, sink=None, program_binding="program", tools={key: key for key in PROFILE_TOOLS["research"]})
@@ -355,7 +341,7 @@ async def check(directory: Path, kind: str, mode: str):
 
 async def main(directory):
     results = []
-    for source in ((args.owner,) if args.owner else ("scheduler", "subagent", "wake")):
+    for source in ((args.owner,) if args.owner else ("subagent", "wake")):
         for mode in ((args.case,) if args.case else ("fresh",) if args.slow_writes else ("fresh", "recovered", "newer-input", "newer-control", *(("two-phases",) if source == "wake" else ()))):
             path = directory / (source + "-" + mode)
             path.mkdir()

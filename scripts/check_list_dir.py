@@ -26,8 +26,8 @@ def page(text: str) -> tuple[list[str], str | None]:
 async def run(args: argparse.Namespace) -> dict:
     """调用真实文件工具及 Bridge，只写本次创建的临时目录。"""
     sys.path.insert(0, str(args.source))
-    from agent.host_bridge import filesystem
-    from agent.tool_catalog import ToolResult
+    from plugins.host_execution.bridge import filesystem
+    from plugins.host_execution.contract import FileError, FileImage
 
     report = {"source": str(args.source), "checks": []}
     with tempfile.TemporaryDirectory(prefix="list-dir-check-") as temporary:
@@ -109,14 +109,15 @@ async def run(args: argparse.Namespace) -> dict:
         assert isinstance(utf8_page, str) and len(utf8_page.encode()) <= 10_000
         assert page(utf8_page)[1] is not None
         for limit in (0, -1, 501, True, 1.5):
-            result = await operation.execute(str(small), limit=limit)
-            assert isinstance(result, ToolResult) and result.is_error
+            # 故意越过类型提示，核对真实输入边界拒绝浮点数和布尔值。
+            result = await operation.execute(str(small), limit=limit)  # pyright: ignore[reportArgumentType]
+            assert isinstance(result, FileError)
         missing = await operation.execute(str(root / "absent"))
-        assert isinstance(missing, ToolResult) and missing.is_error
+        assert isinstance(missing, FileError)
         denied = await filesystem.ListDirOperation(
             allowed_dir=small, enable_bridge=False
         ).execute(str(large))
-        assert isinstance(denied, ToolResult) and denied.is_error
+        assert isinstance(denied, FileError)
         report["checks"].append("small_results_errors_and_directory_changes")
 
         # 3. 在真实线程入口设置屏障；取消必须等物理枚举排空。
@@ -148,11 +149,12 @@ async def run(args: argparse.Namespace) -> dict:
                 raise AssertionError("取消未传播")
         report["checks"].append("cancel_drains_physical_enumeration")
 
-        # 4. 真实 gRPC UDS、认证与 manager admission，不替换 RPC 或业务 handler。
+        # 4. 真实 Protobuf UDS、认证与 manager admission，不替换 RPC 或业务 handler。
         import grpc
-        from agent.host_bridge import host_bridge_pb2_grpc as rpc
-        from agent.host_bridge.client import HostBridgeRpcError, HostBridgeShellProcessManager
-        from agent.host_bridge.server import HostBridgeService
+        from plugins.host_execution.bridge import transport
+        from plugins.host_execution.bridge.factory import HostBridgeRpcError
+        from plugins.host_execution.bridge.client import HostBridgeShellProcessManager
+        from plugins.host_execution.bridge.server import HostBridgeService
 
         class ReplyLossService(HostBridgeService):
             """完成真实目录读取后只丢一次 RPC 响应，不替换目录业务。"""
@@ -178,15 +180,31 @@ async def run(args: argparse.Namespace) -> dict:
             toolchain_digest=digest, runtime_checkout=args.source,
             bridge_python=Path(sys.executable),
         )
-        server = grpc.aio.server()
-        rpc.add_HostBridgeServicer_to_server(service, server)
-        assert server.add_insecure_port(f"unix:{socket}")
-        await server.start()
+        server = transport.Server(service)
+        await server.start(socket)
         client = HostBridgeShellProcessManager(
             socket, "scenario-boot", "scenario-token", commit, digest
         )
         try:
             await client.claim_boot()
+            # 图片由真实本地读取和 UDS 返回相同字节；空缺路径仍是明确错误。
+            from PIL import Image
+            from io import BytesIO
+            image_path = root / "image.png"
+            Image.new("RGB", (8, 8), "red").save(image_path)
+            reader = filesystem.ReadFileOperation(enable_bridge=False)
+            try:
+                local_image = await reader.execute(str(image_path))
+                remote_image = await client.execute_file_tool(
+                    "read_file", allowed_dir=root, arguments={"path": str(image_path)},
+                )
+                assert isinstance(remote_image, FileImage) and remote_image == local_image
+                assert remote_image.mime_type == "image/png"
+                with Image.open(BytesIO(remote_image.data)) as decoded, Image.open(image_path) as original:
+                    assert decoded.size == original.size and decoded.tobytes() == original.tobytes()
+            finally:
+                await reader.aclose()
+            report["checks"].append("image_bytes_match_local_and_bridge")
             for parameters in ({}, {"limit": 71, "after": "000010-" + "x" * 150}):
                 local = await operation.execute(str(large), **parameters)
                 remote = await client.execute_file_tool(
@@ -198,10 +216,10 @@ async def run(args: argparse.Namespace) -> dict:
                     "list_dir", allowed_dir=large,
                     arguments={"path": str(large), "limit": limit},
                 )
-                assert isinstance(error, ToolResult) and error.is_error
+                assert isinstance(error, FileError)
             for limit in (True, False):
                 local = await operation.execute(str(large), limit=limit)
-                assert isinstance(local, ToolResult) and local.is_error
+                assert isinstance(local, FileError)
                 try:
                     await client.execute_file_tool(
                         "list_dir", allowed_dir=large,
@@ -238,7 +256,7 @@ async def run(args: argparse.Namespace) -> dict:
                     await service.shutdown()
                     assert not service._managers
                 finally:
-                    await server.stop(0)
+                    await server.stop()
     return report
 
 

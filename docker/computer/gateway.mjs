@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { setTimeout as sleep } from "node:timers/promises";
 import { ComputerDriver } from "./driver/runtime.mjs";
+import { ComputerLifecycle, duration } from "./lifecycle.mjs";
 import { execFile } from "node:child_process";
 import { createServer, request as httpRequest } from "node:http";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
@@ -8,19 +9,181 @@ import { connect as tcpConnect } from "node:net";
 import { promisify } from "node:util";
 
 const exec = promisify(execFile);
-const driver = new ComputerDriver();
+let driver;
 let driverReady;
-function readyDriver() {
-  return (driverReady ??= driver.start());
+const driverCalls = new Map();
+/** 取消先于唤醒或请求到达时，也必须在准入前保留结果。 */
+function driverCall(callId) {
+  requiredString(callId, "call_id", 256);
+  for (const [id, call] of driverCalls)
+    if (call.expires < Date.now()) driverCalls.delete(id);
+  let call = driverCalls.get(callId);
+  if (!call) {
+    if (driverCalls.size >= 4096) throw new Error("Too many pending Computer calls");
+    call = { controller: new AbortController(), expires: Date.now() + 300000 };
+    driverCalls.set(callId, call);
+  }
+  return call;
 }
+function forgetDriver() {
+  driver = undefined;
+  driverReady = undefined;
+  publishCursor({ point: null });
+}
+
+async function readyDriver() {
+  await computer.wake();
+  return driverReady;
+}
+const computer = new ComputerLifecycle({
+  idleMs: duration("COMPUTER_IDLE_MS", 600000),
+  onChange: scheduleState,
+  async start(exited) {
+    // 1. 图形进程就绪后才创建 driver；控制服务健康检查不会走这里。
+    const deadline = Date.now() + 20000;
+    let failure;
+    while (Date.now() < deadline) {
+      if (exited()) throw new Error("Computer runtime exited during startup");
+      try {
+        await health();
+        failure = null;
+        break;
+      } catch (error) {
+        failure = error;
+        await sleep(100);
+      }
+    }
+    if (failure) throw failure;
+    // 重启后旧一代可能还有迟到的事件；只转发当前这一代的。
+    const owner = new ComputerDriver({ anonymousIdleMs: duration("COMPUTER_ANONYMOUS_IDLE_MS", 600000) });
+    driver = owner;
+    owner.on("cursor", (state) => { if (driver === owner) publishCursor(state); });
+    owner.on("control", () => { if (driver === owner) scheduleState(); });
+    owner.on("activity", () => { if (driver === owner) scheduleState(); });
+    owner.on("targets", () => { if (driver === owner) scheduleState(); });
+    driverReady = owner.start();
+    await driverReady;
+  },
+  async stop() {
+    // 2. 已确认正常输入释放后才允许关闭浏览器与重用 profile。
+    const owner = driver;
+    if (owner) await owner.close();
+    // 重启超时后旧的 close 可能迟到完成，不能清掉新一代 driver。
+    if (driver === owner) forgetDriver();
+  },
+  async abandon() {
+    // 3. 只由人工重启调用：正常收尾失败或超时时强制结束 driver 的子进程。
+    const owner = driver;
+    try {
+      await owner?.abandon();
+    } finally {
+      if (driver === owner) forgetDriver();
+    }
+  },
+});
 const activityPath = "/data/state/activity.json";
 const maxBodyBytes = 256 * 1024;
 let activity = { revision: 0, noticeId: 0, active: false, action: "", updatedAt: "" };
-let activeTargetId = "";
+const activeOperations = new Set();
+let activityWrites = Promise.resolve();
 const legacyCall = new AsyncLocalStorage();
-const browserSnapshots = new Map();
+// 订阅者 → 它最近收到的状态快照；按订阅者去重，新订阅者也能补到最新状态。
+const eventClients = new Map();
+let cursor = { revision: 0, point: null, error: "" };
+let stateTimer = null;
+let stateDirty = false;
+
+function cursorEvent() {
+  const ttlMs = cursor.point ? Math.max(0, cursor.point.expiresAt - Date.now()) : 0;
+  return `data: ${JSON.stringify({ type: "cursor", ...cursor, ttlMs })}\n\n`;
+}
+
+/** 慢消费者直接断开，不能让操作等待显示或积压事件。 */
+function broadcast(event) {
+  for (const client of eventClients.keys()) {
+    if (!client.write(event)) client.destroy();
+  }
+}
+
+/** 坐标只驻留内存。 */
+function publishCursor({ point, error = "" }) {
+  cursor = { revision: cursor.revision + 1,
+    point: point ? { ...point, expiresAt: Date.now() + 5000 } : null, error };
+  broadcast(cursorEvent());
+}
+
+async function stateEvent() {
+  // 先等目录，再同步读取其余字段，避免拿等待之前的旧值。
+  const targets = driver && computer.state === "ready" ? await driver.targets() : [];
+  const state = {
+    type: "state",
+    noticeId: activity.noticeId,
+    active: activity.active || Boolean(driver?.agentJobs.size),
+    turns: [...new Set([...computer.turns, ...[...(driver?.actives.values() ?? [])]
+      .map(call => JSON.stringify([call.context.session_id, call.context.turn_id]))])],
+    browser: { state: computer.state, error: computer.error },
+    targets,
+    control: Boolean(driver?.control),
+  };
+  return `data: ${JSON.stringify(state)}\n\n`;
+}
+
+/** 运行时、活动、控制权和目录变化时触发；合并 50ms 内的变化，内容不变就不推送。 */
+function scheduleState() {
+  stateDirty = true;
+  if (!stateTimer) stateTimer = setTimeout(publishState, 50);
+}
+
+async function publishState() {
+  // 读取期间到达的变化只记为 dirty，读完后补发一次最新快照，不能丢。
+  stateDirty = false;
+  try {
+    const event = await stateEvent();
+    for (const [client, sent] of eventClients) {
+      if (sent === event) continue;
+      eventClients.set(client, event);
+      if (!client.write(event)) client.destroy();
+    }
+  } catch (error) {
+    // 目录读取可能撞上浏览器正在关闭；稍后重读一次，不推送半截状态。
+    console.error("Computer state:", error.message);
+    setTimeout(scheduleState, 1000);
+  } finally {
+    stateTimer = null;
+    if (stateDirty) scheduleState();
+  }
+}
 
 class InputError extends Error {}
+// The Agent is using the browser; a viewer must take control before acting.
+class BusyError extends InputError {}
+
+// 人工直接操作：接管就绪时记进接管的操作，交还前会等它做完；没人接管、Agent 也没有回合和操作时直接执行。
+async function humanAction(id, task) {
+  const owner = driver, control = owner.control;
+  if (control ? !control.ready || control.id !== id
+    : id || activeOperations.size || computer.turns.size || owner.actives.size || owner.agentJobs.size)
+    throw new BusyError("The browser is in use; take control in this window first");
+  // Register before awaiting: Agent work and takeover must wait for admitted navigation.
+  const jobs = control ? control.jobs : owner.humanJobs;
+  const job = computer.use(task);
+  jobs.add(job);
+  try { return await job; } finally { jobs.delete(job); }
+}
+
+// 地址栏只打开网页和空白页，不执行 javascript: 等会在页面里运行代码的地址。
+function pageUrl(value) {
+  const text = requiredString(value, "url", 8192);
+  let url;
+  try { url = new URL(text); }
+  catch (error) {
+    if (error instanceof TypeError) throw new InputError("Invalid page URL");
+    throw error;
+  }
+  if (!["http:", "https:"].includes(url.protocol) && url.href !== "about:blank")
+    throw new InputError("Only http, https and about:blank pages can be opened");
+  return url.href;
+}
 
 function json(response, status, value) {
   const body = Buffer.from(JSON.stringify(value));
@@ -47,25 +210,36 @@ async function body(request) {
   return value;
 }
 
-async function saveActivity(action, active) {
+function saveActivity(action, started) {
   activity = {
     revision: activity.revision + 1,
-    noticeId: active ? activity.noticeId + 1 : activity.noticeId,
-    active,
+    noticeId: started ? activity.noticeId + 1 : activity.noticeId,
+    active: activeOperations.size > 0,
     action,
     updatedAt: new Date().toISOString(),
   };
-  await mkdir("/data/state", { recursive: true });
-  const temporary = `${activityPath}.new`;
-  await writeFile(temporary, JSON.stringify(activity), { mode: 0o600 });
-  await rename(temporary, activityPath);
+  // 状态事件立即排队，不等文件写完：面板和代理要尽早收回人的输入。
+  scheduleState();
+  const saved = JSON.stringify(activity);
+  // One writer owns the shared temporary file, even when Sessions run in parallel.
+  activityWrites = activityWrites.then(async () => {
+    await mkdir("/data/state", { recursive: true });
+    const temporary = `${activityPath}.new`;
+    await writeFile(temporary, saved, { mode: 0o600 });
+    await rename(temporary, activityPath);
+    scheduleState();
+  });
+  return activityWrites;
 }
 
 async function tracked(action, task) {
-  await saveActivity(action, true);
+  const operation = {};
+  activeOperations.add(operation);
   try {
+    await saveActivity(action, true);
     return await task();
   } finally {
+    activeOperations.delete(operation);
     await saveActivity(action, false);
   }
 }
@@ -77,23 +251,6 @@ async function daemonStatus() {
   });
   if (!response.ok) throw new Error(`OpenCLI daemon returned ${response.status}`);
   return await response.json();
-}
-
-async function tcpReady(port) {
-  await new Promise((resolve, reject) => {
-    const socket = tcpConnect({ host: "127.0.0.1", port });
-    const timer = setTimeout(() => {
-      socket.destroy();
-      reject(new Error(`port ${port} timed out`));
-    }, 1500);
-    const finish = (callback) => {
-      clearTimeout(timer);
-      socket.destroy();
-      callback();
-    };
-    socket.once("error", (error) => finish(() => reject(error)));
-    socket.once("connect", () => finish(resolve));
-  });
 }
 
 async function rfbReady(port) {
@@ -197,120 +354,35 @@ async function health() {
       signal: AbortSignal.timeout(1500),
     }),
     rfbReady(5999),
-    tcpReady(6080),
-    exec("pgrep", ["-x", "xfce4-session"], { timeout: 1500 }),
+    fetch("http://127.0.0.1:6081/api/health", {
+      signal: AbortSignal.timeout(1500),
+    }).then((response) => {
+      if (!response.ok) throw new Error(`Computer stream returned ${response.status}`);
+    }),
   ]);
   if (!cdp.ok) throw new Error(`Chromium CDP returned ${cdp.status}`);
   if (!daemon.extensionConnected) throw new Error("OpenCLI extension is not connected");
   return {
     status: "ready",
-    desktop: "ready",
     display: "ready",
     browser: "ready",
     opencli: "ready",
   };
 }
 
-async function pageTargets() {
-  const response = await fetch("http://127.0.0.1:9222/json/list", {
-    signal: AbortSignal.timeout(3000),
-  });
-  if (!response.ok) throw new Error(`Chromium targets returned ${response.status}`);
-  const targets = (await response.json()).filter(
-    (target) => target.type === "page" && typeof target.webSocketDebuggerUrl === "string",
-  );
-  if (targets.length === 0) throw new Error("Chromium has no page target");
-  return targets;
-}
-
-async function pageTarget(requestedId, select = false) {
-  const targets = await pageTargets();
-  const targetId = requestedId || activeTargetId;
-  const target = targets.find((item) => item.id === targetId);
-  if (requestedId && !target) throw new InputError(`unknown browser target: ${requestedId}`);
-  const selected = target ?? targets[0];
-  if (select) activeTargetId = selected.id;
-  return selected;
+// Resolve the visible page through its own Context, including anonymous pages.
+async function pageTarget() {
+  const targets = await driver.targets();
+  const target = targets.find(item => item.front);
+  if (!target) throw new InputError("No browser page is visible; select a tab first");
+  return driver.viewTarget(target.id);
 }
 
 async function cdp(target, method, params = {}) {
   await readyDriver();
   const call = legacyCall.getStore();
   call?.signal.throwIfAborted();
-  let tab = driver.browser.tabs.get(target.id);
-  if (!tab) { await driver.browser.listTabs(); tab = driver.browser.tabs.get(target.id); }
-  if (!tab) throw new InputError("Browser target closed; observe again");
-  call?.signal.throwIfAborted();
-  return driver.browser.execute({target: {tabId: tab.id}, method, commandParams: params}, call?.context);
-}
-
-async function evaluate(target, expression) {
-  const result = await cdp(target, "Runtime.evaluate", {
-    expression,
-    awaitPromise: true,
-    returnByValue: true,
-    userGesture: true,
-  });
-  if (result.exceptionDetails) {
-    throw new Error(result.exceptionDetails.text || "browser evaluation failed");
-  }
-  return result.result?.value;
-}
-
-const interactiveRoles = new Set([
-  "button", "checkbox", "combobox", "link", "listbox", "menuitem",
-  "menuitemcheckbox", "menuitemradio", "option", "radio", "searchbox",
-  "slider", "spinbutton", "switch", "tab", "textbox", "treeitem",
-]);
-
-function axValue(value) {
-  return value && typeof value.value !== "undefined" ? String(value.value) : "";
-}
-
-async function pageLoaderId(target) {
-  const tree = await cdp(target, "Page.getFrameTree");
-  const loaderId = tree.frameTree?.frame?.loaderId;
-  if (typeof loaderId !== "string" || loaderId.length === 0) {
-    throw new Error("browser document identity is unavailable");
-  }
-  return loaderId;
-}
-
-async function browserSnapshot(target) {
-  const [tree, ax] = await Promise.all([
-    cdp(target, "Page.getFrameTree"),
-    cdp(target, "Accessibility.getFullAXTree", { depth: 32 }),
-  ]);
-  const loaderId = tree.frameTree?.frame?.loaderId;
-  if (typeof loaderId !== "string" || !Array.isArray(ax.nodes)) {
-    throw new Error("browser snapshot is invalid");
-  }
-  const refs = new Map();
-  const items = [];
-  for (const node of ax.nodes) {
-    const role = axValue(node.role);
-    if (node.ignored || !interactiveRoles.has(role) || !Number.isInteger(node.backendDOMNodeId)) {
-      continue;
-    }
-    const ref = `e${items.length + 1}`;
-    refs.set(ref, { backendNodeId: node.backendDOMNodeId, role });
-    items.push({
-      ref,
-      role,
-      name: axValue(node.name).trim().replace(/\s+/g, " ").slice(0, 240),
-      value: axValue(node.value).slice(0, 500),
-      disabled: node.properties?.some(
-        (property) => property.name === "disabled" && property.value?.value === true,
-      ) ?? false,
-    });
-    if (items.length === 200) break;
-  }
-  const snapshotId = crypto.randomUUID();
-  browserSnapshots.set(snapshotId, { targetId: target.id, loaderId, refs });
-  while (browserSnapshots.size > 32) {
-    browserSnapshots.delete(browserSnapshots.keys().next().value);
-  }
-  return { snapshot_id: snapshotId, target_id: target.id, url: target.url, title: target.title, items };
+  return target.backend.execute({target: {tabId: target.tabId}, method, commandParams: params}, call?.context);
 }
 
 function requiredString(value, name, maxLength) {
@@ -327,316 +399,190 @@ function boundedString(value, name, maxLength) {
   return value;
 }
 
-async function browserObserve(value) {
-  const observe = value.observe;
-  if (observe === "tab_list") {
-    const targets = await pageTargets();
-    const active = targets.some((item) => item.id === activeTargetId)
-      ? activeTargetId
-      : targets[0].id;
-    return {
-      active_target_id: active,
-      tabs: targets.map((item) => ({ target_id: item.id, title: item.title, url: item.url })),
-    };
+const keyCodes = {
+  Enter: ["Enter", 13, "\r"], Return: ["Enter", 13, "\r"], Tab: ["Tab", 9, "\t"],
+  Escape: ["Escape", 27, ""], Esc: ["Escape", 27, ""], Backspace: ["Backspace", 8, ""],
+  BackSpace: ["Backspace", 8, ""], Delete: ["Delete", 46, ""], Home: ["Home", 36, ""],
+  End: ["End", 35, ""], PageUp: ["PageUp", 33, ""], Page_Up: ["PageUp", 33, ""],
+  PageDown: ["PageDown", 34, ""], Page_Down: ["PageDown", 34, ""], Up: ["ArrowUp", 38, ""],
+  Down: ["ArrowDown", 40, ""], Left: ["ArrowLeft", 37, ""], Right: ["ArrowRight", 39, ""],
+  ArrowUp: ["ArrowUp", 38, ""], ArrowDown: ["ArrowDown", 40, ""], ArrowLeft: ["ArrowLeft", 37, ""],
+  ArrowRight: ["ArrowRight", 39, ""], space: [" ", 32, " "], Space: [" ", 32, " "],
+};
+const modifierBits = { alt: 1, ctrl: 2, control: 2, meta: 4, super: 4, cmd: 4, shift: 8 };
+
+// "ctrl+shift+a" 这类组合键换成 CDP 键盘事件；未知键名直接报错，不猜。
+function keySteps(combo) {
+  const parts = combo.split("+").filter(Boolean);
+  const name = parts.pop() ?? "";
+  let modifiers = 0;
+  for (const part of parts) {
+    const bit = modifierBits[part.toLowerCase()];
+    if (!bit) throw new InputError(`unsupported modifier: ${part}`);
+    modifiers |= bit;
   }
-  const target = await pageTarget(value.target_id);
-  if (observe === "snapshot") {
-    return await browserSnapshot(target);
-  }
-  if (observe === "get_content") {
-    return {
-      url: target.url,
-      title: target.title,
-      content: await evaluate(target, "document.body?.innerText.slice(0, 200000) ?? ''"),
-    };
-  }
-  if (observe === "get_url") return { target_id: target.id, url: target.url };
-  if (observe === "get_title") return { target_id: target.id, title: target.title };
-  if (observe === "screenshot") {
-    const result = await cdp(target, "Page.captureScreenshot", { format: "png", fromSurface: true });
-    return { target_id: target.id, mimeType: "image/png", data: result.data };
-  }
-  throw new InputError("unsupported browser observation");
+  let key, keyCode, text, code;
+  if (keyCodes[name]) [key, keyCode, text] = keyCodes[name];
+  else if ([...name].length === 1) {
+    key = name;
+    keyCode = name.toUpperCase().charCodeAt(0);
+    text = name;
+    code = /[a-z]/i.test(name) ? `Key${name.toUpperCase()}` : /\d/.test(name) ? `Digit${name}` : undefined;
+  } else throw new InputError(`unsupported key: ${name}`);
+  if (modifiers & 7) text = "";
+  const base = { key, code: code ?? key, modifiers, windowsVirtualKeyCode: keyCode };
+  return [
+    ["Input.dispatchKeyEvent", { ...base, type: text ? "keyDown" : "rawKeyDown", text }],
+    ["Input.dispatchKeyEvent", { ...base, type: "keyUp" }],
+  ];
 }
 
-async function refTarget(value) {
-  const snapshotId = requiredString(value.snapshot_id, "snapshot_id", 64);
-  const checkedRef = requiredString(value.ref, "ref", 16);
-  const snapshot = browserSnapshots.get(snapshotId);
-  if (!snapshot) throw new InputError(`stale browser snapshot: ${snapshotId}`);
-  if (value.target_id && value.target_id !== snapshot.targetId) {
-    throw new InputError("target_id does not match snapshot_id");
-  }
-  const refNode = snapshot.refs.get(checkedRef);
-  if (!refNode) throw new InputError(`unknown browser ref: ${checkedRef}`);
-  const target = await pageTarget(snapshot.targetId);
-  if (await pageLoaderId(target) !== snapshot.loaderId) {
-    browserSnapshots.delete(snapshotId);
-    throw new InputError(`stale browser snapshot: ${snapshotId}`);
-  }
-  return { target, ...refNode, ref: checkedRef };
+function point(value, xName, yName) {
+  const x = value[xName], y = value[yName];
+  if (!Number.isInteger(x) || x < 0 || x > 16383 || !Number.isInteger(y) || y < 0 || y > 16383)
+    throw new InputError(`${xName} and ${yName} must be non-negative integers`);
+  return { x, y };
 }
 
-async function focusNode(target, backendNodeId) {
-  try {
-    await cdp(target, "DOM.scrollIntoViewIfNeeded", { backendNodeId });
-    await cdp(target, "DOM.focus", { backendNodeId });
-  } catch (error) {
-    throw new InputError("browser ref is no longer attached", { cause: error });
-  }
+function pressSteps({ x, y }, button, clickCount) {
+  return [
+    ["Input.dispatchMouseEvent", { type: "mousePressed", x, y, button, clickCount }],
+    ["Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button, clickCount }],
+  ];
 }
 
-async function clickNode(target, backendNodeId) {
-  let model;
-  try {
-    await cdp(target, "DOM.scrollIntoViewIfNeeded", { backendNodeId });
-    model = await cdp(target, "DOM.getBoxModel", { backendNodeId });
-  } catch (error) {
-    throw new InputError("browser ref is no longer visible", { cause: error });
-  }
-  const quad = model.model?.border;
-  if (!Array.isArray(quad) || quad.length !== 8) throw new InputError("browser ref has no click area");
-  const x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4;
-  const y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4;
-  await cdp(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
-  await cdp(target, "Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
-  await cdp(target, "Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
-}
-
-async function openTarget(url) {
-  const call = legacyCall.getStore();
-  call.signal.throwIfAborted();
-  const tab = await driver.browser.call("createTab", {}, call.context);
-  const target = { id: driver.browser.tab(tab.id).targetId, url };
-  await cdp(target, "Page.navigate", {url});
-  await driver.browser.call("markTab", {tabId: tab.id, status: "deliverable"}, call.context);
-  activeTargetId = target.id;
-  return target;
-}
-
-async function browserAction(value) {
+// 坐标动作换成发给最前面页面的 CDP 输入；kiosk 窗口铺满屏幕，页面坐标就是屏幕坐标。
+function inputSteps(value) {
   const action = value.action;
-  if (action === "wait") {
-    const timeout = value.timeout ?? 1000;
-    if (!Number.isInteger(timeout) || timeout < 0 || timeout > 30_000) {
-      throw new InputError("timeout must be an integer between 0 and 30000");
-    }
-    await tracked("browser wait", () => sleep(timeout, undefined, {signal: legacyCall.getStore().signal}));
-    return { ok: true, waited_ms: timeout };
+  if (["click", "double_click", "move"].includes(action)) {
+    const at = point(value, "x", "y");
+    const button = value.mouse_button ?? "left";
+    if (!["left", "middle", "right"].includes(button)) throw new InputError("mouse_button is invalid");
+    const steps = [["Input.dispatchMouseEvent", { type: "mouseMoved", ...at }]];
+    if (action === "click") steps.push(...pressSteps(at, button, 1));
+    if (action === "double_click") steps.push(...pressSteps(at, button, 1), ...pressSteps(at, button, 2));
+    return steps;
   }
-  if (action === "tab_new") {
-    const url = checkedUrl(value.url ?? "about:blank");
-    const target = await tracked("browser tab new", () => openTarget(url));
-    return { ok: true, target_id: target.id, url: target.url };
+  if (action === "drag") {
+    const from = point(value, "x", "y"), to = point(value, "to_x", "to_y");
+    const steps = [["Input.dispatchMouseEvent", { type: "mouseMoved", ...from }],
+      ["Input.dispatchMouseEvent", { type: "mousePressed", ...from, button: "left", clickCount: 1 }]];
+    for (let index = 1; index <= 8; index++)
+      steps.push(["Input.dispatchMouseEvent", { type: "mouseMoved", button: "left", buttons: 1,
+        x: from.x + ((to.x - from.x) * index) / 8, y: from.y + ((to.y - from.y) * index) / 8 }]);
+    steps.push(["Input.dispatchMouseEvent", { type: "mouseReleased", ...to, button: "left", clickCount: 1 }]);
+    return steps;
   }
-  const target = ["click", "fill", "type"].includes(action)
-    ? null
-    : await pageTarget(value.target_id);
-  if (action === "tab_select") {
-    requiredString(value.target_id, "target_id", 128);
-    await cdp(target, "Page.bringToFront");
-    activeTargetId = target.id;
-    return { ok: true, target_id: target.id };
+  if (action === "type") return [["Input.insertText", { text: boundedString(value.text, "text", 16384) }]];
+  if (action === "key") return keySteps(requiredString(value.key, "key", 80));
+  if (action === "scroll") {
+    if (!Number.isInteger(value.amount) || Math.abs(value.amount) > 100)
+      throw new InputError("amount must be an integer between -100 and 100");
+    return [["Input.dispatchMouseEvent", { type: "mouseWheel", x: 640, y: 400, deltaX: 0, deltaY: value.amount * 100 }]];
   }
-  if (action === "tab_close") {
-    requiredString(value.target_id, "target_id", 128);
-    const call = legacyCall.getStore();
-    await driver.browser.listTabs();
-    const tab = driver.browser.tabs.get(target.id);
-    await driver.browser.call("claimUserTab", {tabId: tab.id}, call.context);
-    await cdp(target, "Page.close");
-    if (activeTargetId === target.id) activeTargetId = "";
-    return { ok: true, target_id: target.id };
-  }
-  return await tracked(`browser ${action}`, async () => {
-    if (action === "navigate") {
-      const url = checkedUrl(value.url);
-      await cdp(target, "Page.navigate", { url });
-      return { ok: true, target_id: target.id, url };
-    }
-    if (action === "click") {
-      const selected = await refTarget(value);
-      await clickNode(selected.target, selected.backendNodeId);
-      return { ok: true, ref: selected.ref, snapshot_id: value.snapshot_id };
-    }
-    if (action === "fill" || action === "type") {
-      const text = boundedString(value.text, "text", 16_384);
-      const selected = await refTarget(value);
-      if (!["combobox", "searchbox", "spinbutton", "textbox"].includes(selected.role)) {
-        throw new InputError(`browser ref is not editable: ${selected.ref}`);
-      }
-      await focusNode(selected.target, selected.backendNodeId);
-      if (action === "fill") {
-        await cdp(selected.target, "Input.dispatchKeyEvent", {
-          type: "rawKeyDown",
-          key: "a",
-          code: "KeyA",
-          modifiers: 2,
-          windowsVirtualKeyCode: 65,
-          commands: ["SelectAll"],
-        });
-        await cdp(selected.target, "Input.dispatchKeyEvent", {
-          type: "keyUp", key: "a", code: "KeyA", modifiers: 2, windowsVirtualKeyCode: 65,
-        });
-        await cdp(selected.target, "Input.dispatchKeyEvent", {
-          type: "rawKeyDown", key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8,
-        });
-        await cdp(selected.target, "Input.dispatchKeyEvent", {
-          type: "keyUp", key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8,
-        });
-      }
-      await cdp(selected.target, "Input.insertText", { text });
-      return { ok: true, ref: selected.ref, snapshot_id: value.snapshot_id, action };
-    }
-    if (action === "press") {
-      const key = requiredString(value.key, "key", 80);
-      await cdp(target, "Input.dispatchKeyEvent", { type: "keyDown", key });
-      await cdp(target, "Input.dispatchKeyEvent", { type: "keyUp", key });
-      return { ok: true, key };
-    }
-    if (action === "scroll") {
-      const direction = value.direction ?? "down";
-      const amount = value.amount ?? 500;
-      if (!["up", "down", "left", "right"].includes(direction) ||
-          !Number.isInteger(amount) || amount < 1 || amount > 5000) {
-        throw new InputError("scroll direction or amount is invalid");
-      }
-      const x = direction === "left" ? -amount : direction === "right" ? amount : 0;
-      const y = direction === "up" ? -amount : direction === "down" ? amount : 0;
-      await cdp(target, "Input.dispatchMouseEvent", {
-        type: "mouseWheel", x: 640, y: 400, deltaX: x, deltaY: y,
-      });
-      return { ok: true, direction, amount };
-    }
-    if (action === "reload") {
-      await cdp(target, "Page.reload", {});
-      return { ok: true, target_id: target.id };
-    }
-    if (action === "go_back" || action === "go_forward") {
-      await evaluate(target, action === "go_back" ? "history.back(); true" : "history.forward(); true");
-      return { ok: true, target_id: target.id };
-    }
-    throw new InputError("unsupported browser action");
-  });
+  throw new InputError("unsupported input action");
 }
 
-function checkedUrl(value) {
-  const url = requiredString(value, "url", 8192);
-  if (url === "about:blank") return url;
-  let parsed;
-  try {
-    parsed = new URL(url);
-  } catch {
-    throw new InputError("url must be an absolute HTTP or HTTPS URL");
-  }
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    throw new InputError("url must use HTTP or HTTPS");
-  }
-  return parsed.href;
+// 页面级坐标操作：作为一次 legacy 调用执行，经过同一个人工接管与输入释放边界。
+async function pageOperation(task, signal) {
+  await readyDriver();
+  return driver.perform(
+    (inner, context) => legacyCall.run({ signal: inner, context }, async () => {
+      const target = await pageTarget();
+      try { return await task(target); }
+      finally { await target.backend.releaseInputs(context.session_id); }
+    }),
+    signal,
+  );
 }
 
 async function runInput(value, signal) {
-  const action = value.action;
-  let method, input;
-  if (["click", "double_click", "move", "drag"].includes(action)) {
-    if (
-      !Number.isInteger(value.x) ||
-      value.x < 0 ||
-      value.x > 1279 ||
-      !Number.isInteger(value.y) ||
-      value.y < 0 ||
-      value.y > 799
-    ) {
-      throw new InputError(
-        "x and y must be integers inside the 1280 by 800 screen",
-      );
-    }
-    method = action === "double_click" ? "click" : action;
-    input = { x: value.x, y: value.y };
-    if (action === "double_click") input.click_count = 2;
-    if (action === "click" && value.mouse_button != null)
-      input.mouse_button = value.mouse_button;
-    if (action === "drag") {
-      if (
-        !Number.isInteger(value.to_x) ||
-        value.to_x < 0 ||
-        value.to_x > 1279 ||
-        !Number.isInteger(value.to_y) ||
-        value.to_y < 0 ||
-        value.to_y > 799
-      ) {
-        throw new InputError(
-          "to_x and to_y must be integers inside the 1280 by 800 screen",
-        );
-      }
-      input = { path: [input, { x: value.to_x, y: value.to_y }] };
-    }
-  } else if (action === "type") {
-    method = "type_text";
-    input = { text: boundedString(value.text, "text", 16384) };
-  } else if (action === "key") {
-    method = "press_key";
-    input = { key: requiredString(value.key, "key", 80) };
-  } else if (action === "scroll") {
-    if (!Number.isInteger(value.amount) || Math.abs(value.amount) > 100)
-      throw new InputError("amount must be an integer between -100 and 100");
-    method = "scroll";
-    input = {
-      direction: value.amount < 0 ? "up" : "down",
-      pixels: Math.abs(value.amount) * 100,
-    };
-  } else if (action === "wait") {
+  if (value.action === "wait") {
     if (!Number.isInteger(value.ms) || value.ms < 0 || value.ms > 30000)
       throw new InputError("ms must be 0..30000");
-    await tracked(
-      "wait",
-      () => sleep(value.ms, undefined, {signal}),
-    );
+    await tracked("wait", () => sleep(value.ms, undefined, { signal }));
     return { ok: true };
-  } else throw new InputError("unsupported input action");
-  await readyDriver();
-  await tracked(String(action), () => driver.input(method, input, signal));
+  }
+  const steps = inputSteps(value);
+  await tracked(String(value.action), () => pageOperation(async (target) => {
+    for (const [method, params] of steps) await cdp(target, method, params);
+  }, signal));
   return { ok: true };
 }
 
 async function screenshot(response, quiet) {
-  await readyDriver();
-  const capture = () => driver.desktop.call("get_screenshot");
+  const capture = () => pageOperation((target) =>
+    cdp(target, "Page.captureScreenshot", { format: "png", captureBeyondViewport: false }));
   const result = quiet ? await capture() : await tracked("screenshot", capture);
   const bytes = Buffer.from(result.data, "base64");
   response.writeHead(200, {
-    "content-type": result.mimeType,
+    "content-type": "image/png",
     "content-length": String(bytes.length),
     "cache-control": "no-store",
   });
   response.end(bytes);
 }
 
-function proxyOpenCli(request, response) {
+async function proxyOpenCli(request, response) {
   const url = new URL(request.url ?? "/", "http://opencli.local");
-  if (url.pathname === "/shutdown") {
-    json(response, 403, { error: "the Computer plugin owns the OpenCLI daemon lifecycle" });
+  if (request.headers["x-opencli"] !== "1" || request.headers.upgrade) {
+    json(response, 403, { error: "Only OpenCLI client requests may wake Computer" });
     return;
   }
-  const upstream = httpRequest(
-    {
-      hostname: "127.0.0.1",
-      port: 19825,
-      method: request.method,
-      path: request.url,
-      headers: { ...request.headers, host: "127.0.0.1:19825" },
-    },
-    (upstreamResponse) => {
-      response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
-      upstreamResponse.pipe(response);
-    },
-  );
-  upstream.setTimeout(125_000, () => upstream.destroy(new Error("OpenCLI daemon timed out")));
-  upstream.on("error", (error) => {
-    if (!response.headersSent) json(response, 502, { error: error.message });
-    else response.destroy(error);
+  if (url.pathname === "/shutdown") {
+    json(response, 403, {
+      error: "the Computer plugin owns the OpenCLI daemon lifecycle",
+    });
+    return;
+  }
+  const controller = new AbortController();
+  response.once("close", () => {
+    if (!response.writableFinished) controller.abort(new Error("OpenCLI caller disconnected"));
   });
-  request.pipe(upstream);
+  try {
+    await computer.use(async () => {
+      await readyDriver();
+      return driver.agentOperation(() => new Promise((resolve, reject) => {
+          if (response.destroyed) {
+            resolve();
+            return;
+          }
+          response.once("finish", resolve);
+          response.once("close", resolve);
+          const upstream = httpRequest(
+            {
+              hostname: "127.0.0.1",
+              port: 19825,
+              method: request.method,
+              path: request.url,
+              headers: { ...request.headers, host: "127.0.0.1:19825" },
+            },
+            (upstreamResponse) => {
+              response.writeHead(
+                upstreamResponse.statusCode ?? 502,
+                upstreamResponse.headers,
+              );
+              upstreamResponse.pipe(response);
+            },
+          );
+          upstream.setTimeout(125_000, () =>
+            upstream.destroy(new Error("OpenCLI daemon timed out")),
+          );
+          upstream.on("error", (error) => {
+            if (!response.headersSent)
+              json(response, 502, { error: error.message });
+            else response.destroy(error);
+            reject(error);
+          });
+          response.once("close", () => upstream.destroy());
+          request.pipe(upstream);
+        }), controller.signal);
+    });
+  } catch (error) {
+    if (!response.headersSent && !response.destroyed)
+      json(response, 502, { error: error.message });
+    else console.error("OpenCLI proxy:", error.message);
+  }
 }
 
 try {
@@ -650,37 +596,194 @@ try {
 if (activity.active) await saveActivity(activity.action, false);
 
 const server = createServer(async (request, response) => {
-  if (stopping) { json(response, 503, {error:"Computer is stopping"}); return; }
+  let release;
+  let call;
+  let callId;
+  if (stopping) {
+    json(response, 503, { error: "Computer is stopping" });
+    return;
+  }
   try {
     const url = new URL(request.url ?? "/", "http://computer.local");
-    if (request.method === "POST" && url.pathname === "/driver/run") {
-      const payload = await body(request);
-      await readyDriver();
-      const controller = new AbortController();
+    const driverPayload =
+      request.method === "POST" && url.pathname === "/driver/run"
+        ? await body(request)
+        : null;
+    if (driverPayload) {
+      callId = driverPayload.context?.call_id;
+      if (driverCalls.get(callId)?.done)
+        throw new InputError("Computer call_id is already running");
+      call = driverCall(callId);
+      call.expires = Infinity;
+      call.done = new Promise((resolve) => { call.finish = resolve; });
       response.once("close", () => {
         if (!response.writableFinished)
-          controller.abort(new Error("Computer caller disconnected"));
+          call.controller.abort(new Error("Computer caller disconnected"));
       });
-      json(
-        response,
-        200,
-        await tracked("computer", () => driver.run({context: payload.context, code: payload.code, endTurn: payload.endTurn, timeoutMs: payload.timeoutMs}, controller.signal)),
-      );
+      call.controller.signal.throwIfAborted();
+    }
+    // 操作持有占用；活动轮询、握手与取消均不得唤醒主浏览器。
+    const operation =
+      [
+        "/screenshot",
+        "/input",
+        "/wake",
+      ].includes(url.pathname) ||
+      (driverPayload && (!driverPayload.endTurn || driver));
+    if (operation) release = await computer.acquire();
+    if (request.method === "POST" && url.pathname === "/driver/run") {
+      const payload = driverPayload;
+      if (payload.endTurn && !driver) {
+        json(response, 200, {
+          content: [],
+          call_id: payload.context?.call_id,
+        });
+        return;
+      }
+      await readyDriver();
+      call.controller.signal.throwIfAborted();
+      const turn = JSON.stringify([
+        payload.context?.session_id,
+        payload.context?.turn_id,
+      ]);
+      try {
+        const result = await tracked("computer", () =>
+          driver.run(
+            {
+              context: payload.context,
+              code: payload.code,
+              endTurn: payload.endTurn,
+              timeoutMs: payload.timeoutMs,
+            },
+            call.controller.signal,
+          ),
+        );
+        if (!payload.endTurn) computer.turns.add(turn);
+        json(response, 200, result);
+      } finally {
+        if (payload.endTurn) computer.turns.delete(turn);
+      }
     } else if (request.method === "POST" && url.pathname === "/driver/cancel") {
       const payload = await body(request);
-      await driver.cancel(payload.call_id);
+      const cancelled = driverCall(payload.call_id);
+      cancelled.controller.abort(new Error("Computer call cancelled before admission; earlier effects may remain"));
+      if (driver?.findActive(payload.call_id))
+        await driver.cancel(payload.call_id);
+      if (cancelled.done) await cancelled.done;
       json(response, 200, { released: true });
     } else if (request.method === "POST" && url.pathname === "/driver/reset") {
       const payload = await body(request);
-      await driver.reset(payload.session_id);
+      requiredString(payload.session_id, "session_id", 256);
+      if (driver) await driver.reset(payload.session_id);
+      for (const turn of computer.turns)
+        if (JSON.parse(turn)[0] === payload.session_id) computer.turns.delete(turn);
       json(response, 200, { reset: true });
-    } else if (request.method === "GET" && url.pathname === "/driver/status") {
-      await readyDriver();
-      json(response, 200, { version: 2, source: true, ready: !driver.closed });
+    } else if (
+      request.method === "GET" &&
+      url.pathname === "/driver/status"
+    ) {
+      json(response, 200, {
+        version: 3,
+        source: true,
+        ready: computer.state !== "failed",
+        browser: computer.status(),
+      });
     } else if (request.method === "GET" && url.pathname === "/health") {
-      json(response, 200, await health());
+      await daemonStatus();
+      if (computer.state === "failed") throw new Error(computer.error);
+      json(response, 200, {
+        status: "ready",
+        control: "ready",
+        browser: computer.state,
+      });
+    } else if (request.method === "GET" && url.pathname === "/events") {
+      // 只读订阅不唤醒，也不写 activity 或 profile；先发完整快照，之后只发变化。
+      if (eventClients.size >= 32) {
+        json(response, 503, { error: "Too many Computer viewers" });
+        return;
+      }
+      const snapshot = await stateEvent();
+      response.writeHead(200, {"content-type": "text/event-stream", "cache-control": "no-store"});
+      response.write(snapshot + cursorEvent());
+      eventClients.set(response, snapshot);
+      response.once("close", () => eventClients.delete(response));
+      // 快照读取期间可能有变化已经广播过，补一次核对。
+      scheduleState();
+    } else if (request.method === "GET" && url.pathname === "/targets") {
+      json(response, 200, { targets: driver && computer.state === "ready" ? await driver.targets() : [],
+        control: Boolean(driver?.control) });
+    } else if (request.method === "POST" && url.pathname === "/view/show") {
+      const payload = await body(request);
+      if (!driver || computer.state !== "ready") throw new InputError("Computer is not awake");
+      await driver.show(requiredString(payload.target, "target", 128));
+      json(response, 200, { shown: true });
+    } else if (request.method === "POST" && ["/view/navigate", "/view/open", "/view/close"].includes(url.pathname)) {
+      const payload = await body(request);
+      if (!driver || computer.state !== "ready") throw new InputError("Computer is not awake");
+      const id = payload.control === undefined ? "" : requiredString(payload.control, "control", 128);
+      if (url.pathname === "/view/open") {
+        const address = payload.url === undefined ? "about:blank" : pageUrl(payload.url);
+        json(response, 200, { target: await humanAction(id, () => driver.openPage(address)) });
+        return;
+      }
+      const target = requiredString(payload.target, "target", 128);
+      if (url.pathname === "/view/close") await humanAction(id, () => driver.closePage(target));
+      else if (!["go", "back", "forward", "reload"].includes(payload.action))
+        throw new InputError("action must be go, back, forward or reload");
+      else {
+        const address = payload.action === "go" ? pageUrl(payload.url) : "";
+        await humanAction(id, () => driver.navigate(target, payload.action, address));
+      }
+      json(response, 200, { done: true });
+    } else if (request.method === "POST" && url.pathname === "/view/touch") {
+      // 观看者直接操作页面不经过网关；面板代理转发输入时续期，人在用时不休眠。
+      if (computer.state === "ready") computer.touch();
+      json(response, 200, { touched: computer.state === "ready" });
     } else if (request.method === "GET" && url.pathname === "/activity") {
-      json(response, 200, activity);
+      json(response, 200, { ...activity, browser: computer.status(), control: driver?.control ? { active: true } : { active: false } });
+    } else if (request.method === "POST" && url.pathname.startsWith("/control/")) {
+      const payload = await body(request);
+      requiredString(payload.id, "id", 128);
+      if (url.pathname === "/control/take") {
+        if (!driver || computer.state !== "ready") throw new InputError("Computer is not awake");
+        const target = payload.target ?? "";
+        if (driver.control) throw new InputError("Another viewer controls this Computer");
+        if (target) await driver.show(target);
+        const controller = new AbortController();
+        const disconnected = () => {
+          if (!response.writableFinished) controller.abort(new Error("Control caller disconnected"));
+        };
+        response.once("close", disconnected);
+        if (response.destroyed) disconnected();
+        const releaseWorkload = await computer.acquire();
+        try {
+          await driver.takeControl(payload.id, target, controller.signal);
+          if (driver.control?.id !== payload.id) throw new Error("Control connection has ended");
+          driver.control.releaseWorkload = releaseWorkload;
+        } catch (error) { releaseWorkload(); throw error; }
+        finally { response.removeListener("close", disconnected); }
+      } else if (url.pathname === "/control/release") {
+        if (driver) await driver.releaseControl(payload.id);
+      } else if (url.pathname !== "/control/renew") {
+        throw new InputError("Unknown control operation");
+      }
+      if (url.pathname !== "/control/release") {
+        if (driver?.control?.id !== payload.id || !driver.control.ready)
+          throw new InputError("Control connection has ended");
+        clearTimeout(controlTimer);
+        const owner = driver;
+        controlTimer = setTimeout(() => owner.releaseControl(payload.id).catch(error => {
+          owner.closed = true;
+          owner.rejectAll(error);
+          console.error("Computer control release failed:", error.message);
+        }), 30000);
+      }
+      json(response, 200, { controlled: url.pathname !== "/control/release" });
+    } else if (request.method === "POST" && url.pathname === "/restart") {
+      await computer.restart();
+      json(response, 200, computer.status());
+    } else if (request.method === "POST" && url.pathname === "/wake") {
+      json(response, 200, computer.status());
     } else if (request.method === "GET" && url.pathname === "/screenshot") {
       await screenshot(response, url.searchParams.get("quiet") === "1");
     } else if (request.method === "POST" && url.pathname === "/input") {
@@ -691,49 +794,118 @@ const server = createServer(async (request, response) => {
           controller.abort(new Error("Computer caller disconnected"));
       });
       json(response, 200, await runInput(payload, controller.signal));
-    } else if (
-      request.method === "POST" &&
-      url.pathname === "/browser/observe"
-    ) {
-      json(response, 200, await browserObserve(await body(request)));
-    } else if (
-      request.method === "POST" &&
-      url.pathname === "/browser/action"
-    ) {
-      const payload = await body(request);
-      await readyDriver();
-      const controller = new AbortController();
-      response.once("close", () => {
-        if (!response.writableFinished) controller.abort(new Error("Computer caller disconnected"));
-      });
-      const result = await driver.perform(signal => legacyCall.run(
-        {signal, context: driver.active.context}, async () => {
-          try { return await browserAction(payload); }
-          finally { await driver.browser.endTurn(driver.active.context); }
-        }), controller.signal);
-      json(response, 200, result);
     } else {
       json(response, 404, { error: "not found" });
     }
   } catch (error) {
-    const status =
-      error instanceof InputError || error instanceof SyntaxError ? 400 : 500;
+    if (driver?.closed && computer.state === "ready") {
+      computer.fail(error);
+    }
+    const status = error instanceof BusyError ? 409
+      : error instanceof InputError || error instanceof SyntaxError ? 400 : 500;
     json(response, status, {
       error: error instanceof Error ? error.message : String(error),
     });
+  } finally {
+    release?.();
+    if (call?.finish) {
+      driverCalls.delete(callId);
+      call.finish();
+    }
   }
 }).listen(8080, "0.0.0.0");
 
 const openCliServer = createServer(proxyOpenCli).listen(19826, "0.0.0.0");
 let stopping = false;
+let refreshTimer;
+let controlTimer;
+/** 一次刷新持有完整占用；失败回执与下一次计划均保留在控制服务。 */
+async function refreshIdentity() {
+  try {
+    const { stdout } = await computer.use(async () => {
+      await readyDriver();
+      // Keep existing pages, Agent pages and popups. Any human takeover during
+      // refresh makes ownership uncertain, so that refresh does not close pages.
+      const pages = async () => (await driver.browser.browser.send("Target.getTargets")).targetInfos
+        .filter(target => target.type === "page" && !driver.anonymous.contexts.has(target.browserContextId));
+      let before = null;
+      let controlVersion;
+      try {
+        return await driver.agentOperation(async () => {
+          controlVersion = driver.controlVersion;
+          before = new Set((await pages()).map(page => page.targetId));
+          return exec(
+          "opencli",
+          [
+            "auth",
+            "refresh",
+            "--all",
+            "--site",
+            process.env.OPENCLI_AUTH_REFRESH_SITES ?? "",
+            "--concurrency",
+            "2",
+            "--timeout",
+            "45",
+            "--format",
+            "json",
+          ],
+          { timeout: 120000 },
+        ); });
+      } finally {
+        if (before && driver.controlVersion === controlVersion && !driver.control) {
+          await driver.agentOperation(async () => {
+            await driver.browser.listTabs();
+            const agent = new Set([...driver.browser.tabs.values()]
+              .filter(tab => tab.created || tab.claimed).map(tab => tab.targetId));
+            const opened = (await pages()).filter(page => !before.has(page.targetId)
+              && !agent.has(page.targetId) && !page.openerId);
+            let closed = 0;
+            for (const { targetId } of opened) {
+              // A live Agent may still be assigning ownership to a new target.
+              if (driver.actives.size || driver.agentJobs.size > 1 || driver.controlVersion !== controlVersion) break;
+              const result = await driver.browser.browser.send("Target.closeTarget", { targetId });
+              if (!result.success) throw new Error(`OpenCLI refresh could not close page ${targetId}`);
+              closed++;
+            }
+            console.log(`OpenCLI refresh closed ${closed} pages; kept ${before.size}`);
+          });
+        }
+      }
+    });
+    const sites = JSON.parse(stdout);
+    if (!Array.isArray(sites) || sites.length === 0) throw new Error("OpenCLI returned no refresh results");
+    const needsLogin = sites.filter(site => site.status === "not_logged_in");
+    if (needsLogin.length) {
+      console.warn(`OpenCLI login required: ${needsLogin.map(site => site.site).join(", ")}`);
+    }
+    const failed = sites.filter(site => !["refreshed", "touched", "not_logged_in"].includes(site.status));
+    if (failed.length) throw new Error(`OpenCLI refresh incomplete: ${failed.map(site => `${site.site}:${site.status}`).join(", ")}`);
+    // 未登录需要人工处理；按正常周期再检查，但不能写成整批刷新成功。
+    if (!needsLogin.length) {
+      await writeFile("/data/state/auth-refresh.ok", new Date().toISOString(), {
+        mode: 0o600,
+      });
+    }
+    refreshTimer = setTimeout(refreshIdentity, 43200000);
+  } catch (error) {
+    console.error("OpenCLI login refresh failed:", error.message);
+    refreshTimer = setTimeout(refreshIdentity, 900000);
+  }
+}
+refreshTimer = setTimeout(refreshIdentity, 900000);
 async function stop() {
   if (stopping) return;
   stopping = true;
+  clearTimeout(refreshTimer);
   server.close();
+  for (const client of eventClients.keys()) client.end();
   openCliServer.close();
-  const timer = setTimeout(() => { console.error("Computer shutdown timed out"); process.exit(1); }, 30000);
+  const timer = setTimeout(() => {
+    console.error("Computer shutdown timed out");
+    process.exit(1);
+  }, 30000);
   try {
-    if (driverReady) { await driverReady; await driver.close(); }
+    await computer.close();
     console.error("Computer driver input release confirmed");
     clearTimeout(timer);
     process.exit(0);

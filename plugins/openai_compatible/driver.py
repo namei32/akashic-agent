@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from plugins.models.contract import describe_transport_error
+
+from core.common.diagnostic_log import log_timing
+
 # External JSON is validated field by field below; pyright cannot preserve the
 # narrowed key/value types of arbitrary Mapping and list payloads.
 # pyright: reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false
@@ -16,35 +20,39 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
-from core.net.http import HttpClient, StreamProgress, finish_response
+from core.net.http import HttpClient, StreamProgress, finish_response, retry_after_time
 
-from agent.plugin_composition import (
-    AuthenticationError,
+from core.common.frozen_json import freeze_json
+
+from plugins.models.contract import (
+    EmbeddingResult,
+    LLMResponse,
+    ModelRequest,
+    ModelUsage,
+    ToolCall,
+)
+from plugins.models.contract import (
     BoundModelDescriptor,
     CapabilitySources,
-    ContentSafetyError,
-    ContextLengthError,
     CredentialHandle,
     DiscoveredModel,
     DriverConnection,
     DriverConnectionDescriptor,
-    EmbeddingResult,
     EmbeddingSpaceDescriptor,
-    LLMResponse,
-    InvalidRequestError,
     ModelCapabilities,
-    ModelDriverDefinition,
+)
+from plugins.models.contract import (
+    AuthenticationError,
+    ContentSafetyError,
+    ContextLengthError,
+    InvalidRequestError,
     ModelError,
-    ModelKind,
-    ModelRequest,
     ModelTimeoutError,
-    ModelUsage,
     QuotaError,
     RateLimitError,
-    ToolCall,
     TransportError,
-    UsageCoverage,
 )
+from plugins.models.contract import ModelDriverDefinition, message_size
 
 _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 
@@ -89,6 +97,14 @@ class _ModelConfig:
     embedding_batch_size: int
 
 
+@dataclass(frozen=True, slots=True)
+class _ChatRow:
+    source: Mapping[str, Any]
+    fill_reasoning: bool
+    encoded: bytes
+    images: tuple[bytes, ...]
+
+
 class _BoundChat:
     def __init__(
         self,
@@ -103,6 +119,12 @@ class _BoundChat:
         self._descriptor = descriptor
         self._config = config
         self._http = http
+        self._message_sizes: dict[int, tuple[Mapping[str, Any], int, int]] = {}
+        self._message_size_totals: tuple[tuple[int, ...], int, int] | None = None
+        self._tool_size: tuple[object, int] | None = None
+        # 原冻结行只编译一次；图片发射位置仍由本轮工具配对决定。
+        self._chat_rows: dict[int, _ChatRow] = {}
+        self._tools_json: tuple[object, bytes] | None = None
 
     @property
     def max_tool_schemas(self) -> int | None:
@@ -115,19 +137,21 @@ class _BoundChat:
             # 发送前本地校验失败：可证明请求未发出。
             raise _unsent(InvalidRequestError(
                 "OpenAI-compatible Chat Completions does not support continuation state"
-            ))
+            ).exception())
         # 生成调用恒为一次物理 attempt：重试预算唯一 owner 是 Models；
         # 未带 request_key 的直调同样不得隐式重发（§6.3）。max_retries
         # 连接配置只留给 embeddings/discovery 等非生成路径。
         connection = replace(self._connection, max_retries=0)
-        body = _chat_body(self._descriptor, connection, self._config, request)
+        body = _chat_body(
+            self._descriptor, connection, request,
+        )
         if request.on_delta is None and connection.thinking_format != "deepseek":
             payload = await _request_json(
                 connection,
                 self._credential,
                 "POST",
                 "/chat/completions",
-                body=body,
+                body_bytes=self._encode_body(body, request),
                 http=self._http,
             )
             return _parse_chat_response(payload)
@@ -137,23 +161,134 @@ class _BoundChat:
         return await _stream_chat(
             connection,
             self._credential,
-            body,
+            self._encode_body(body, request),
             request.on_delta,
             self._http,
         )
+
+    def _encode_body(self, body: Mapping[str, Any], request: ModelRequest) -> bytes:
+        """逐字段复用身份缓存字节；与 httpx encode_json 的字节格式一致。"""
+        frags: list[bytes] = []
+        for key, value in body.items():
+            if key == "messages":
+                encoded = self._encode_rows(
+                    value, request.system_prompt,
+                    self._connection.thinking_format == "deepseek" and not request.disable_reasoning,
+                )
+            elif key == "tools":
+                encoded = self._encode_tools(value)
+            else:
+                encoded = _json_dumps_bytes(value)
+            frags.append(b'"' + key.encode("utf-8") + b'":' + encoded)
+        return b"{" + b",".join(frags) + b"}"
+
+    def _encode_rows(
+        self, messages: Sequence[Mapping[str, Any]], system_prompt: str,
+        fill_reasoning: bool,
+    ) -> bytes:
+        """复用逐行协议字节，并在工具组闭合处发射图片。"""
+        # 1. 连续 system 只合并非空文本；全空且没有后续行时保留原行。
+        parts: list[bytes] = []
+        index = 0
+        system_contents: list[str] = []
+        while index < len(messages) and messages[index].get("role") == "system":
+            content = messages[index].get("content")
+            if isinstance(content, str) and content:
+                system_contents.append(content)
+            index += 1
+        if index == 0 and system_prompt:
+            system_contents.append(system_prompt)
+        if system_contents:
+            parts.append(_json_dumps_bytes({"role": "system", "content": "\n\n".join(system_contents)}))
+        elif index == len(messages):
+            index = 0
+
+        # 2. 缓存只拥有单行变换；跨行配对状态每次从当前窗口重建。
+        cache: dict[int, _ChatRow] = {}
+        images: list[bytes] = []
+        pending_calls: set[str] = set()
+        for row in messages[index:]:
+            identity = id(row)
+            entry = self._chat_rows.get(identity)
+            if entry is None or entry.source is not row or entry.fill_reasoning != fill_reasoning:
+                entry = _compile_chat_row(row, fill_reasoning)
+            cache[identity] = entry
+            images.extend(entry.images)
+            role = str(row.get("role") or "")
+            if role == "assistant" and row.get("tool_calls"):
+                if images and pending_calls:
+                    raise InvalidRequestError("图片所在工具请求尚未完成配对").exception()
+                pending_calls = {call["id"] for call in row["tool_calls"]}
+            elif role == "tool":
+                pending_calls.discard(row["tool_call_id"])
+            parts.append(entry.encoded)
+            if images and not pending_calls:
+                parts.append(b'{"role":"user","content":[' + b",".join(images) + b"]}")
+                images = []
+        if images:
+            raise InvalidRequestError("图片所在工具请求缺少结果，不能重排为有效历史").exception()
+        self._chat_rows = cache
+        return b"[" + b",".join(parts) + b"]"
+
+    def _encode_tools(self, tools: Sequence[Mapping[str, Any]]) -> bytes:
+        saved = self._tools_json
+        if saved is not None and saved[0] is tools:
+            return saved[1]
+        encoded = _json_dumps_bytes(tools)
+        self._tools_json = (tools, encoded)
+        return encoded
 
     def estimate_context_tokens(
         self,
         messages: Sequence[Mapping[str, Any]],
         tools: Sequence[Mapping[str, Any]] = (),
     ) -> int:
-        return _estimate_context_tokens("", messages, tools)
+        """固定 schema 只编码一次；消息仍按原公式合计后取整。"""
+        frozen_tools = freeze_json(tools)
+        saved = self._tool_size
+        if saved is not None and saved[0] is frozen_tools:
+            chars = saved[1]
+        else:
+            chars = len(json.dumps(frozen_tools, ensure_ascii=False, separators=(",", ":"), default=dict))
+            self._tool_size = (frozen_tools, chars)
+        return max(1, chars // 3 + self.estimate_appended_message_tokens(messages))
 
     def estimate_appended_message_tokens(
         self,
         messages: Sequence[Mapping[str, Any]],
     ) -> int:
-        return _estimate_message_tokens(messages)
+        """仅复用同一个深冻结消息的长度；动态内容和普通可变输入重新计算。"""
+        previous = self._message_sizes
+        frozen_rows: list[Mapping[str, Any]] = []
+        frozen_ids: list[int] = []
+        for message in messages:
+            frozen = cast(Mapping[str, Any], freeze_json(message))
+            frozen_rows.append(frozen)
+            frozen_ids.append(id(frozen))
+        sizes: dict[int, tuple[Mapping[str, Any], int, int]] = {}
+        for frozen, identity in zip(frozen_rows, frozen_ids):
+            saved = previous.get(identity)
+            if saved is None or saved[0] is not frozen:
+                chars, images = message_size(frozen)
+                saved = (frozen, chars, images)
+            sizes[identity] = saved
+        # 窗口只追加时合计只算尾部；前缀身份逐位一致才能沿用旧合计。
+        text_chars = image_tokens = start = 0
+        totals = self._message_size_totals
+        if totals is not None:
+            old_ids, text_chars, image_tokens = totals
+            if len(old_ids) <= len(frozen_ids) and old_ids == tuple(frozen_ids[:len(old_ids)]):
+                start = len(old_ids)
+            else:
+                text_chars = image_tokens = 0
+        for identity in frozen_ids[start:]:
+            saved = sizes[identity]
+            text_chars += saved[1]
+            image_tokens += saved[2]
+        # 只保留本次输入，切窗或结束 scope 后不保留被排除的历史。
+        self._message_sizes = sizes
+        self._message_size_totals = (tuple(frozen_ids), text_chars, image_tokens)
+        return max(1, text_chars // 3 + image_tokens) if messages else 0
 
 
 class _BoundEmbedding:
@@ -213,9 +348,9 @@ async def _open(
 ) -> DriverConnection:
     connection = _connection_config(descriptor)
     if credential.connection_id != descriptor.connection_id:
-        raise AuthenticationError("credential connection scope does not match")
+        raise AuthenticationError("credential connection scope does not match").exception()
     if credential.auth_identity != descriptor.auth_identity:
-        raise AuthenticationError("credential auth identity does not match")
+        raise AuthenticationError("credential auth identity does not match").exception()
 
     http = HttpClient(lambda: _client(connection))
 
@@ -262,10 +397,10 @@ async def _probe_embedding(
                 max_bytes=4 * 1024 * 1024,
             )
     except TimeoutError as error:
-        raise ModelTimeoutError("向量试算超时，请检查服务地址或稍后重试；配置未保存。") from error
+        raise ModelTimeoutError("向量试算超时，请检查服务地址或稍后重试；配置未保存。").exception() from error
     result = _parse_embedding_response(payload, expected_count=2)
     return DiscoveredModel(
-        kind=ModelKind.EMBEDDING, model=model,
+        kind='embedding', model=model,
         capabilities=ModelCapabilities(embedding_dimensions=len(result.vectors[0]), embedding_normalization="none"),
         capability_sources=CapabilitySources(embedding_dimensions="probe", embedding_normalization="driver"),
         driver_config={"format_version": 1},
@@ -286,7 +421,7 @@ async def _probe(
         raise
     except Exception as error:
         mapped = _map_error(error)
-        if mapped is error and not isinstance(error, ModelError):
+        if mapped is error and not ModelError.matches(error):
             raise
         raise mapped from error
     if response.status_code == 404 and connection.allow_unverified_manual:
@@ -320,28 +455,28 @@ async def _discover(
     except asyncio.CancelledError:
         raise
     except TimeoutError as error:
-        raise ModelTimeoutError("model discovery timed out") from error
+        raise ModelTimeoutError("model discovery timed out").exception() from error
     raw_models = payload.get("data")
     if not isinstance(raw_models, list):
-        raise TransportError("models response is missing data array")
+        raise TransportError("models response is missing data array").exception()
     if len(raw_models) > _DISCOVERY_MAX_MODELS:
-        raise TransportError(f"models response exceeds {_DISCOVERY_MAX_MODELS} entries")
+        raise TransportError(f"models response exceeds {_DISCOVERY_MAX_MODELS} entries").exception()
     result: list[DiscoveredModel] = []
     seen_models: set[str] = set()
     for raw in raw_models:
         if not isinstance(raw, Mapping):
-            raise TransportError("models response contains a non-object item")
+            raise TransportError("models response contains a non-object item").exception()
         model = raw.get("id")
         if not isinstance(model, str) or not model.strip():
-            raise TransportError("models response contains an invalid id")
+            raise TransportError("models response contains an invalid id").exception()
         if model != model.strip():
-            raise TransportError("models response contains an id with outer whitespace")
+            raise TransportError("models response contains an id with outer whitespace").exception()
         if len(model) > 256:
             raise TransportError(
                 "models response contains an id longer than 256 characters"
-            )
+            ).exception()
         if model in seen_models:
-            raise TransportError(f"models response contains duplicate id: {model}")
+            raise TransportError(f"models response contains duplicate id: {model}").exception()
         seen_models.add(model)
         result.append(
             DiscoveredModel(
@@ -451,25 +586,27 @@ def _model_config(config: Mapping[str, Any]) -> _ModelConfig:
     )
 
 
+def _json_dumps_bytes(value: object) -> bytes:
+    """与 httpx encode_json 相同的字节格式，供请求体增量拼装复用。"""
+    return json.dumps(
+        value, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+
+
 def _chat_body(
     descriptor: BoundModelDescriptor,
     connection: _ConnectionConfig,
-    model: _ModelConfig,
     request: ModelRequest,
 ) -> dict[str, Any]:
-    messages = _normalize_messages(request.messages)
-    if request.system_prompt and not (messages and messages[0].get("role") == "system"):
-        messages.insert(0, {"role": "system", "content": request.system_prompt})
-    messages = _merge_leading_system_messages(messages)
     body: dict[str, Any] = {
         "model": descriptor.model,
-        "messages": messages,
+        "messages": request.messages,
     }
     if request.max_output_tokens > 0:
         body["max_tokens"] = request.max_output_tokens
     if request.tools:
-        body["tools"] = [_thaw_mapping(item) for item in request.tools]
-        body["tool_choice"] = _thaw(request.tool_choice)
+        body["tools"] = request.tools
+        body["tool_choice"] = request.tool_choice
     if descriptor.reasoning_effort and not request.disable_reasoning:
         body["reasoning_effort"] = descriptor.reasoning_effort
     if request.disable_reasoning:
@@ -487,31 +624,42 @@ async def _request_json(
     path: str,
     *,
     body: Mapping[str, Any] | None = None,
+    body_bytes: bytes | None = None,
     http: HttpClient,
 ) -> dict[str, Any]:
     last_error: Exception | None = None
     for attempt in range(connection.max_retries + 1):
         try:
             token = _credential_token(await credential.read())
+            log_timing("model.http.credential")
             client = http.client()
             # 只复用传输连接，不继承旧凭据请求产生的 Cookie。
             client.cookies.clear()
-            response = await client.request(
-                method, path, json=body, headers={"Authorization": f"Bearer {token}"}
-            )
+            if body_bytes is not None:
+                response = await client.request(
+                    method, path, content=body_bytes,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                    },
+                )
+            else:
+                response = await client.request(
+                    method, path, json=body, headers={"Authorization": f"Bearer {token}"}
+                )
             _raise_status(response, secret=token)
             return _json_object(response)
         except asyncio.CancelledError:
             raise
         except Exception as error:
             mapped = _map_error(error)
-            if mapped is error and not isinstance(error, ModelError):
+            if mapped is error and not ModelError.matches(error):
                 raise
             if not _retryable(mapped) or attempt >= connection.max_retries:
                 raise mapped from error
             last_error = mapped
             await asyncio.sleep(min(8.0, float(2**attempt)))
-    raise TransportError("request failed without result") from last_error
+    raise TransportError("request failed without result").exception() from last_error
 
 
 async def _request_limited_json(
@@ -546,7 +694,7 @@ async def _request_limited_json(
         raise
     except Exception as error:
         mapped = _map_error(error)
-        if mapped is error and not isinstance(error, ModelError):
+        if mapped is error and not ModelError.matches(error):
             raise
         raise mapped from error
 
@@ -566,7 +714,7 @@ async def _read_limited_response(
     else:
         raise TransportError(
             f"provider returned unsupported Content-Encoding: {encoding}"
-        )
+        ).exception()
     raw_length = response.headers.get("content-length")
     if raw_length is not None:
         try:
@@ -574,16 +722,16 @@ async def _read_limited_response(
         except ValueError as error:
             raise TransportError(
                 "provider returned an invalid Content-Length"
-            ) from error
+            ).exception() from error
         if content_length < 0 or content_length > max_bytes:
-            raise TransportError(f"provider response exceeds {max_bytes} bytes")
+            raise TransportError(f"provider response exceeds {max_bytes} bytes").exception()
     content = bytearray()
     raw_bytes = 0
     try:
         async for chunk in response.aiter_raw(chunk_size=64 * 1024):
             raw_bytes += len(chunk)
             if raw_bytes > max_bytes:
-                raise TransportError(f"provider response exceeds {max_bytes} bytes")
+                raise TransportError(f"provider response exceeds {max_bytes} bytes").exception()
             if decoder is None:
                 decoded = chunk
             else:
@@ -592,11 +740,11 @@ async def _read_limited_response(
                 if decoder.unconsumed_tail:
                     raise TransportError(
                         f"provider response exceeds {max_bytes} decoded bytes"
-                    )
+                    ).exception()
             if len(content) + len(decoded) > max_bytes:
                 raise TransportError(
                     f"provider response exceeds {max_bytes} decoded bytes"
-                )
+                ).exception()
             content.extend(decoded)
         if decoder is not None:
             remaining = max_bytes - len(content)
@@ -604,19 +752,19 @@ async def _read_limited_response(
             if len(content) + len(decoded) > max_bytes:
                 raise TransportError(
                     f"provider response exceeds {max_bytes} decoded bytes"
-                )
+                ).exception()
             content.extend(decoded)
             if not decoder.eof or decoder.unused_data:
-                raise TransportError("provider returned an invalid gzip response")
+                raise TransportError("provider returned an invalid gzip response").exception()
     except zlib.error as error:
-        raise TransportError("provider returned an invalid gzip response") from error
+        raise TransportError("provider returned an invalid gzip response").exception() from error
     return bytes(content)
 
 
 async def _stream_chat(
     connection: _ConnectionConfig,
     credential: CredentialHandle,
-    body: Mapping[str, Any],
+    body_bytes: bytes,
     on_delta: Callable[[dict[str, str]], Awaitable[None]] | None,
     http: HttpClient,
 ) -> LLMResponse:
@@ -625,13 +773,18 @@ async def _stream_chat(
         response_delta_seen = False
         try:
             token = _credential_token(await credential.read())
+            log_timing("model.http.credential")
             client = http.client()
             # 只复用传输连接，不继承旧凭据请求产生的 Cookie。
             client.cookies.clear()
             async with client.stream(
-                "POST", "/chat/completions", json=body,
-                headers={"Authorization": f"Bearer {token}"},
+                "POST", "/chat/completions", content=body_bytes,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
             ) as response:
+                log_timing("model.http.headers")
                 if response.status_code >= 400:
                     _ = await response.aread()
                 _raise_status(response, secret=token)
@@ -642,15 +795,14 @@ async def _stream_chat(
             raise error.error from error
         except Exception as error:
             mapped = _map_error(error)
-            if mapped is error and not isinstance(error, ModelError):
+            if mapped is error and not ModelError.matches(error):
                 raise
             # 证据以协议层观察为准：on_delta 回调缺席时 provider 仍可能
             # 已吐出部分输出，不能凭"没有预览观察者"主张安全。已进入
             # HTTP 200 流的任何失败都不携带 send_evidence，_retryable
             # 不会授予重发——无论是否观察到 delta。
-            response_delta_seen = bool(getattr(error, "response_delta_seen", False))
-            if response_delta_seen:
-                setattr(mapped, "retryable", False)
+            response_delta_seen = (error.response_delta_seen if isinstance(error, _StreamReadError)
+                                   else (value.response_delta_seen if (value := ModelError.read(error)) is not None else False))
             if (
                 response_delta_seen
                 or not _retryable(mapped)
@@ -659,7 +811,7 @@ async def _stream_chat(
                 raise mapped from error
             last_error = mapped
             await asyncio.sleep(min(8.0, float(2**attempt)))
-    raise TransportError("stream failed without result") from last_error
+    raise TransportError("stream failed without result").exception() from last_error
 
 
 class _StreamReadError(RuntimeError):
@@ -708,9 +860,9 @@ async def _consume_stream(
             try:
                 chunk = json.loads(data)
             except json.JSONDecodeError as error:
-                raise TransportError("stream contains invalid JSON") from error
+                raise TransportError("stream contains invalid JSON").exception() from error
             if not isinstance(chunk, dict):
-                raise TransportError("stream chunk must be an object")
+                raise TransportError("stream chunk must be an object").exception()
             raw_usage = chunk.get("usage")
             if isinstance(raw_usage, Mapping):
                 usage = _usage(raw_usage)
@@ -719,7 +871,7 @@ async def _consume_stream(
                 continue
             choice = choices[0]
             if not isinstance(choice, Mapping):
-                raise TransportError("stream choice must be an object")
+                raise TransportError("stream choice must be an object").exception()
             raw_finish = choice.get("finish_reason")
             if raw_finish is not None:
                 finish_reason = str(raw_finish)
@@ -774,14 +926,14 @@ async def _consume_stream(
     except _CallbackError:
         raise
     except TimeoutError as error:
-        failure = ModelTimeoutError(f"模型流超过 {progress_timeout:g} 秒没有有效进展")
+        failure = ModelTimeoutError(f"模型流超过 {progress_timeout:g} 秒没有有效进展").exception()
         raise _StreamReadError(failure, response_delta_seen=response_delta_seen) from error
     except Exception as error:
         raise _StreamReadError(
             error, response_delta_seen=response_delta_seen
         ) from error
     if not completed:
-        error = TransportError("stream ended before its terminal marker")
+        error = TransportError("stream ended before its terminal marker").exception()
         raise _StreamReadError(error, response_delta_seen=response_delta_seen)
     parsed_content, parsed_thinking = _split_tagged_thinking(
         "".join(content).strip() or None,
@@ -845,29 +997,29 @@ def _parse_chat_response(payload: Mapping[str, Any]) -> LLMResponse:
         or not choices
         or not isinstance(choices[0], Mapping)
     ):
-        raise TransportError("chat response is missing first choice")
+        raise TransportError("chat response is missing first choice").exception()
     choice = cast(Mapping[str, Any], choices[0])
     message = choice.get("message")
     if not isinstance(message, Mapping):
-        raise TransportError("chat response is missing message")
+        raise TransportError("chat response is missing message").exception()
     content = message.get("content")
     if content is not None and not isinstance(content, str):
-        raise TransportError("chat message content must be string or null")
+        raise TransportError("chat message content must be string or null").exception()
     thinking = message.get("reasoning_content")
     if thinking is None:
         thinking = message.get("reasoning")
     if thinking is not None and not isinstance(thinking, str):
-        raise TransportError("chat reasoning content must be string or null")
+        raise TransportError("chat reasoning content must be string or null").exception()
     raw_calls = message.get("tool_calls", [])
     calls: list[ToolCall] = []
     if not isinstance(raw_calls, list):
-        raise TransportError("chat tool_calls must be an array")
+        raise TransportError("chat tool_calls must be an array").exception()
     for raw in raw_calls:
         if not isinstance(raw, Mapping):
-            raise TransportError("chat tool call must be an object")
+            raise TransportError("chat tool call must be an object").exception()
         function = raw.get("function")
         if not isinstance(function, Mapping):
-            raise TransportError("chat tool call is missing function")
+            raise TransportError("chat tool call is missing function").exception()
         calls.append(
             ToolCall(
                 id=_required_string(raw.get("id"), "tool call id"),
@@ -930,31 +1082,31 @@ def _parse_embedding_response(
 ) -> EmbeddingResult:
     raw_data = payload.get("data")
     if not isinstance(raw_data, list) or len(raw_data) != expected_count:
-        raise TransportError("embedding response count does not match input")
+        raise TransportError("embedding response count does not match input").exception()
     ordered: list[tuple[int, tuple[float, ...]]] = []
     for raw in raw_data:
         if not isinstance(raw, Mapping):
-            raise TransportError("embedding item must be an object")
+            raise TransportError("embedding item must be an object").exception()
         index = raw.get("index")
         vector = raw.get("embedding")
         if not isinstance(index, int) or isinstance(index, bool):
-            raise TransportError("embedding index must be an integer")
+            raise TransportError("embedding index must be an integer").exception()
         if not isinstance(vector, list) or not vector:
-            raise TransportError("embedding vector must be non-empty")
+            raise TransportError("embedding vector must be non-empty").exception()
         values: list[float] = []
         for value in vector:
             if not isinstance(value, (int, float)) or isinstance(value, bool):
-                raise TransportError("embedding vector must contain numbers")
+                raise TransportError("embedding vector must contain numbers").exception()
             number = float(value)
             if not math.isfinite(number):
-                raise TransportError("embedding vector must contain finite numbers")
+                raise TransportError("embedding vector must contain finite numbers").exception()
             values.append(number)
         ordered.append((index, tuple(values)))
     if sorted(index for index, _vector in ordered) != list(range(expected_count)):
-        raise TransportError("embedding indexes must cover the input batch exactly")
+        raise TransportError("embedding indexes must cover the input batch exactly").exception()
     ordered.sort(key=lambda item: item[0])
     if len({len(vector) for _index, vector in ordered}) != 1:
-        raise TransportError("服务返回了不一致的向量维度；请联系服务提供方，配置未保存。")
+        raise TransportError("服务返回了不一致的向量维度；请联系服务提供方，配置未保存。").exception()
     raw_usage = payload.get("usage")
     return EmbeddingResult(
         vectors=tuple(vector for _index, vector in ordered),
@@ -967,10 +1119,10 @@ def _merge_tool_deltas(calls: dict[int, dict[str, str]], raw_calls: list[Any]) -
     advanced = False
     for raw in raw_calls:
         if not isinstance(raw, Mapping):
-            raise TransportError("stream tool call delta must be an object")
+            raise TransportError("stream tool call delta must be an object").exception()
         index = raw.get("index")
         if not isinstance(index, int) or isinstance(index, bool) or index < 0:
-            raise TransportError("stream tool call index must be non-negative")
+            raise TransportError("stream tool call index must be non-negative").exception()
         slot = calls.setdefault(index, {"id": "", "name": "", "arguments": ""})
         raw_id = raw.get("id")
         if isinstance(raw_id, str):
@@ -1006,13 +1158,13 @@ def _tool_calls(calls: Mapping[int, Mapping[str, str]]) -> list[ToolCall]:
 
 def _tool_arguments(value: object) -> Mapping[str, Any]:
     if not isinstance(value, str):
-        raise TransportError("tool call arguments must be a JSON string")
+        raise TransportError("tool call arguments must be a JSON string").exception()
     try:
         parsed = json.loads(value)
     except json.JSONDecodeError as error:
-        raise TransportError("tool call arguments are invalid JSON") from error
+        raise TransportError("tool call arguments are invalid JSON").exception() from error
     if not isinstance(parsed, dict):
-        raise TransportError("tool call arguments must decode to an object")
+        raise TransportError("tool call arguments must decode to an object").exception()
     return cast(dict[str, Any], parsed)
 
 
@@ -1048,12 +1200,12 @@ def _usage(raw: Mapping[str, Any]) -> ModelUsage:
     )
     covered = int(input_tokens is not None and output_tokens is not None)
     coverage = (
-        UsageCoverage.EXACT
+        'exact'
         if covered
         else (
-            UsageCoverage.PARTIAL
+            'partial'
             if input_tokens is not None or output_tokens is not None
-            else UsageCoverage.UNAVAILABLE
+            else 'unavailable'
         )
     )
     return ModelUsage(
@@ -1085,12 +1237,12 @@ def _merge_usage(items: Sequence[ModelUsage | None]) -> ModelUsage | None:
     request_count = sum(item.request_count for item in normalized)
     covered = sum(item.covered_request_count for item in normalized)
     coverage = (
-        UsageCoverage.UNAVAILABLE
-        if all(item.coverage is UsageCoverage.UNAVAILABLE for item in normalized)
-        else UsageCoverage.EXACT
+        'unavailable'
+        if all(item.coverage == 'unavailable' for item in normalized)
+        else 'exact'
         if covered == request_count
-        and all(item.coverage is UsageCoverage.EXACT for item in normalized)
-        else UsageCoverage.PARTIAL
+        and all(item.coverage == 'exact' for item in normalized)
+        else 'partial'
     )
     return ModelUsage(
         input_tokens=total("input_tokens"),
@@ -1104,9 +1256,9 @@ def _merge_usage(items: Sequence[ModelUsage | None]) -> ModelUsage | None:
     )
 
 
-def _unsent(error: ModelError) -> ModelError:
+def _unsent(error: Exception) -> Exception:
     """发送前本地校验失败：请求可证明未到达 provider，标记为允许重试的证据。"""
-    error.send_evidence = "unsent"
+    error = ModelError.change(error, send_evidence="unsent")
     return error
 
 
@@ -1117,64 +1269,64 @@ def _raise_status(response: httpx.Response, *, secret: str) -> None:
     # 4xx 是对本请求的明确拒绝应答——正面证据。5xx 只说明服务端/网关
     # 未能给出结论，不能证明后端未接收或未处理：不授证据，fail-closed。
     if response.status_code < 500:
-        error.send_evidence = "rejected"
+        error = ModelError.change(error, send_evidence="rejected")
     raise error
 
 
-def _status_error(response: httpx.Response, *, secret: str) -> ModelError | None:
+def _status_error(response: httpx.Response, *, secret: str) -> Exception | None:
     if response.status_code < 400:
         return None
-    message = _redact_secret(_response_error_message(response), secret)
+    message = _response_error_message(response, secret=secret)
     lowered = message.lower()
     if response.status_code in {401, 403}:
         return AuthenticationError(
             f"模型连接授权未通过（HTTP {response.status_code}）。"
             f"请在模型设置中核对 API Key 或账号权限后重试。服务返回：{message}"
-        )
+        ).exception()
     if response.status_code >= 500:
         # status-first：5xx 只说明服务端/网关未给出结论，正文诊断文案
         # （context_length 等）不得把错误提升为可证明的容量拒绝。
-        return TransportError(f"模型服务暂不可用（HTTP {response.status_code}），请稍后重试。服务返回：{message}")
+        error = TransportError(f"模型服务暂不可用（HTTP {response.status_code}），请稍后重试。服务返回：{message}").exception()
+        if response.status_code == 503:
+            # 503 与 429 一样可能带 Retry-After；固定为绝对允许时间，由 Models 可取消地遵守。
+            error = ModelError.change(error, retry_at=retry_after_time(response.headers.get("retry-after")))
+        return error
     if any(code in lowered for code in _CONTEXT_CODES):
-        return ContextLengthError(message)
+        return ContextLengthError(f"模型上下文超过限制（HTTP {response.status_code}）。服务返回：{message}").exception()
     if any(code in lowered for code in _SAFETY_CODES):
-        return ContentSafetyError(message)
+        return ContentSafetyError(f"模型安全策略拒绝请求（HTTP {response.status_code}）。服务返回：{message}").exception()
     if response.status_code == 402 or (
         response.status_code == 429
         and any(value in lowered for value in ("quota", "usage limit", "credit"))
     ):
-        return QuotaError(message)
+        return QuotaError(f"模型账号额度不足（HTTP {response.status_code}）。服务返回：{message}").exception()
     if response.status_code == 429:
-        error = RateLimitError(message)
+        error = RateLimitError(f"模型服务限流（HTTP 429）。服务返回：{message}").exception()
         # Retry-After 必须随错误传给 Models，由独占重试预算决定何时再付。
-        retry_after = response.headers.get("retry-after")
-        if retry_after is not None:
-            try:
-                setattr(error, "retry_after", max(0.0, float(retry_after)))
-            except ValueError:
-                pass
+        error = ModelError.change(error, retry_at=retry_after_time(response.headers.get("retry-after")))
         return error
     if 400 <= response.status_code < 500:
         return InvalidRequestError(
-            f"provider rejected the request with HTTP {response.status_code}: {message}"
-        )
-    error = TransportError(f"provider returned HTTP {response.status_code}: {message}")
+            f"模型服务拒绝请求（HTTP {response.status_code}）。服务返回：{message}"
+        ).exception()
+    error = TransportError(f"provider returned HTTP {response.status_code}: {message}").exception()
     return error
 
 
-def _response_error_message(response: httpx.Response) -> str:
+def _response_error_message(response: httpx.Response, *, secret: str = "") -> str:
     try:
         payload = response.json()
     except (json.JSONDecodeError, UnicodeDecodeError):
-        return f"HTTP {response.status_code}"
+        return _redact_secret(response.text, secret)[:500] or f"HTTP {response.status_code}"
     if isinstance(payload, Mapping):
-        raw = payload.get("error")
+        raw = payload.get("error", payload.get("detail", payload))
         if isinstance(raw, Mapping):
-            message = raw.get("message") or raw.get("code")
-            if isinstance(message, str) and message:
-                return message[:500]
+            message, code = raw.get("message"), raw.get("code")
+            details = [value for value in (code, message) if isinstance(value, str) and value]
+            if details:
+                return _redact_secret(": ".join(dict.fromkeys(details)), secret)[:500]
         if isinstance(raw, str) and raw:
-            return raw[:500]
+            return _redact_secret(raw, secret)[:500]
     return f"HTTP {response.status_code}"
 
 
@@ -1185,43 +1337,34 @@ def _redact_secret(message: str, secret: str) -> str:
 
 
 def _map_error(error: Exception) -> Exception:
-    if isinstance(
-        error,
-        (
-            AuthenticationError,
-            ContentSafetyError,
-            ContextLengthError,
-            InvalidRequestError,
-            ModelTimeoutError,
-            QuotaError,
-            RateLimitError,
-            TransportError,
-        ),
-    ):
+    if ModelError.matches(error, AuthenticationError, ContentSafetyError, ContextLengthError, InvalidRequestError, ModelTimeoutError, QuotaError, RateLimitError, TransportError):
         return error
     if isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout)):
         # 连接建立失败可证明请求未发出：这是允许重试的正面证据。
-        mapped = TransportError(f"model transport failed: {type(error).__name__}")
-        mapped.send_evidence = "unsent"
-        setattr(mapped, "retry_safe", True)
+        mapped = TransportError(describe_transport_error(error)).exception()
+        mapped = ModelError.change(mapped, send_evidence="unsent")
+        mapped = ModelError.change(mapped, retry_safe=True)
         return mapped
     if isinstance(error, (httpx.TimeoutException, TimeoutError)):
-        return ModelTimeoutError("model request timed out")
+        return ModelTimeoutError(describe_transport_error(error)).exception()
     if isinstance(error, httpx.TransportError):
         # 请求发出后的读/写失败不携带任何安全证据。
-        return TransportError(f"model transport failed: {type(error).__name__}")
+        return TransportError(describe_transport_error(error)).exception()
     if isinstance(error, _StreamReadError):
         # 已进入 HTTP 200 流：无论是否观察到 delta，远端效果都不可证。
         mapped = _map_error(error.error)
-        setattr(mapped, "response_delta_seen", error.response_delta_seen)
+        if ModelError.matches(mapped):
+            mapped = ModelError.change(mapped, response_delta_seen=error.response_delta_seen, send_evidence=None)
+        else:
+            setattr(mapped, "response_delta_seen", error.response_delta_seen)
         return mapped
     return error
 
 
 def _retryable(error: Exception) -> bool:
-    return getattr(error, "send_evidence", None) in ("rejected", "unsent") and (
-        isinstance(error, (ModelTimeoutError, RateLimitError))
-        or bool(getattr(error, "retry_safe", False))
+    value = ModelError.read(error)
+    return value is not None and value.send_evidence in ("rejected", "unsent") and (
+        isinstance(value, (ModelTimeoutError, RateLimitError)) or value.retry_safe
     )
 
 
@@ -1229,9 +1372,9 @@ def _json_object(response: httpx.Response) -> dict[str, Any]:
     try:
         payload = response.json()
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
-        raise TransportError("provider response is not valid JSON") from error
+        raise TransportError("provider response is not valid JSON").exception() from error
     if not isinstance(payload, dict):
-        raise TransportError("provider response must be a JSON object")
+        raise TransportError("provider response must be a JSON object").exception()
     return cast(dict[str, Any], payload)
 
 
@@ -1239,9 +1382,9 @@ def _json_bytes_object(content: bytes) -> dict[str, Any]:
     try:
         payload = json.loads(content)
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
-        raise TransportError("provider response is not valid JSON") from error
+        raise TransportError("provider response is not valid JSON").exception() from error
     if not isinstance(payload, dict):
-        raise TransportError("provider response must be a JSON object")
+        raise TransportError("provider response must be a JSON object").exception()
     return cast(dict[str, Any], payload)
 
 
@@ -1250,7 +1393,7 @@ def _credential_token(payload: Mapping[str, str]) -> str:
         payload.get("access_token") or payload.get("api_key") or payload.get("token")
     )
     if not token or not token.strip():
-        raise AuthenticationError("credential does not contain an API token")
+        raise AuthenticationError("credential does not contain an API token").exception()
     return token.strip()
 
 
@@ -1259,9 +1402,9 @@ def _check_credential_scope(
     credential: CredentialHandle,
 ) -> None:
     if credential.connection_id != descriptor.connection_id:
-        raise AuthenticationError("credential connection scope does not match")
+        raise AuthenticationError("credential connection scope does not match").exception()
     if credential.auth_identity != descriptor.auth_identity:
-        raise AuthenticationError("credential auth identity does not match")
+        raise AuthenticationError("credential auth identity does not match").exception()
 
 
 def _check_bound_model(
@@ -1292,152 +1435,52 @@ def _normalize_base_url(value: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
 
 
-def _estimate_context_tokens(
-    system_prompt: str,
-    messages: Sequence[Mapping[str, Any]],
-    tools: Sequence[Mapping[str, Any]],
-) -> int:
-    complete = list(messages)
-    if system_prompt and not (complete and complete[0].get("role") == "system"):
-        complete.insert(0, {"role": "system", "content": system_prompt})
-    fixed_chars = len(
-        json.dumps(tools, ensure_ascii=False, separators=(",", ":"), default=dict)
-    )
-    return max(1, fixed_chars // 3 + _estimate_message_tokens(complete))
-
-
-def _normalize_messages(
-    messages: Sequence[Mapping[str, Any]],
-) -> list[dict[str, Any]]:
-    """Match the established generic Chat Completions message contract."""
-
-    normalized: list[dict[str, Any]] = []
-    images: list[dict[str, Any]] = []
-    pending_calls: set[str] = set()
-    for message in messages:
-        item = _thaw_mapping(message)
-        item.pop("reasoning_content", None)
-        role = str(item.get("role") or "")
-        content = item.get("content")
-        # Chat Completions 的 assistant/tool content 不接受 image_url。
-        # 只在请求视图中将图片放到配对完成后的 user 数据消息，保持 call/result 邻接。
-        if role in {"assistant", "tool"} and isinstance(content, list):
-            pictures = [block for block in content if block.get("type") == "image_url"]
-            if pictures:
-                label = (
-                    f"工具结果 {item['tool_call_id']} 的图片"
-                    if role == "tool" else "Agent 输出消息中的图片"
-                )
-                images.append({"type": "text", "text": label})
-                images.extend(pictures)
-                content = [block for block in content if block.get("type") != "image_url"]
-                if not content:
-                    content = [{"type": "text", "text": "图片见本组消息后的图像内容。"}]
-                item["content"] = content
-        if role == "assistant" and item.get("tool_calls"):
-            if images and pending_calls:
-                raise InvalidRequestError("图片所在工具请求尚未完成配对")
-            pending_calls = {call["id"] for call in item["tool_calls"]}
-        elif role == "tool":
-            pending_calls.discard(item["tool_call_id"])
-        if role == "assistant" and item.get("tool_calls"):
-            if content is None or (isinstance(content, str) and not content.strip()):
-                calls = item.get("tool_calls")
-                first = calls[0] if isinstance(calls, list) and calls else {}
-                function = first.get("function") if isinstance(first, dict) else {}
-                tool_name = (
-                    str(function.get("name") or "")
-                    if isinstance(function, dict)
-                    else ""
-                )
-                item["content"] = f"调用工具 {tool_name}" if tool_name else "调用工具"
-        elif role in {"user", "assistant", "tool"} and content is None:
-            item["content"] = ""
-        normalized.append(item)
-        if images and not pending_calls:
-            normalized.append({"role": "user", "content": images})
-            images = []
-    if images:
-        raise InvalidRequestError("图片所在工具请求缺少结果，不能重排为有效历史")
-    return normalized
-
-
-def _merge_leading_system_messages(
-    messages: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    system_contents: list[str] = []
-    index = 0
-    while index < len(messages) and messages[index].get("role") == "system":
-        content = messages[index].get("content")
-        if isinstance(content, str) and content:
-            system_contents.append(content)
-        index += 1
-    result = (
-        [{"role": "system", "content": "\n\n".join(system_contents)}]
-        if system_contents
-        else []
-    )
-    # 这些行由 _normalize_messages 新建；合并头部无需再次复制整份正文。
-    result.extend(messages[index:])
-    return result if result else messages
-
-
-def _estimate_message_tokens(messages: Sequence[Mapping[str, Any]]) -> int:
-    text_chars = 0
-    image_tokens = 0
-    for message in messages:
-        content = message.get("content")
-        if isinstance(content, Sequence) and not isinstance(content, (str, bytes)):
-            for block in content:
-                if isinstance(block, Mapping) and block.get("type") in {
-                    "image_url",
-                    "input_image",
-                }:
-                    detail = block.get("detail")
-                    image = block.get("image_url")
-                    if isinstance(image, Mapping):
-                        detail = image.get("detail", detail)
-                    image_tokens += 1024 if detail == "low" else 8192
-                    continue
-                text_chars += len(
-                    json.dumps(block, ensure_ascii=False, separators=(",", ":"), default=dict)
-                )
-        elif content is not None:
-            text_chars += len(str(content))
-        text_chars += len(
-            json.dumps(
-                {
-                    key: value
-                    for key, value in message.items()
-                    if key != "content"
-                },
-                ensure_ascii=False,
-                separators=(",", ":"),
-                default=dict,
+def _compile_chat_row(message: Mapping[str, Any], fill_reasoning: bool) -> _ChatRow:
+    """将冻结行编译成协议正文与待发射图片，只在字段改变时复制。"""
+    role = str(message.get("role") or "")
+    content = message.get("content")
+    item: dict[str, Any] | None = None
+    images: tuple[bytes, ...] = ()
+    # 1. assistant/tool 图片只能移到 user 行；每个来源行保留一个标签。
+    if role in {"assistant", "tool"} and isinstance(content, (list, tuple)):
+        pictures = [block for block in content if block.get("type") == "image_url"]
+        if pictures:
+            label = (
+                f"工具结果 {message['tool_call_id']} 的图片"
+                if role == "tool" else "Agent 输出消息中的图片"
             )
-        )
-    if not messages:
-        return 0
-    return max(1, text_chars // 3 + image_tokens)
-
-
-def _thaw_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
-    return {key: _thaw(item) for key, item in value.items()}
-
-
-def _thaw(value: Any) -> Any:
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, Mapping):
-        return {str(key): _thaw(item) for key, item in value.items()}
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return [_thaw(item) for item in value]
-    return value
+            images = tuple(_json_dumps_bytes(block) for block in (
+                {"type": "text", "text": label}, *pictures,
+            ))
+            content = [block for block in content if block.get("type") != "image_url"]
+            if not content:
+                content = [{"type": "text", "text": "图片见本组消息后的图像内容。"}]
+            item = dict(message)
+            item["content"] = content
+    # 2. 空正文兜底与 DeepSeek 补齐共享同一次外层复制。
+    if role == "assistant" and message.get("tool_calls"):
+        if content is None or (isinstance(content, str) and not content.strip()):
+            calls = message.get("tool_calls")
+            first = calls[0] if isinstance(calls, (list, tuple)) and calls else {}
+            function = first.get("function") if isinstance(first, dict) else {}
+            tool_name = str(function.get("name") or "") if isinstance(function, dict) else ""
+            if item is None:
+                item = dict(message)
+            item["content"] = f"调用工具 {tool_name}" if tool_name else "调用工具"
+    elif role in {"user", "assistant", "tool"} and content is None:
+        if item is None:
+            item = dict(message)
+        item["content"] = ""
+    if fill_reasoning and message.get("role") == "assistant" and "reasoning_content" not in message:
+        if item is None:
+            item = dict(message)
+        item["reasoning_content"] = ""
+    return _ChatRow(message, fill_reasoning, _json_dumps_bytes(message if item is None else item), images)
 
 
 def _required_string(value: object, name: str) -> str:
     if not isinstance(value, str) or not value:
-        raise TransportError(f"{name} must be a non-empty string")
+        raise TransportError(f"{name} must be a non-empty string").exception()
     return value
 
 
@@ -1445,7 +1488,7 @@ def _optional_int(value: object) -> int | None:
     if value is None:
         return None
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise TransportError("usage token counts must be non-negative integers")
+        raise TransportError("usage token counts must be non-negative integers").exception()
     return value
 
 

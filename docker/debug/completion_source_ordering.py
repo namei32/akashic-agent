@@ -20,37 +20,60 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from docker.debug import source_reply_boundaries as fixture
-from agent.plugin_composition import CHAT_MODELS, CompositionRoot, PluginRuntime
-from agent.plugin_composition.artifacts import ARTIFACT_READ
-from agent.plugin_composition.archive import PluginArchive
-from agent.plugin_composition.bindings import BINDINGS, Bindings
-from agent.plugin_composition.channels import ChannelInboundMessage
+from agent.plugin_composition import (
+    CompositionRoot,
+    PluginRuntime,
+)
+from plugins.models.contract import CHAT_MODELS
+from plugins.ledger.contract import ARTIFACT_READ
+from plugins.ledger.contract import BINDINGS
+from plugins.ledger.bindings import Bindings
+from plugins.ledger.services import MessageWriters, OwnerState, SessionAdmission
+from plugins.channels.contract import ChannelInboundMessage
 from agent.restart import RESTART_GATE, RestartGate
-from agent.plugin_composition.messages import (
+from plugins.ledger.contract import (
     MESSAGE_CATALOG, MESSAGE_WRITERS, OWNER_STATE, SESSION_ADMISSION,
-    MessageWriters, OwnerState, SessionAdmission,
 )
 from agent.plugin_composition.tasks import TASKS, PluginTasks
-from agent.plugin_contracts import ContentPart, ContentReferences, Control, Input, Output, ToolResult
-from agent.plugin_composition.models import ToolCall as ModelToolCall
+from plugins.ledger.contract import ContentPart, Control, Input, Output, ToolResult
+from plugins.models.contract import ToolCall as ModelToolCall
 from plugins.tools.execution import ToolExecution
 from plugins.tools.api import MessageReply, Result, result_message_id
 from plugins.tools.menu import ToolCallDecode
-from agent.plugin_contracts.content import CONTENT
-from agent.plugin_contracts.delivery import DELIVERY_GUARDED_START as DELIVERY
-from agent.plugin_contracts.reply import REPLY_PROGRAM_V3, REPLY_EXECUTE_V4
-from agent.plugin_contracts.tools import ALL_TOOLS
+from plugins.content.contract import CONTENT
+from plugins.delivery.contract import (
+    DELIVERY_GUARDED_START as DELIVERY,
+)
+from plugins.reply.contract import (
+    REPLY_PROGRAM_V3,
+)
+from plugins.reply_program.contract import (
+    REPLY_EXECUTE_V4,
+)
+from plugins.tools.contract import ALL_TOOLS
 from plugins.commands import plugin as commands_plugin
 from plugins.conversation import plugin as conversation_plugin
 from plugins.reply import plugin as reply_plugin
 from plugins.reply_program import plugin as program_plugin
-from plugins.reply_program import inputs as program_inputs
+from plugins.context.contract import CONTEXT, MATERIALS_V4
+from plugins.models.contract import (
+    MODEL_CALLS, MODEL_CHECKS, MODEL_CONTENT, MODEL_PROJECTION, MODEL_SELECTION,
+)
+from plugins.react.contract import REACT_ORDERED_V2
+from plugins.tools.contract import TOOL_CLEANUP, TOOL_PROGRAM_V2, TOOLS
+from plugins.turn_projection.contract import TURN_PROJECTION
 from plugins.sources import plugin as sources_plugin
-from agent.plugin_contracts.sources import CHECK_ORIGIN, CONVERSATION_COMPLETE_V2, SOURCES_V5
+from plugins.conversation.contract import (
+    CHECK_ORIGIN,
+    CONVERSATION_COMPLETE_V2,
+)
+from plugins.sources.contract import (
+    SOURCES_V5,
+)
 from plugins.sources.session import SourceSession
 from plugins.subagent.request import PROFILE_TOOLS, Request
 from plugins.subagent.runtime import Subagents
-from session.log import MessageLog, MessageWriter, OwnerStore
+from plugins.ledger.log import MessageLog, MessageWriter
 
 
 class LocalDelivery(fixture.LocalDelivery):
@@ -72,7 +95,7 @@ async def check(directory: Path, stage: str, control: bool, *, boundary_source: 
     reached, proceed = asyncio.Event(), asyncio.Event()
     committed, notify = asyncio.Event(), asyncio.Event()
     rejected = asyncio.Event()
-    bindings = Bindings(log, PluginArchive(directory / "archives"), root)
+    bindings = Bindings(log, root.context)
 
     async def hold():
         reached.set()
@@ -92,7 +115,7 @@ async def check(directory: Path, stage: str, control: bool, *, boundary_source: 
         binding_id="local-model", plugin_snapshot_id="scenario", model_revision=0,
         model_id="local-model", connection_id="local", driver_id="local",
         driver_contract_version="1", auth_identity="none", model="local", role="agent",
-        reasoning_effort=None, capabilities=fixture.ModelCapabilities(context_window=10000),
+        reasoning_effort=None, capabilities=fixture.ModelCapabilities(context_window=10000, max_output_tokens=100),
         capability_sources=fixture.CapabilitySources(), capability_digest="scenario",
     )
     bound = fixture._BoundChat(descriptor, Driver(), models)
@@ -181,16 +204,16 @@ async def check(directory: Path, stage: str, control: bool, *, boundary_source: 
             (DELIVERY, LocalDelivery()), (BINDINGS, bindings), (ARTIFACT_READ, object()),
             (RESTART_GATE, RestartGate(boot_id="scenario", supervised=False)),
             (CHAT_MODELS, Models()), (ALL_TOOLS, lambda: fixture.EmptyTools()),
-            (program_inputs.CONTEXT, fixture.ContextBuilder()),
-            (program_inputs.MATERIALS, Materials()), (program_inputs.MODEL_CALLS, models.read_call),
-            (program_inputs.MODEL_CHECKS, fixture.MessageChecksOwner()),
-            (program_inputs.MODEL_CONTENT, fixture.ContentOwner()),
-            (program_inputs.MODEL_PROJECTION, fixture.ProjectionOwner()),
-            (program_inputs.MODEL_SELECTION, fixture.SelectionOwner()),
-            (program_inputs.REACT, fixture.react), (program_inputs.TOOL_CLEANUP, fixture.cleanup),
-            (program_inputs.TOOL_PROGRAM, Menu() if stage in {"tool", "tool-success", "tool-finished"} else fixture.EmptyTools()),
-            (program_inputs.TOOLS, fixture.EmptyTools()),
-            (program_inputs.TURN_PROJECTION, fixture.TurnProjection()),
+            (CONTEXT, fixture.ContextBuilder()),
+            (MATERIALS_V4, Materials()), (MODEL_CALLS, models.read_call),
+            (MODEL_CHECKS, fixture.MessageChecksOwner()),
+            (MODEL_CONTENT, fixture.ContentOwner()),
+            (MODEL_PROJECTION, fixture.ProjectionOwner()),
+            (MODEL_SELECTION, fixture.SelectionOwner()),
+            (REACT_ORDERED_V2, fixture.react), (TOOL_CLEANUP, fixture.cleanup),
+            (TOOL_PROGRAM_V2, Menu() if stage in {"tool", "tool-success", "tool-finished"} else fixture.EmptyTools()),
+            (TOOLS, fixture.EmptyTools()),
+            (TURN_PROJECTION, fixture.TurnProjection()),
         ):
             await ctx.provide(key, value)
         tool_tasks = tasks.open(ctx)
@@ -241,14 +264,6 @@ async def check(directory: Path, stage: str, control: bool, *, boundary_source: 
     if boundary_source == "report":
         writer(Input, request.session_id).append("report-original", Input(()))
     originals = tuple(message for session in ("parent", request.session_id) for message in log.reader(session).snapshot())
-    original_transact = OwnerStore.transact_async
-
-    async def transact(store, callback, **kwargs):
-        # Pause before the real generation-claim transaction acquires SQL ownership.
-        if stage == "claim" and callback.__name__ == "advance":
-            await hold()
-        return await original_transact(store, callback, **kwargs)
-
     original_complete = SourceSession.complete
 
     async def observe_complete(session, program):
@@ -269,7 +284,7 @@ async def check(directory: Path, stage: str, control: bool, *, boundary_source: 
 
     announce_job = accepting = None
     try:
-        with patch.object(OwnerStore, "transact_async", transact), patch.object(SourceSession, "complete", observe_complete):
+        with patch.object(SourceSession, "complete", observe_complete):
             announce_job = asyncio.create_task(announce())
             if stage in {"success", "tool-success"}:
                 assert await announce_job is True
@@ -323,11 +338,11 @@ async def check(directory: Path, stage: str, control: bool, *, boundary_source: 
                 await asyncio.wait_for(rejected.wait(), 3)
                 assert len(calls) == int(stage in {"output", "tool", "tool-finished"})
                 assert len(effects) == int(stage == "tool-finished")
+                # ADR-0100：默认消息调用不写 Tools 阶段回执，ToolCall/ToolResult 即事实。
+                if stage in {"tool", "tool-finished"}:
+                    assert not list(tool_state.list())
                 if stage == "tool-finished":
-                    assert [row.value["phase"] for _, row in tool_state.list()] == ["done"]
                     assert any(isinstance(m.body, ToolResult) and m.body.outcome == "success" for m in log.reader("parent").snapshot())
-                if stage == "tool":
-                    assert [row.value["phase"] for _, row in tool_state.list()] == ["prepared"]
                 assert not any(m.source == request.session_id and isinstance(m.body, Output)
                                and m.body.finish != "continue" for m in log.reader("parent").snapshot())
                 announce_job.cancel()
@@ -359,15 +374,14 @@ async def check(directory: Path, stage: str, control: bool, *, boundary_source: 
 
 async def main(directory):
     results = []
-    for stage, control in [("success", False), ("tool-success", False), *((stage, control) for stage in ("entry", "claim", "tool", "tool-finished", "output") for control in (False, True))]:
+    for stage, control in [("success", False), ("tool-success", False), *((stage, control) for stage in ("entry", "tool", "tool-finished", "output") for control in (False, True))]:
         path = directory / f"{stage}-{control}"
         path.mkdir()
         results.append(await check(path, stage, control))
-    for stage in ("claim", "output"):
-        for control in (False, True):
-            path = directory / f"report-{stage}-{control}"
-            path.mkdir()
-            results.append(await check(path, stage, control, boundary_source="report"))
+    for control in (False, True):
+        path = directory / f"report-output-{control}"
+        path.mkdir()
+        results.append(await check(path, "output", control, boundary_source="report"))
     return results
 
 

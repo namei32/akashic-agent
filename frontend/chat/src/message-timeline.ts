@@ -1,3 +1,5 @@
+import { toolDataText } from "./message-rendering-policy";
+
 export interface TimelineAttachment {
   artifact_id: string;
   kind: "file" | "image";
@@ -11,8 +13,10 @@ export type TimelinePart =
   | { kind: "text" | "artifact_ref" | "reply_ref"; value: string }
   | { kind: "tool_call"; binding_id: string; name: string; arguments: Record<string, unknown> }
   | { kind: "model.facts"; value: { call_record_id: string; thinking: string | null } }
+  | { kind: "context.notice"; value: { text: string } }
   | { kind: "history.provenance" | "history.transcript" | "history.record" | "history.turn_input"; archive: unknown }
-  | { kind: string; display: "unavailable" };
+  | { kind: string; display: "unavailable" }
+  | { kind: string; display: "data"; value: unknown; rendered?: unknown };
 
 export type TimelineBody =
   | { kind: "input"; parts: TimelinePart[] }
@@ -39,12 +43,25 @@ export interface TimelineReply {
   preview: string;
 }
 
+/** 重试中的尝试进度：服务端时间戳为 Unix 秒，前端自己计时。 */
+export interface ModelAttempt {
+  attempt: number;
+  limit: number | null;
+  failing_since: number;
+  last_failure: string;
+  detail: string;
+  next_attempt_at: number | null;
+}
+
 export interface ReplyActivity {
   session_id: string;
   source: string;
   handle: string;
   active: boolean;
-  preview: { message_id: string; text: string; thinking: string; call_record_id?: string | null; truncated?: boolean } | null;
+  preview: { message_id: string; text: string; thinking: string; call_record_id?: string | null; retry_status?: string;
+    attempt?: ModelAttempt | null; truncated?: boolean;
+    /** 本次尝试的首字耗时（毫秒），服务端在首段增量时给出；未出字时为空。 */
+    first_token_ms?: number | null } | null;
 }
 
 export type MessageLogFrame =
@@ -91,6 +108,10 @@ export function readMessageLogFrame(value: unknown): MessageLogFrame | null {
       handles.add(item.handle);
       if (item.preview !== null) {
         const preview = object(item.preview);
+        if (preview?.retry_status !== undefined && typeof preview.retry_status !== "string") throw new Error("模型重试状态无效");
+        if (preview?.attempt !== undefined && preview.attempt !== null && !validAttempt(preview.attempt)) throw new Error("模型尝试进度无效");
+        if (preview?.first_token_ms !== undefined && preview.first_token_ms !== null
+          && !(typeof preview.first_token_ms === "number" && Number.isFinite(preview.first_token_ms) && preview.first_token_ms >= 0)) throw new Error("首字耗时无效");
         if (!item.active || !preview || !nonempty(preview.message_id) || typeof preview.text !== "string"
           || typeof preview.thinking !== "string" || (preview.call_record_id !== undefined && preview.call_record_id !== null && !nonempty(preview.call_record_id)) || (preview.truncated !== undefined && typeof preview.truncated !== "boolean") || previews.has(preview.message_id)) throw new Error("回复草稿无效");
         previews.add(preview.message_id);
@@ -98,6 +119,15 @@ export function readMessageLogFrame(value: unknown): MessageLogFrame | null {
     }
   }
   return frame as unknown as MessageLogFrame;
+}
+
+function validAttempt(value: unknown): boolean {
+  const item = object(value);
+  if (!item) return false;
+  const finite = (field: unknown) => typeof field === "number" && Number.isFinite(field);
+  return integer(item.attempt) && (item.limit === null || integer(item.limit))
+    && finite(item.failing_since) && (item.next_attempt_at === null || finite(item.next_attempt_at))
+    && typeof item.last_failure === "string" && typeof item.detail === "string";
 }
 
 /** 在 HTTP/桥接入口一次校验，组件只读取已验证的展示数据。 */
@@ -129,6 +159,9 @@ export function readTimelineMessage(value: unknown): TimelineMessage {
       if (!ref || !nonempty(ref.message_id) || !integer(ref.part_index)
         || !["success", "denied", "error", "interrupted"].includes(String(body.outcome))) throw new Error("工具结果引用或状态无效");
     }
+    if (body.kind !== "tool_result" && body.parts.some((part) => object(part)?.display === "data")) {
+      throw new Error("通用工具数据只能出现在工具结果中");
+    }
     // 2. 附件引用必须能从本行元数据解析，不猜存储路径。
     const ids = new Set(row.attachments.map((item) => (item as TimelineAttachment).artifact_id));
     if (body.parts.some((part) => object(part)?.kind === "artifact_ref" && !ids.has(object(part)?.value as string))) {
@@ -150,7 +183,7 @@ export function mergeTimelineMessages(current: TimelineMessage[], incoming: Time
     if (prior) {
       const { metadata: before, ...oldFacts } = prior;
       const { metadata: after, ...newFacts } = row;
-      if (JSON.stringify(oldFacts) !== JSON.stringify(newFacts) || JSON.stringify(before) !== JSON.stringify(after)) {
+      if (JSON.stringify(messageFacts(oldFacts)) !== JSON.stringify(messageFacts(newFacts)) || JSON.stringify(before) !== JSON.stringify(after)) {
         throw new Error("历史消息正文发生变化");
       }
     }
@@ -160,9 +193,36 @@ export function mergeTimelineMessages(current: TimelineMessage[], incoming: Time
   return [...byId.values()].sort((left, right) => left.seq - right.seq);
 }
 
+/** 引用展示可以随可用性刷新；原内容、身份与顺序仍必须一致。 */
+function messageFacts(message: Omit<TimelineMessage, "metadata">) {
+  if (message.body.kind !== "tool_result") return message;
+  return { ...message, body: { ...message.body, parts: message.body.parts.map((part) => {
+    if (!("display" in part) || part.display !== "data") return part;
+    const { rendered, ...facts } = part;
+    return facts;
+  }) } };
+}
+
 export function timelineText(message: TimelineMessage): string {
+  if (message.body.kind === "tool_result") return toolResultValues(message).map(toolDataText).join("\n");
   return message.body.kind === "control" ? message.body.reason ?? "" : message.body.parts
-    .flatMap((part) => !("display" in part) && part.kind === "text" ? [part.value] : []).join("\n");
+    .flatMap((part) => !("display" in part) && part.kind === "text" ? [part.value]
+      : !("display" in part) && part.kind === "context.notice" ? [part.value.text] : []).join("\n");
+}
+
+/** 工具数据只交给通用结果视图，不把结构化内容伪装成聊天正文。 */
+export function timelineToolOutput(message: TimelineMessage): unknown {
+  if (message.body.kind !== "tool_result") return undefined;
+  const values = toolResultValues(message);
+  return values.length === 1 ? values[0] : values;
+}
+
+function toolResultValues(message: TimelineMessage): unknown[] {
+  if (message.body.kind !== "tool_result") return [];
+  return message.body.parts.flatMap((part): unknown[] => {
+    if ("display" in part) return part.display === "data" ? ["rendered" in part ? part.rendered : part.value] : [];
+    return part.kind === "text" ? [part.value] : [];
+  });
 }
 
 export function timelineReply(message: TimelineMessage): TimelineReply {
@@ -174,6 +234,7 @@ export function timelineReply(message: TimelineMessage): TimelineReply {
 function validPart(value: unknown): boolean {
   const part = object(value);
   if (!part || !nonempty(part.kind)) return false;
+  if (part.display === "data") return "value" in part && part.kind !== "tool_call";
   if (part.display === "unavailable") return !["text", "artifact_ref", "reply_ref", "tool_call", "model.facts"].includes(part.kind);
   switch (part.kind) {
     case "text": return typeof part.value === "string";
@@ -183,6 +244,7 @@ function validPart(value: unknown): boolean {
       const facts = object(part.value);
       return facts !== null && nonempty(facts.call_record_id) && nullableText(facts.thinking);
     }
+    case "context.notice": return nonempty(object(part.value)?.text);
     case "history.provenance": case "history.transcript": case "history.record": case "history.turn_input":
       return "archive" in part;
     default: return false;
@@ -242,7 +304,7 @@ export function historyTranscript(archive: unknown): HistoryTranscriptGroup[] | 
 
 /** 聊天可见性只影响布局，原始 Message、part index 和同步 seq 不变。 */
 export function isTimelinePartVisible(part: TimelinePart): boolean {
-  if ("display" in part) return !["channel.origin", "context.summary", "tool.selection", "model.selection", "command.result", "akasha.recall", "akasha.feedback"].includes(part.kind);
+  if ("display" in part) return part.display === "data" || !["channel.origin", "context.summary", "tool.selection", "model.selection", "command.result", "akasha.recall", "akasha.feedback"].includes(part.kind);
   if ("archive" in part) {
     if (part.kind !== "history.transcript") return false;
     const groups = historyTranscript(part.archive);
@@ -251,6 +313,18 @@ export function isTimelinePartVisible(part: TimelinePart): boolean {
   if (part.kind === "text") return part.value.length > 0;
   if (part.kind === "model.facts") return Boolean(part.value.thinking);
   return true;
+}
+
+// 过程与指针类 part（工具调用、思考、上下文提示、回复引用）不算正文；附件与其它可见 part 都算。
+const PROCESS_PARTS = new Set(["tool_call", "model.facts", "context.notice", "reply_ref"]);
+function hasReplyBody(message: TimelineMessage): boolean {
+  if (message.attachments.length > 0) return true;
+  return message.body.kind !== "control" && message.body.parts.some((part) => !PROCESS_PARTS.has(part.kind) && isTimelinePartVisible(part));
+}
+
+// 工具结果里的图片是给模型看的观察（截图、读图），跟随所属调用；文件附件才是交给用户的回复产物。
+export function timelineDeliversAttachment(message: TimelineMessage): boolean {
+  return message.body.kind === "tool_result" && message.attachments.some((ref) => ref.kind === "file");
 }
 
 export function isTimelineMessageVisible(message: TimelineMessage): boolean {
@@ -330,10 +404,12 @@ export function timelineSourceRefreshTokens(messages: TimelineMessage[], activit
 }
 
 /** 完成或停止展示时，把同来源的过程归到末条输出；不改变 Turn。 */
-export function timelineReplyGroups(messages: TimelineMessage[], activities: ReplyActivity[] = []) {
+export function timelineReplyGroups(messages: TimelineMessage[], activities: ReplyActivity[] = [], replySynced = true) {
   const pending = new Map<string, TimelineMessage[]>();
   const completed = new Map<string, TimelineMessage[]>();
   const hiddenBodies = new Set<string>();
+  // 被附件结果切开的同一回复只在末尾显示一次时间和操作。
+  const joined = new Set<string>();
   for (const message of messages) {
     const key = `${message.session_id}:${message.source}`;
     const body = message.body;
@@ -348,7 +424,8 @@ export function timelineReplyGroups(messages: TimelineMessage[], activities: Rep
         pending.delete(key);
       }
     } else if ((body.kind === "input" && message.author === "user")
-      || (body.kind === "control" && body.action !== "resume")) {
+      || (body.kind === "control" && body.action !== "resume")
+      || timelineDeliversAttachment(message)) {
       const throughSeq = body.kind === "control" ? body.through_seq : message.seq - 1;
       const members = pending.get(key) ?? [];
       const closed = members.filter((item) => item.seq <= throughSeq);
@@ -357,6 +434,13 @@ export function timelineReplyGroups(messages: TimelineMessage[], activities: Rep
         hiddenBodies.delete(ending.id);
         if (closed.length > 1) completed.set(ending.id, closed);
       }
+      if (body.kind === "tool_result") {
+        joined.add(message.id);
+        if (ending?.body.kind === "output" && ending.body.finish === "continue") joined.add(ending.id);
+      }
+      // 停止或暂停收尾、只有过程没有正文的输出：时间挂在紧随其后的"已暂停"上，空白处不再挂一行时间与指向空消息的操作。
+      // 图片、artifact、插件数据都算正文：带着它们的输出照常保留时间与"引用此消息"。
+      if (body.kind === "control" && ending?.body.kind === "output" && !hasReplyBody(ending)) joined.add(ending.id);
       pending.set(key, members.filter((item) => item.seq > throughSeq));
     }
   }
@@ -364,7 +448,57 @@ export function timelineReplyGroups(messages: TimelineMessage[], activities: Rep
   for (const activity of activities) active.set(activity.handle, pending.get(`${activity.session_id}:${activity.source}`) ?? []);
   const moved = new Set([...completed.values()].flatMap((members) => members.slice(0, -1).map((message) => message.id)));
   for (const members of active.values()) for (const message of members) moved.add(message.id);
-  return { completed, active, moved, hiddenBodies };
+  // 附件把正文留在原位；整条图文回复的过程集中在首段上方。
+  const inline = timelineInlineReplies(messages);
+  // 回复状态未同步时，未结束的图文回复不按图文合并（合并会把前段过程折成摘要、文字按正文排），与普通未结束轮次一样逐行显示。
+  const openInline = new Set<string>();
+  if (!replySynced) for (const id of inline.open) {
+    for (const item of inline.leading.get(id) ?? []) { inline.outputs.delete(item.id); openInline.add(item.id); }
+    inline.leading.delete(id);
+  }
+  for (const members of inline.leading.values()) for (const item of members.slice(0, -1)) joined.add(item.id);
+  for (const id of inline.outputs) {
+    completed.delete(id); moved.delete(id); hiddenBodies.delete(id);
+  }
+  for (const [handle, members] of active) active.set(handle, members.filter(item => !inline.outputs.has(item.id)));
+  // 轮次还没结束（末条输出 finish=continue，之后没有输入或控制收尾）的输出：本会话的回复状态还没同步到时按原位显示，
+  // 不能当成已落定的一轮收进摘要。状态同步后，仍在运行的轮次由实时活动接管（moved）；没有活动说明它已不会再继续
+  // （异常中断、没有收尾记录的旧轮次），照常收起并挂上时间与操作。
+  const unsettled = replySynced ? new Set<string>() : new Set([...[...pending.values()].flat().map((message) => message.id), ...openInline]);
+  return { completed, active, moved, hiddenBodies, joined, inline, unsettled };
+}
+
+/** 从已提交消息识别图文回复；不依赖插件是否启用，也不改写消息顺序。 */
+function timelineInlineReplies(messages: TimelineMessage[]) {
+  const pending = new Map<string, { messages: TimelineMessage[]; attachment: boolean }>();
+  const leading = new Map<string, TimelineMessage[]>();
+  const outputs = new Set<string>();
+  // 记录到末尾仍以 finish=continue 结尾、后面没有输入或控制收尾的图文回复（首段 id）。
+  const open = new Set<string>();
+  const save = (key: string, ended = true) => {
+    const reply = pending.get(key);
+    if (reply?.attachment && reply.messages.length) {
+      leading.set(reply.messages[0].id, reply.messages);
+      for (const item of reply.messages) outputs.add(item.id);
+      const last = reply.messages.at(-1)?.body;
+      if (!ended && last?.kind === "output" && last.finish === "continue") open.add(reply.messages[0].id);
+    }
+    pending.delete(key);
+  };
+  for (const message of messages) {
+    const key = timelineSourceKey(message), body = message.body;
+    if (body.kind === "input" || (body.kind === "control" && body.action !== "resume")) save(key);
+    if (body.kind === "output") {
+      const reply = pending.get(key) ?? { messages: [], attachment: false };
+      reply.messages.push(message); pending.set(key, reply);
+      if (body.finish !== "continue") save(key);
+    } else if (timelineDeliversAttachment(message)) {
+      const reply = pending.get(key);
+      if (reply) reply.attachment = true;
+    }
+  }
+  for (const key of [...pending.keys()]) save(key, false);
+  return { leading, outputs, open };
 }
 
 /** 已加载的工具结果在原调用面板中展示；缺少调用的分页仍保留结果行。 */
@@ -376,8 +510,10 @@ export function timelineVisibleMessages(messages: TimelineMessage[], groups = ti
       && !(message.body.kind === "input" && message.author === "user")) return false;
     if (groups.hiddenBodies.has(message.id) && !message.attachments.length && message.body.kind === "output"
       && !message.body.parts.some((part) => part.kind !== "text" && isTimelinePartVisible(part))) return false;
-    if (message.body.kind !== "tool_result" || message.attachments.length) return true;
-    if (message.body.parts.some((part) => isTimelinePartVisible(part) && part.kind !== "text")) return true;
+    if (message.body.kind !== "tool_result" || timelineDeliversAttachment(message)) return true;
+    // 引用自身图片的 artifact_ref 随调用卡片展示，不单独成行。
+    if (message.body.parts.some((part) => isTimelinePartVisible(part) && part.kind !== "text" && part.kind !== "artifact_ref"
+      && !("display" in part && part.display === "data"))) return true;
     const call = byId.get(message.body.call_ref.message_id);
     return call?.body.kind !== "output" || call.body.parts[message.body.call_ref.part_index]?.kind !== "tool_call";
   });

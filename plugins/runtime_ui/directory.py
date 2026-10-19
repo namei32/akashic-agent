@@ -3,10 +3,9 @@ from collections.abc import Mapping
 
 from agent.plugin_composition import Context
 from agent.plugin_composition.model import ServiceKey
-from agent.plugin_composition.rpc import rpc_method_key
-from agent.plugin_composition.runtime_catalog import (
-    RUNTIME_CATALOG, RUNTIME_MCP_DETAIL, RuntimeCatalogUnavailable,
-)
+from plugins.gateway.contract import RpcMethod
+from agent.plugin_composition.runtime_catalog import RUNTIME_CATALOG
+from plugins.mcp.contract import MCP_DETAIL, MCP_SERVERS, McpDetailUnavailable
 
 _METHODS = {
     "documents": "inspection/documents.list",
@@ -22,7 +21,7 @@ class RuntimeDirectory:
         self.read = ctx.entrypoint(self._read)
 
     async def _rpc(self, name: str, values: dict[str, object]) -> dict[str, object]:
-        with self._ctx.borrow(rpc_method_key(name)) as method:
+        with self._ctx.borrow(RpcMethod.key(name)) as method:
             if method is None:
                 return {"unavailable": {
                     "code": "inspection_unavailable", "message": "此目录的检查服务尚未绑定",
@@ -37,8 +36,12 @@ class RuntimeDirectory:
             return await self._rpc(_METHODS[section], values)
         if section == "capabilities":
             catalog = dict(self._ctx.require(RUNTIME_CATALOG)(self._ctx))
-            if "mcp_unavailable" in catalog:
-                return {"unavailable": catalog["mcp_unavailable"]}
+            with self._ctx.borrow(MCP_SERVERS) as servers:
+                if servers is None:
+                    return {"unavailable": {
+                        "code": "mcp_provider_unavailable", "message": "MCP provider 不可用",
+                    }}
+                catalog["mcp_servers"] = servers.catalog()
             skills = await self._rpc("inspection/skills.list", {})
             if "unavailable" in skills:
                 return skills
@@ -50,8 +53,13 @@ class RuntimeDirectory:
             if not isinstance(owner_id, str) or not isinstance(name, str):
                 raise ValueError("MCP 详情需要 owner_id 和 name")
             try:
-                tools = await self._ctx.require(RUNTIME_MCP_DETAIL)(self._ctx, owner_id, name)
-            except RuntimeCatalogUnavailable as error:
+                with self._ctx.borrow(MCP_DETAIL) as detail:
+                    if detail is None:
+                        return {"unavailable": {
+                            "code": "mcp_provider_unavailable", "message": "MCP provider 不可用",
+                        }}
+                    tools = await detail(owner_id, name)
+            except McpDetailUnavailable as error:
                 return {"unavailable": {"code": error.code, "message": str(error)}}
             return {"owner_id": owner_id, "name": name, "tools": tools, "tool_count": len(tools)}
         raise KeyError(section)

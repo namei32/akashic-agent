@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
+import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from functools import partial
@@ -11,38 +13,38 @@ from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from agent.plugin_composition import PROCESSES, Context, ServiceKey
-from agent.plugin_composition.bindings import BINDINGS
-from agent.plugin_composition.messages import MessageReader
-from agent.process_runtime import (
-    DEFAULT_HARD_TIMEOUT_S,
-    DEFAULT_INITIAL_YIELD_TIME_MS,
-    DEFAULT_MAX_OUTPUT_TOKENS,
-    MAX_HARD_TIMEOUT_S,
-    ExecutionCleanupReport,
-    UnknownExecutionError,
-    clamp_initial_yield_time,
-    clamp_write_stdin_yield_time,
-    format_execution_result,
+from plugins.host_execution.contract import PROCESSES
+from agent.plugin_composition import CompositionError, Context
+from plugins.ledger.contract import BINDINGS
+from plugins.ledger.contract import MessageReader
+from plugins.host_execution.contract import (
+    DEFAULT_HARD_TIMEOUT_S, DEFAULT_INITIAL_YIELD_TIME_MS, DEFAULT_MAX_OUTPUT_TOKENS, MAX_HARD_TIMEOUT_S, ExecutionCleanupReport, ExecutionResult, ExecutionState, UnknownExecutionError, clamp_initial_yield_time, clamp_write_stdin_yield_time
 )
-from agent.plugin_composition.shell_runtime import resolve_shell
+from .shell_backend import format_execution_result
 from agent.plugin_composition.tasks import TASKS, Task, TaskAdmission, TaskSlot
-from agent.plugin_contracts import (
+from plugins.ledger.contract import (
     CallRef,
     ContentPart,
     Control,
+    Message,
     Message,
     Output,
     ToolCall,
     json_value,
 )
-from agent.plugin_contracts.tools import (
+from plugins.tools.contract import (
     TOOL_CLEANUP as TOOL_CLEANUP,
 )
 
 from ._tool_boundary import TOOLS, CallSource, ToolRef, ToolResultValue
+from plugins.context.contract import MATERIALS_V4
+from plugins.jobs.contract import JOB_NOTICES, JobOutcome, JobWatch
 from .shell_backend import _log_shell_execution, _shell_env
 from .shell_security import validate_command
+from .working_directory import WorkingDirectories
+
+
+_SETTLE_POLL_S = 1.0
 
 
 class ShellSettings(BaseModel):
@@ -73,12 +75,24 @@ class Command(BaseModel):
     command: str = Field(min_length=1, description="要执行的命令；需要观察长任务时避免等待 EOF 的过滤器。")
     description: str = Field(description="简短说明命令作用。")
     cwd: str | None = Field(default=None, description="可选工作目录，覆盖默认目录。")
-    shell: str | None = Field(default=None, description="shell binary；默认使用当前用户的默认 shell。")
+    shell: str | None = Field(default=None, description="shell binary；默认值见当前命令环境材料。按 Bash 语法编写时显式传入 bash。")
     login: bool = True
     tty: bool = Field(default=False, description="需要交互输入时启用 PTY。")
     yield_time_ms: int = DEFAULT_INITIAL_YIELD_TIME_MS
     max_output_tokens: int = Field(default=DEFAULT_MAX_OUTPUT_TOKENS, ge=0)
     timeout: int = Field(default=DEFAULT_HARD_TIMEOUT_S, ge=1, le=MAX_HARD_TIMEOUT_S)
+    run_in_background: bool = Field(
+        default=False,
+        description=(
+            "后台运行并在结束时回调：命令退出后自动通知当前会话（本轮进行中注入下一步，空闲时唤醒新一轮），"
+            "期间可以继续对话或结束本轮。\n"
+            "任何需要等待结果的事都能变成回调，只要把它写成一条阻塞到完成才退出的命令："
+            "编译、测试、下载、渲染、部署、长脚本；其他 agent 的非交互模式（如 codex exec、devin -p、claude -p）；"
+            "只提供异步接口的服务，写一个轮询到终态再退出的脚本。结果写入文件，通知到达后再读取。\n"
+            "不要在本轮轮询或用 write_stdin 长等待，也不要承诺稍后再看：你不会自己回来，只有回调会唤醒你。"
+            "需要时用 write_stdin 读取输出、task_stop 终止。"
+        ),
+    )
 
 
 class Stdin(BaseModel):
@@ -94,6 +108,12 @@ class Stop(BaseModel):
     execution_id: int
 
 
+class BackgroundTarget(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    session_id: str
+    source: str
+
+
 class PreparedCommand(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     owner_key: str
@@ -107,19 +127,28 @@ class PreparedCommand(BaseModel):
     yield_time_ms: int
     max_output_tokens: int
     timeout: int
+    call_context: dict[str, object] = Field(default_factory=dict)
+    background: BackgroundTarget | None = None
 
 
 class PreparedStdin(Stdin):
     owner_key: str
+    background_owner_key: str | None = None
 
 
 class PreparedStop(Stop):
     owner_key: str
+    background_owner_key: str | None = None
 
 
 def _owner_key(settings: ShellSettings, session_id: str, source: str, abandon_id: str | None = None) -> str:
     key = settings.owner_key or json.dumps((session_id, source), ensure_ascii=False, separators=(",", ":"))
     return key if abandon_id is None else json.dumps((key, "abandon", abandon_id), ensure_ascii=False, separators=(",", ":"))
+
+
+# 后台进程不随回合放弃或回复结束清理；它只按会话来源分区，由 task_stop、超时或宿主停止回收。
+def _background_owner(settings: ShellSettings, session_id: str, source: str) -> str:
+    return json.dumps((_owner_key(settings, session_id, source), "background"), ensure_ascii=False, separators=(",", ":"))
 
 
 def _abandon_before(messages: tuple[Message, ...], source: str, through_seq: int) -> str | None:
@@ -145,16 +174,15 @@ class ShellOwners:
             return await self._ctx.require(PROCESSES).terminate_owner(self._ctx, owner_key)
 
 
-SHELL_OWNERS = ServiceKey[ShellOwners]("shell.owners.v1")
-
-
 class ShellTool:
     idempotent = False
 
-    def __init__(self, ctx: Context, name: Literal["shell", "write_stdin", "task_stop"], settings: ShellSettings):
+    def __init__(self, ctx: Context, name: Literal["shell", "write_stdin", "task_stop"], settings: ShellSettings,
+                 directories: WorkingDirectories | None = None):
         self._ctx = ctx
         self._name = name
         self._settings = settings
+        self._directories = directories
 
     async def prepare(self, arguments: Mapping[str, object], source: CallSource | None = None) -> Mapping[str, object] | str:
         """校验最终命令并固定进程 owner；恢复不重选目录、shell 或默认参数。"""
@@ -165,17 +193,27 @@ class ShellTool:
                 _abandon_before(source.messages, source.messages[-1].source, source.messages[-1].seq),
             )
         )
+        background_owner = None
+        background_source = None
+        if source is not None and self._settings.owner_key is None:
+            latest = source.messages[-1]
+            with self._ctx.borrow(JOB_NOTICES) as notices:
+                background_source = (latest.source if notices is None
+                                     else notices.origin_source(latest.session_id, latest.source))
+            background_owner = _background_owner(self._settings, latest.session_id, background_source)
         raw = json_value(arguments)
         try:
             if self._name == "task_stop":
-                return PreparedStop(**Stop.model_validate(raw).model_dump(), owner_key=owner).model_dump()
+                return PreparedStop(**Stop.model_validate(raw).model_dump(), owner_key=owner,
+                                    background_owner_key=background_owner).model_dump()
             if self._name == "write_stdin":
                 args = Stdin.model_validate(raw)
                 default = 5000 if not args.chars else 250
                 args.yield_time_ms = clamp_write_stdin_yield_time(
                     default if args.yield_time_ms is None else args.yield_time_ms, has_input=bool(args.chars),
                 )
-                return PreparedStdin(**args.model_dump(), owner_key=owner).model_dump()
+                return PreparedStdin(**args.model_dump(), owner_key=owner,
+                                     background_owner_key=background_owner).model_dump()
             command = Command.model_validate(raw)
         except ValidationError as error:
             return str(error)
@@ -183,10 +221,21 @@ class ShellTool:
         if not text:
             return '命令不能为空'
         try:
-            shell = resolve_shell(command.shell)
+            shell = self._ctx.require(PROCESSES).resolve_shell(command.shell)
         except ValueError as error:
             return str(error)
         cwd = command.cwd or self._settings.working_dir or self._settings.restricted_dir
+        if self._directories is not None:
+            session_id = None if source is None else source.messages[-1].session_id
+            if command.cwd is None and self._settings.working_dir is None and session_id is not None:
+                current = self._directories.snapshot(session_id)
+                if current.path is not None:
+                    cwd = current.path
+            try:
+                cwd, _ = await self._directories.resolve_target(session_id, cwd or ".")
+                _ = await self._directories.check_directory(cwd)
+            except ValueError as error:
+                return str(error)
         directory = None if cwd is None else Path(cwd).expanduser().absolute()
         denied = validate_command(
             text, allow_network=self._settings.allow_network,
@@ -195,65 +244,156 @@ class ShellTool:
         )
         if denied:
             return denied
+        background = None
+        if command.run_in_background:
+            if background_owner is None or background_source is None or source is None:
+                return '当前调用上下文不支持后台运行'
+            with self._ctx.borrow(JOB_NOTICES) as notices:
+                if notices is None:
+                    return '后台运行需要启用 jobs 插件'
+            owner = background_owner
+            background = BackgroundTarget(session_id=source.messages[-1].session_id, source=background_source)
         return PreparedCommand(
-            owner_key=owner, command=text, description=command.description,
+            background=background, owner_key=owner, command=text, description=command.description,
             argv=shell.derive_argv(text, login=command.login), shell_kind=shell.kind.value,
             login=command.login, cwd=None if directory is None else str(directory), tty=command.tty,
             yield_time_ms=clamp_initial_yield_time(command.yield_time_ms),
             max_output_tokens=command.max_output_tokens, timeout=command.timeout,
+            call_context={} if source is None else {
+                "session_id": source.messages[-1].session_id,
+                "call_message_id": source.call_ref.message_id,
+                "call_part_index": source.call_ref.part_index,
+                "boot_id": os.environ.get("AKASHIC_BOOT_ID", ""),
+            },
         ).model_dump()
 
     async def invoke(self, key: str, arguments: Mapping[str, object]) -> ToolResultValue:
         """执行与续接只访问同一个物理进程 owner，失败不伪装为成功。"""
-        processes = self._ctx.require(PROCESSES)
         raw = json_value(arguments)
-        command_text: str | None = None
         if self._name == "task_stop":
-            stop = PreparedStop.model_validate(raw)
-            stopped = await processes.terminate_execution(self._ctx, stop.owner_key, stop.execution_id)
-            return ToolResultValue("success" if stopped else "error", (ContentPart("text", json.dumps({
-                "execution_id": stop.execution_id, **({"process_status": "stopped"} if stopped else {}),
-                "status": "stopped" if stopped else "not_found",
-            })),))
+            return await self._stop(PreparedStop.model_validate(raw))
         if self._name == "write_stdin":
-            stdin = PreparedStdin.model_validate(raw)
-            assert stdin.yield_time_ms is not None
+            return await self._continue(PreparedStdin.model_validate(raw))
+        return await self._execute(key, PreparedCommand.model_validate(raw))
+
+    # 回合分区找不到时再查后台分区；唤醒只继承本会话原来源的后台分区。
+    async def _stop(self, stop: PreparedStop) -> ToolResultValue:
+        processes = self._ctx.require(PROCESSES)
+        stopped = await processes.terminate_execution(self._ctx, stop.owner_key, stop.execution_id)
+        if not stopped and stop.background_owner_key is not None:
+            stopped = await processes.terminate_execution(self._ctx, stop.background_owner_key, stop.execution_id)
+        return ToolResultValue("success" if stopped else "error", (ContentPart("text", json.dumps({
+            "execution_id": stop.execution_id, **({"process_status": "stopped"} if stopped else {}),
+            "status": "stopped" if stopped else "not_found",
+        })),))
+
+    async def _continue(self, stdin: PreparedStdin) -> ToolResultValue:
+        processes = self._ctx.require(PROCESSES)
+        assert stdin.yield_time_ms is not None
+        error: UnknownExecutionError | None = None
+        for owner in (stdin.owner_key, stdin.background_owner_key):
+            if owner is None:
+                continue
             try:
-                result = await processes.write_stdin(
-                    self._ctx, stdin.owner_key, execution_id=stdin.execution_id, chars=stdin.chars,
+                return _result(await processes.write_stdin(
+                    self._ctx, owner, execution_id=stdin.execution_id, chars=stdin.chars,
                     yield_time_ms=stdin.yield_time_ms, max_output_tokens=stdin.max_output_tokens,
-                )
-            except UnknownExecutionError as error:
-                return ToolResultValue("error", (ContentPart("text", str(error)),))
-        else:
-            command = PreparedCommand.model_validate(raw)
-            command_text = command.command
-            log = partial(
-                _log_shell_execution, operation_id=key, description=command.description,
-                command_fp=hashlib.sha256(command.command.encode()).hexdigest()[:16],
-                command_bytes=len(command.command.encode()), cwd=command.cwd or "",
-                shell_kind=command.shell_kind, login=command.login, tty=command.tty, session=command.owner_key,
-            )
-            log("shell.execution_admitted")
-            result = await processes.exec_command(
-                self._ctx, command.owner_key, command=command.command, argv=command.argv,
-                cwd=None if command.cwd is None else Path(command.cwd), env=_shell_env(), tty=command.tty,
-                yield_time_ms=command.yield_time_ms, max_output_tokens=command.max_output_tokens,
-                hard_timeout_s=command.timeout,
-            )
-            log("shell.execution_result", result=result)
-        outcome = "success" if result.execution_id is not None or result.exit_code == 0 else "error"
-        return ToolResultValue(outcome, (ContentPart("text", format_execution_result(result, command=command_text)),))
+                ), None)
+            except UnknownExecutionError as caught:
+                error = caught
+        assert error is not None
+        return ToolResultValue("error", (ContentPart("text", str(error)),))
+
+    async def _execute(self, key: str, command: PreparedCommand) -> ToolResultValue:
+        processes = self._ctx.require(PROCESSES)
+        log = partial(
+            _log_shell_execution, operation_id=key, description=command.description,
+            command_fp=hashlib.sha256(command.command.encode()).hexdigest()[:16],
+            command_bytes=len(command.command.encode()), cwd=command.cwd or "",
+            shell_kind=command.shell_kind, login=command.login, tty=command.tty, session=command.owner_key,
+        )
+        log("shell.execution_admitted")
+        env = _shell_env()
+        env["AKASHIC_CALL_CONTEXT"] = json.dumps(command.call_context)
+        started_at_ms = time.time_ns() // 1_000_000
+        result = await processes.exec_command(
+            self._ctx, command.owner_key, command=command.command, argv=command.argv,
+            cwd=None if command.cwd is None else Path(command.cwd), env=env, tty=command.tty,
+            yield_time_ms=command.yield_time_ms, max_output_tokens=command.max_output_tokens,
+            hard_timeout_s=command.timeout,
+            shell_snapshot=command.login and command.shell_kind in {"bash", "zsh"},
+        )
+        log("shell.execution_result", result=result)
+        value = _result(result, command.command)
+        if command.background is None or result.execution_id is None:
+            return value
+        watched = self._watch(command, command.background, result.execution_id, started_at_ms)
+        notice = (
+            f"已转入后台（execution_id={result.execution_id}）。完成时会通知当前会话，不要轮询；"
+            "可以继续处理其他事情，需要时用 write_stdin 读取输出、task_stop 终止。"
+            if watched else "jobs 插件已停用，后台完成将不会通知；需要时用 write_stdin 读取输出。"
+        )
+        return ToolResultValue(value.outcome, (*value.parts, ContentPart("text", notice)))
+
+    # 运行中的后台命令交给 jobs 等待结算；插件缺席时命令照常运行，只是没有完成通知。
+    def _watch(self, command: PreparedCommand, target: BackgroundTarget, execution_id: int, started_at_ms: int) -> bool:
+        with self._ctx.borrow(JOB_NOTICES) as notices:
+            if notices is None:
+                return False
+            notices.watch(JobWatch(
+                session_id=target.session_id, source=target.source, job_id=f"shell-{execution_id}",
+                kind="shell", label=command.description or command.command[:60],
+                collect_hint=f"需要结果时用 write_stdin(execution_id={execution_id}) 读取输出。",
+                settled=partial(_settled, self._ctx, command.owner_key, execution_id),
+                started_at_ms=started_at_ms,
+                stop=partial(_stop_background, self._ctx, command.owner_key, execution_id),
+            ))
+        return True
 
     async def query(self, key: str) -> ToolResultValue | None:
         return None
 
 
-async def register_shell(ctx: Context) -> tuple[ToolRef, ...]:
+def _result(result: ExecutionResult, command: str | None) -> ToolResultValue:
+    outcome = "success" if result.execution_id is not None or result.exit_code == 0 else "error"
+    return ToolResultValue(outcome, (ContentPart("text", format_execution_result(result, command=command)),))
+
+
+def _outcome(state: ExecutionState) -> JobOutcome:
+    detail = f"exit_code={state.exit_code}"
+    if state.finish_reason == "timeout":
+        return JobOutcome("timeout", detail)
+    if state.finish_reason != "natural":
+        return JobOutcome("killed", f"{detail}，{state.finish_reason}")
+    return JobOutcome("completed" if state.exit_code == 0 else "failed", detail)
+
+
+# 用户在界面上停止后台命令；与 task_stop 一样终止进程组，结算由 _settled 照常观察。
+async def _stop_background(ctx: Context, owner_key: str, execution_id: int) -> bool:
+    async with ctx.runtime_scope():
+        return await ctx.require(PROCESSES).terminate_execution(ctx, owner_key, execution_id)
+
+
+# 后台执行退出且无人等待时结算；条目消失说明终态已交给模型或执行已被停止。
+async def _settled(ctx: Context, owner_key: str, execution_id: int) -> JobOutcome | None:
+    while True:
+        try:
+            async with ctx.runtime_scope():
+                states = await ctx.require(PROCESSES).execution_states(ctx, owner_key)
+        except CompositionError:
+            return None
+        state = next((item for item in states if item.execution_id == execution_id), None)
+        if state is None:
+            return None
+        if state.settled:
+            return _outcome(state)
+        await asyncio.sleep(_SETTLE_POLL_S)
+
+
+async def register_shell(ctx: Context, directories: WorkingDirectories | None = None) -> tuple[ToolRef, ...]:
     """配置由 Shell owner 校验，所有操作与作业释放共用此插件身份。"""
     owners = ShellOwners(ctx)
     shell_tasks = ctx.require(TASKS).open(ctx)
-    _ = await ctx.provide(SHELL_OWNERS, owners)
 
     def cleanup_entry(
         reader: MessageReader,
@@ -268,14 +408,29 @@ async def register_shell(ctx: Context) -> tuple[ToolRef, ...]:
         )
 
     _ = await ctx.provide(TOOL_CLEANUP, cleanup_entry)
+
+    async def environment(_snapshot: tuple[Message, ...], _source: str) -> Mapping[str, object]:
+        """请求准备时公开实际默认 shell；安装和归档装配不探测执行环境。"""
+        shell = ctx.require(PROCESSES).resolve_shell()
+        return {"reminders": ({"name": "shell-environment", "priority": 350, "replay": False,
+                               "text": f"默认命令 shell：{shell.path}（{shell.kind.value}）。"
+                               "未指定 shell 参数时使用此环境，命令须遵守该 shell 的语法；"
+                               "需要 Bash 或其他 shell 时显式传入 shell 参数，不要假定默认是 Bash。"},)}
+
+    _ = await ctx.require(MATERIALS_V4).register(
+        ctx, name="shell-environment", kind="context", prepare=environment,
+    )
     definitions: tuple[tuple[Literal["shell", "write_stdin", "task_stop"], type[BaseModel], str], ...] = (
-        ("shell", Command, "执行 shell 命令；返回终态或可供 write_stdin/task_stop 使用的 execution_id。"),
+        ("shell", Command, "执行 shell 命令；返回终态或可供 write_stdin/task_stop 使用的 execution_id。"
+                           "run_in_background=true 时命令结束会回调通知本会话，任何要等待结果的工作都可借此异步完成。"
+                           "前台命令结束时会回收它留下的整个进程组，nohup 或 & 放到后台的进程也会被结束；"
+                           "开发服务器等需要常驻的进程直接用 run_in_background=true 启动，不再需要时用 task_stop 结束。"),
         ("write_stdin", Stdin, "续接命令，等待新增输出或输入 PTY 字符；仅返回上次读取后的新增内容。"),
         ("task_stop", Stop, "确认终止命令的进程组并释放 execution_id。"),
     )
     refs: list[ToolRef] = []
     for name, schema, description in definitions:
-        refs.append(await _register(ctx, name, schema, description))
+        refs.append(await _register(ctx, name, schema, description, directories))
     return tuple(refs)
 
 
@@ -284,13 +439,14 @@ async def _register(
     name: Literal["shell", "write_stdin", "task_stop"],
     schema: type[BaseModel],
     description: str,
+    directories: WorkingDirectories | None,
 ) -> ToolRef:
     def capture(configuration: Mapping[str, object]) -> Mapping[str, object]:
         return ShellSettings.model_validate(json_value(configuration)).model_dump()
 
     @asynccontextmanager
     async def open_tool(state: Mapping[str, object]) -> AsyncGenerator[ShellTool]:
-        yield ShellTool(ctx, name, ShellSettings.model_validate(json_value(state)))
+        yield ShellTool(ctx, name, ShellSettings.model_validate(json_value(state)), directories)
 
     return cast(ToolRef, await ctx.require(TOOLS).register(
         ctx,
@@ -314,7 +470,18 @@ async def shell_cleanup(
             yield
         finally:
             # 1. 放弃后到达的新输入与调用不属于旧程序的清理范围。
-            messages = reader.snapshot()
+            # 调用与放弃判定只涉及 from_seq 起的前缀；更早历史只贡献最后一个
+            # abandon Control 的 owner 分区，逐个点查 Control 即可，不做全量快照。
+            messages = reader.snapshot(after_seq=from_seq - 1)
+            through = from_seq - 1
+            while through >= 0:
+                control = reader.latest_control(source, through_seq=through)
+                if control is None:
+                    break
+                if control.body.action == "abandon":
+                    messages = (control, *messages)
+                    break
+                through = control.seq - 1
             abandoned = next((message for message in messages
                               if message.source == source and isinstance(message.body, Control)
                               and message.body.action == "abandon" and message.body.through_seq >= from_seq), None)

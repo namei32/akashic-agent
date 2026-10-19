@@ -8,21 +8,30 @@ export interface NavigationRowAction {
   label: string;
   icon: ReactNode;
   disabled?: boolean;
-  onSelect: () => void;
+  /** 破坏性动作以 error 墨色呈现，仍走各自的就地确认。 */
+  danger?: boolean;
+  /** event.preventDefault() 保持菜单开启——就地两段确认使用。 */
+  onSelect: (event: Event) => void;
 }
 
 /** 导航行共享操作菜单；长按不打开会话，滑动仍交给目录滚动。 */
-export function NavigationRowMenu({ title, actions = [], className, children }: {
+export function NavigationRowMenu({ title, actions = [], className, children, onOpenChange }: {
   title: string;
   actions?: NavigationRowAction[];
   className: string;
   children: ReactNode;
+  /** 菜单开合通知；行内确认态等在菜单关闭时复位。 */
+  onOpenChange?: (open: boolean) => void;
 }) {
   const [open, setOpen] = useState(false);
   const rowRef = useRef<HTMLDivElement>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const press = useRef<{ id: number; x: number; y: number } | null>(null);
   const held = useRef(false);
+  const setMenuOpen = (next: boolean) => {
+    setOpen(next);
+    if (!next) onOpenChange?.(next);
+  };
   const cancelPress = () => {
     if (timer.current !== null) clearTimeout(timer.current);
     timer.current = null;
@@ -30,7 +39,7 @@ export function NavigationRowMenu({ title, actions = [], className, children }: 
   };
   useEffect(() => cancelPress, []);
 
-  return <DropdownMenu open={open} onOpenChange={setOpen} modal={false}>
+  return <DropdownMenu open={open} onOpenChange={setMenuOpen} modal={false}>
     <div ref={rowRef} className={`navigation-menu-row ${className}`} data-menu-open={open || undefined}
       onPointerDown={(event) => {
         // 1. 一次新触摸开始计时；第二根手指、鼠标和菜单按钮不参与长按。
@@ -77,7 +86,8 @@ export function NavigationRowMenu({ title, actions = [], className, children }: 
       {children}
       {actions.length ? <>
         <DropdownMenuTrigger asChild>
-          <button type="button" className="navigation-menu-trigger" aria-label={`${title} 的操作`}>
+          {/* 键盘在行上按菜单键或 Shift+F10 打开，不再为每行多占一个 Tab 停靠点。 */}
+          <button type="button" className="navigation-menu-trigger" aria-label={`${title} 的操作`} tabIndex={-1}>
             <Ellipsis size={18} aria-hidden="true" />
           </button>
         </DropdownMenuTrigger>
@@ -85,10 +95,16 @@ export function NavigationRowMenu({ title, actions = [], className, children }: 
           aria-label={`${title} 的操作`} onCloseAutoFocus={(event) => {
             event.preventDefault();
             held.current = false;
-            rowRef.current?.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus({ preventScroll: true });
+            // 菜单动作可能把行换成输入框（重命名）：焦点交给它，而不是"…"按钮——输入框一失焦就会按原标题提交并退出编辑。
+            // 否则回到行的主按钮（data-row-primary），不能取"第一个按钮"：项目行排第一的是不参与方向键导航的展开箭头。
+            const row = rowRef.current;
+            (row?.querySelector<HTMLElement>("input:not(:disabled)")
+              ?? row?.querySelector<HTMLElement>("[data-row-primary]:not(:disabled)")
+              ?? row?.querySelector<HTMLElement>("button:not(:disabled)"))?.focus({ preventScroll: true });
           }}>
           {actions.map((action) => <DropdownMenuItem key={action.label} disabled={action.disabled}
-            onSelect={action.onSelect} className="navigation-row-menu__item">
+            onSelect={action.onSelect}
+            className={`navigation-row-menu__item${action.danger ? " navigation-row-menu__item--danger" : ""}`}>
             {action.icon}<span>{action.label}</span>
           </DropdownMenuItem>)}
         </DropdownMenuContent>
