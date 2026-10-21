@@ -96,10 +96,11 @@ class Companion:
         return {"explanation": "" if row is None else row.value.get("explanation", "")}
 
     async def scene(self, request: Scene) -> None:
-        if request.reference and request.reference.message_id:
+        message_id = request.reference.message_id if request.reference else None
+        if message_id:
             reader = self.ctx.require(MESSAGE_CATALOG).reader(request.parent)
             try:
-                found = await reader.read_async(lambda r: r.get(request.reference.message_id))
+                found = await reader.read_async(lambda r: r.get(message_id))
             except KeyError:
                 found = None
             if found is None:
@@ -214,8 +215,9 @@ class Companion:
             except KeyError:
                 background = ()
             reference = request.reference
-            original = None if parent_reader is None or reference is None or not reference.message_id else await parent_reader.read_async(
-                lambda r: r.get(reference.message_id))
+            reference_id = reference.message_id if reference else None
+            original = None if parent_reader is None or not reference_id else await parent_reader.read_async(
+                lambda r: r.get(reference_id))
             preferences = await self.preferences()
             materials = {"当前讨论": [text(m)[:2000] for m in background if text(m)],
                          "选中文字": reference.text if reference else "",

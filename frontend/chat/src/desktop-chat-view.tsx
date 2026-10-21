@@ -51,7 +51,7 @@ export function DesktopChatView({ embeddedShell, controller }: DesktopChatViewPr
   const companion = useRef<CompanionHandle | null>(null);
   const [companionAvailable, setCompanionAvailable] = useState(false);
   const companionSources = useRef(controller);
-  companionSources.current = controller;
+  useLayoutEffect(() => { companionSources.current = controller; }, [controller]);
   const askCompanion = useCallback((id: string) => {
     const current = companionSources.current;
     const message = current.timelineMessages.find((item) => item.id === id);
