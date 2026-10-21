@@ -53,6 +53,7 @@ class Run:
     detail: str = "正在理解你的问题…"
     status: str = "running"
     task: asyncio.Task | None = None
+    stop_requested: bool = False
 
     def snapshot(self) -> dict[str, object]:
         return {"request_id": self.request.request_id, "status": self.status,
@@ -159,6 +160,7 @@ class Companion:
             self.active[request.request_id] = run
             try:
                 run.task = await self.ctx.spawn(self.generate(run), name="explain-" + request.request_id)
+                run.task.add_done_callback(lambda task: self.active.pop(request.request_id, None) if task.cancelled() else None)
             except BaseException:
                 self.active.pop(request.request_id, None)
                 raise
@@ -188,13 +190,21 @@ class Companion:
     async def stop(self, request_id: str) -> dict[str, object]:
         run = self.active.get(request_id)
         if run is not None and run.task is not None:
-            run.task.cancel()
-            await asyncio.gather(run.task, return_exceptions=True)
+            if not run.stop_requested:
+                run.stop_requested = True
+                run.task.cancel()
+            try:
+                await asyncio.shield(run.task)
+            except asyncio.CancelledError:
+                if not run.task.done():
+                    raise
         return await self.result(request_id)
 
     async def generate(self, run: Run) -> None:
         request = run.request
         status, detail = "complete", ""
+        writer = self.writer(self.thread(request.parent), "assistant", (Output,))
+        store = self.store()
         try:
             reader = self.ctx.require(MESSAGE_CATALOG).reader(self.thread(request.parent))
             history = await reader.read_async(lambda r: r.read_tail(limit=12).messages)
@@ -246,22 +256,25 @@ class Companion:
             logger.warning("Companion explanation failed: %s", type(error).__name__)
         try:
             # HTTP 断开不取消任务；用户停止和插件排空也必须先结算已收到的文字。
-            with anyio.CancelScope(shield=True):
-                writer = self.writer(self.thread(request.parent), "assistant", (Output,))
+            while True:
                 try:
-                    prepared = await writer.prepare_async(request.request_id + ":answer",
-                        Output((ContentPart("text", run.text),), "complete" if status == "complete" else "continue")) if run.text else None
-                    def commit(tx):
-                        row = tx.read("request:" + request.request_id)
-                        if row is None:
-                            raise RuntimeError("答疑记录缺失")
-                        tx.save("request:" + request.request_id,
-                            {**row.value, "status": status, "detail": detail}, expected_version=row.version)
-                        if prepared is not None:
-                            tx.append_prepared(prepared)
-                    await self.store().transact_async(commit)
-                finally:
-                    writer.expire()
+                    with anyio.CancelScope(shield=True):
+                        prepared = await writer.prepare_async(request.request_id + ":answer",
+                            Output((ContentPart("text", run.text),), "complete" if status == "complete" else "continue")) if run.text else None
+                        def commit(tx):
+                            row = tx.read("request:" + request.request_id)
+                            if row is None:
+                                raise RuntimeError("答疑记录缺失")
+                            tx.save("request:" + request.request_id,
+                                {**row.value, "status": status, "detail": detail}, expected_version=row.version)
+                            if prepared is not None:
+                                tx.append_prepared(prepared)
+                        await store.transact_async(commit)
+                    break
+                except asyncio.CancelledError:
+                    # run_file_io 已等待实际线程结束；仅重做同 ID 的幂等存储，不重发模型。
+                    continue
         finally:
+            writer.expire()
             run.status, run.detail = status, detail
             self.active.pop(request.request_id, None)

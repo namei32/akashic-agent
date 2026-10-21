@@ -4,28 +4,39 @@ import asyncio
 import json
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.datastructures import Headers, MutableHeaders
 
 from .runtime import Ask, Companion, Preferences, Scene
 
 
-def create_app(companion: Companion) -> FastAPI:
-    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+class SameOrigin:
+    """Pure ASGI middleware preserves the actual request task's owner scope."""
+    def __init__(self, app):
+        self.app = app
 
-    @app.middleware("http")
-    async def same_origin(request: Request, call_next):
-        origin = request.headers.get("origin")
-        host = request.headers.get("x-akashic-host", request.headers.get("host", ""))
-        if request.method not in {"GET", "HEAD", "OPTIONS"} and (
-            request.headers.get("x-akashic-csrf") != "1"
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        headers = Headers(scope=scope)
+        origin = headers.get("origin")
+        host = headers.get("x-akashic-host", headers.get("host", ""))
+        if scope["method"] not in {"GET", "HEAD", "OPTIONS"} and (
+            headers.get("x-akashic-csrf") != "1"
             or (origin is not None and urlsplit(origin).netloc.casefold() != host.casefold())
         ):
-            from fastapi.responses import JSONResponse
-            return JSONResponse({"detail": "请从 Akashic 页面内使用桌宠。"}, status_code=403)
-        response = await call_next(request)
-        response.headers["Cache-Control"] = "no-store"
-        return response
+            return await JSONResponse({"detail": "请从 Akashic 页面内使用桌宠。"}, status_code=403)(scope, receive, send)
+        async def uncached(message):
+            if message["type"] == "http.response.start":
+                MutableHeaders(scope=message)["Cache-Control"] = "no-store"
+            await send(message)
+        await self.app(scope, receive, uncached)
+
+
+def create_app(companion: Companion) -> FastAPI:
+    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    app.add_middleware(SameOrigin)
 
     @app.get("/api/companion/state")
     async def state(parent: str = Query(default="", max_length=512)):
@@ -65,16 +76,18 @@ def create_app(companion: Companion) -> FastAPI:
         except KeyError as error:
             raise HTTPException(404, str(error)) from error
         async def stream():
-            previous = ""
-            while True:
-                value = await companion.result(request_id)
-                encoded = json.dumps(value, ensure_ascii=False)
-                if encoded != previous:
-                    yield encoded + "\n"
-                    previous = encoded
-                if value["status"] != "running":
-                    return
-                await asyncio.sleep(0.15)
+            # StreamingResponse may run its iterator in a distinct ASGI task.
+            async with companion.ctx.runtime_scope():
+                previous = ""
+                while True:
+                    value = await companion.result(request_id)
+                    encoded = json.dumps(value, ensure_ascii=False)
+                    if encoded != previous:
+                        yield encoded + "\n"
+                        previous = encoded
+                    if value["status"] != "running":
+                        return
+                    await asyncio.sleep(0.15)
         return StreamingResponse(stream(), media_type="application/x-ndjson",
                                  headers={"X-Accel-Buffering": "no"})
 
