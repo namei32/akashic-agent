@@ -66,6 +66,7 @@ export const Companion = forwardRef<CompanionHandle, {
     try {
       const state = await companionApi<CompanionState>(`/state?parent=${encodeURIComponent(parent)}`);
       if (!mounted.current) return null;
+      setError("");
       setAvailable(true); onAvailable(true); setHistory(state.history);
       setPreferences(state.preferences.explanation);
       if (!preferenceDirty.current) setPreferenceDraft(state.preferences.explanation);
@@ -161,7 +162,10 @@ export const Companion = forwardRef<CompanionHandle, {
     try {
       const value = await companionApi<CompanionRun>(`/stop/${encodeURIComponent(live.request_id)}`, {});
       if (mounted.current) { setLive(value); await refresh(); }
-    } catch (reason) { setError(reason instanceof Error ? reason.message : "停止失败，请重试。"); }
+    } catch (reason) {
+      if (reason instanceof CompanionRequestError && reason.status === 404) { setLive(null); setError(""); }
+      else setError(reason instanceof Error ? reason.message : "停止失败，请重试。");
+    }
   }
 
   async function savePreferences() {
@@ -249,7 +253,7 @@ export const Companion = forwardRef<CompanionHandle, {
           {floating ? <article className="companion-message is-assistant is-streaming"><span className="companion-speaker">随问</span><p>{floating}</p></article> : null}
           {busy ? <p className="companion-progress" role="status">{live?.detail || "正在解释…"}</p> : null}
           {live && live.status !== "running" && live.status !== "complete" ? <div className="companion-interrupted" role="status"><p>{live.detail}</p>
-            <button type="button" onClick={() => { const q = lastRequest.current?.question ?? [...history].reverse().find((m) => m.role === "user")?.text; if (q) void submit({ request_id: createUuid(), parent, question: q, reference }); }}>重新解释</button></div> : null}
+            <button type="button" onClick={() => { const q = live.question ?? lastRequest.current?.question ?? [...history].reverse().find((m) => m.role === "user")?.text; if (q) void submit({ request_id: createUuid(), parent, question: q, reference: live.reference === undefined ? reference : live.reference }); }}>重新解释</button></div> : null}
         </div>
         <form className="companion-composer" onSubmit={(event) => { event.preventDefault(); void submit(); }}>
           <textarea ref={input} aria-label="问桌宠" placeholder={reference ? "这段哪里没懂，随时问…" : "问个小问题…"}
