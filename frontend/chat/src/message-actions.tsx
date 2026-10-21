@@ -1,4 +1,6 @@
-import { Copy, PencilLine, Reply, X } from "lucide-react";
+import { Copy, MessageCircle, PencilLine, Reply, X } from "lucide-react";
+import { useContext } from "react";
+import { CompanionActions } from "./companion-context";
 
 import { CheckGlyph, IconSwap } from "./icon-swap";
 
@@ -20,8 +22,13 @@ export function SharedMessageActions({
   /** 只给用户自己的提问：把原文放回输入框，改一改再问。 */
   onEdit?: () => void;
 }) {
+  const askCompanion = useContext(CompanionActions);
   return (
     <div className="shared-message-actions">
+      {askCompanion ? <button type="button" aria-label="问桌宠这条消息" onClick={(event) => {
+        const id = event.currentTarget.closest<HTMLElement>("[data-message-id]")?.dataset.messageId;
+        if (id) askCompanion(id);
+      }}><MessageCircle size={16} aria-hidden="true" /></button> : null}
       {onEdit ? (
         <button type="button" onClick={onEdit} aria-label="放回输入框编辑" data-tip="放回输入框编辑">
           <PencilLine size={16} aria-hidden="true" />
