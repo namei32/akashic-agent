@@ -199,7 +199,14 @@ class Companion:
                       "本次阅读背景：" + json.dumps(materials, ensure_ascii=False))
             messages = [{"role": "user" if isinstance(m.body, Input) else "assistant", "content": text(m)[:6000]}
                         for m in history if isinstance(m.body, (Input, Output)) and text(m)]
+            attempt = None
             async def delta(value: dict[str, str]) -> None:
+                nonlocal attempt
+                if value.get("attempt_status"):
+                    current = json.loads(value["attempt_status"]).get("attempt")
+                    if attempt is not None and current != attempt:
+                        run.text = ""
+                    attempt = current
                 run.text += value.get("content_delta", "")
                 if len(run.text) > 32000:
                     raise ValueError("解释内容过长，请把问题拆小一些。")
