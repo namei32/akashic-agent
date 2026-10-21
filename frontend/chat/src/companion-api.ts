@@ -1,6 +1,6 @@
 export interface CompanionReference { message_id: string | null; text: string }
 export interface CompanionMessage { id: string; role: "user" | "assistant"; text: string; partial: boolean }
-export interface CompanionRun { request_id: string; status: "running" | "complete" | "failed" | "interrupted"; text: string; detail: string }
+export interface CompanionRun { request_id: string; status: "running" | "complete" | "failed" | "interrupted"; text: string; detail: string; question?: string; reference?: CompanionReference | null }
 export interface CompanionState {
   history: CompanionMessage[];
   preferences: { explanation: string };

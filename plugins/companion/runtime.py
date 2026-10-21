@@ -56,7 +56,8 @@ class Run:
 
     def snapshot(self) -> dict[str, object]:
         return {"request_id": self.request.request_id, "status": self.status,
-                "text": self.text, "detail": self.detail}
+                "text": self.text, "detail": self.detail, "question": self.request.question,
+                "reference": self.request.reference.model_dump() if self.request.reference else None}
 
 
 def text(message: Message) -> str:
@@ -96,7 +97,10 @@ class Companion:
     async def scene(self, request: Scene) -> None:
         if request.reference and request.reference.message_id:
             reader = self.ctx.require(MESSAGE_CATALOG).reader(request.parent)
-            found = await reader.read_async(lambda r: r.get(request.reference.message_id))
+            try:
+                found = await reader.read_async(lambda r: r.get(request.reference.message_id))
+            except KeyError:
+                found = None
             if found is None:
                 raise ValueError("引用的原消息尚未保存，请等回复完成后再选中，或清除引用直接提问。")
         await self.save("scene:" + self.thread(request.parent),
@@ -104,12 +108,21 @@ class Companion:
 
     async def state(self, parent: str) -> dict[str, object]:
         reader = self.ctx.require(MESSAGE_CATALOG).reader(self.thread(parent))
-        messages = await reader.read_async(lambda r: r.read_tail(limit=40).messages)
+        try:
+            messages = await reader.read_async(lambda r: r.read_tail(limit=40).messages)
+        except KeyError:
+            messages = ()
         scene = await self.record("scene:" + self.thread(parent))
         history = [{"id": m.message_id, "role": "user" if isinstance(m.body, Input) else "assistant",
                     "text": text(m), "partial": isinstance(m.body, Output) and m.body.finish != "complete"}
                    for m in messages if isinstance(m.body, (Input, Output))]
         active = next((r.snapshot() for r in self.active.values() if r.request.parent == parent), None)
+        if active is None:
+            last_input = next((m for m in reversed(messages) if isinstance(m.body, Input)), None)
+            if last_input is not None:
+                latest = await self.result(last_input.message_id)
+                if latest["status"] != "complete":
+                    active = latest
         return {"history": history, "preferences": await self.preferences(), "active": active,
                 "reference": None if scene is None else scene.value.get("reference")}
 
@@ -164,10 +177,12 @@ class Companion:
             raise KeyError("没有找到这次答疑。")
         reader = self.ctx.require(MESSAGE_CATALOG).reader(self.thread(str(row.value["parent"])))
         output = await reader.read_async(lambda r: r.get(request_id + ":answer"))
+        question = await reader.read_async(lambda r: r.get(request_id))
         status = row.value["status"]
         if status == "running":
             status = "interrupted"
         return {"request_id": request_id, "status": status, "text": "" if output is None else text(output),
+                "question": "" if question is None else text(question), "reference": row.value.get("reference"),
                 "detail": row.value.get("detail") or ("上次解释已中断，可以重新提问。" if status == "interrupted" else "")}
 
     async def stop(self, request_id: str) -> dict[str, object]:
@@ -184,7 +199,10 @@ class Companion:
             reader = self.ctx.require(MESSAGE_CATALOG).reader(self.thread(request.parent))
             history = await reader.read_async(lambda r: r.read_tail(limit=12).messages)
             parent_reader = self.ctx.require(MESSAGE_CATALOG).reader(request.parent) if request.parent else None
-            background = await parent_reader.read_async(lambda r: r.read_tail(limit=4).messages) if parent_reader else ()
+            try:
+                background = await parent_reader.read_async(lambda r: r.read_tail(limit=4).messages) if parent_reader else ()
+            except KeyError:
+                background = ()
             reference = request.reference
             original = None if parent_reader is None or reference is None or not reference.message_id else await parent_reader.read_async(
                 lambda r: r.get(reference.message_id))
