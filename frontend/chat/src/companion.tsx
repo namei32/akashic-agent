@@ -44,9 +44,13 @@ export const Companion = forwardRef<CompanionHandle, {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [saving, setSaving] = useState(false);
+  const [unread, setUnread] = useState(false);
   const [position, setPosition] = useState(initialPosition);
   const [viewport, setViewport] = useState({ width: innerWidth, height: innerHeight });
   const mounted = useRef(true);
+  const openRef = useRef(open);
+  openRef.current = open;
+  const preferenceDirty = useRef(false);
   const sceneRevision = useRef(0);
   const stream = useRef<AbortController | null>(null);
   const lastRequest = useRef<CompanionRequest | null>(null);
@@ -63,7 +67,8 @@ export const Companion = forwardRef<CompanionHandle, {
       const state = await companionApi<CompanionState>(`/state?parent=${encodeURIComponent(parent)}`);
       if (!mounted.current) return null;
       setAvailable(true); onAvailable(true); setHistory(state.history);
-      setPreferences(state.preferences.explanation); setPreferenceDraft(state.preferences.explanation);
+      setPreferences(state.preferences.explanation);
+      if (!preferenceDirty.current) setPreferenceDraft(state.preferences.explanation);
       if (revision === sceneRevision.current) setReference(state.reference);
       return state;
     } catch (reason) {
@@ -80,7 +85,9 @@ export const Companion = forwardRef<CompanionHandle, {
     const control = new AbortController(); stream.current = control;
     setError("");
     try {
-      await readCompanionRun(id, (value) => { if (mounted.current) setLive(value); }, control.signal);
+      await readCompanionRun(id, (value) => {
+        if (mounted.current) { setLive(value); if (value.status === "complete" && !openRef.current) setUnread(true); }
+      }, control.signal);
       if (mounted.current) await refresh();
     } catch (reason) {
       if (mounted.current && !control.signal.aborted) setError(reason instanceof Error ? reason.message : "答疑连接中断，请重连。");
@@ -126,7 +133,7 @@ export const Companion = forwardRef<CompanionHandle, {
   }, [parent]);
 
   useImperativeHandle(ref, () => ({ explain(value) {
-    changeReference(value); setOpen(true); setSettings(false);
+    changeReference(value); setOpen(true); setSettings(false); setUnread(false);
     if (matchMedia("(pointer: fine)").matches) requestAnimationFrame(() => input.current?.focus({ preventScroll: true }));
   } }), [changeReference]);
 
@@ -142,7 +149,10 @@ export const Companion = forwardRef<CompanionHandle, {
       setDraft(""); setLive(result); await refresh();
       if (result.status === "running") await watch(value.request_id);
     } catch (reason) {
-      if (mounted.current) setError(reason instanceof Error ? reason.message : "提问失败，请重试。");
+      if (mounted.current) {
+        if (reason instanceof CompanionRequestError && reason.status < 500) setLive(null);
+        setError(reason instanceof Error ? reason.message : "提问失败，请重试。");
+      }
     }
   }
 
@@ -158,7 +168,7 @@ export const Companion = forwardRef<CompanionHandle, {
     setSaving(true); setError("");
     try {
       const value = await companionApi<{ explanation: string }>("/preferences", { explanation: preferenceDraft.trim() });
-      if (mounted.current) { setPreferences(value.explanation); setNotice("解释偏好已保存，下次提问生效。"); }
+      if (mounted.current) { preferenceDirty.current = false; setPreferences(value.explanation); setNotice("解释偏好已保存，下次提问生效。"); }
     } catch (reason) { setError(reason instanceof Error ? reason.message : "保存失败，请重试。"); }
     finally { if (mounted.current) setSaving(false); }
   }
@@ -174,7 +184,7 @@ export const Companion = forwardRef<CompanionHandle, {
   const panelPosition = { left: clamp(position.x + 62 - panelWidth, 12, viewport.width - panelWidth - 12),
     top: clamp(position.y - panelHeight - 12, 12, viewport.height - panelHeight - 12), width: panelWidth, height: panelHeight };
   const floating = live && !history.some((m) => m.id === `${live.request_id}:answer`) ? live.text : "";
-  const completed = live?.status === "complete" && !open;
+  const completed = unread && !open;
 
   return createPortal(<div className="companion-root">
     <button type="button" className={`companion-launcher ${busy ? "is-thinking" : ""} ${completed ? "has-answer" : ""}`}
@@ -200,7 +210,7 @@ export const Companion = forwardRef<CompanionHandle, {
         if (dragged.current) remember("akashic.companion.position", JSON.stringify({ x: position.x / innerWidth, y: position.y / innerHeight }));
       }}
       onPointerCancel={() => { drag.current = null; }}
-      onClick={() => { if (dragged.current) { dragged.current = false; return; } setOpen((value) => !value); setNotice(""); }}>
+      onClick={() => { if (dragged.current) { dragged.current = false; return; } setOpen((value) => !value); setUnread(false); setNotice(""); }}>
       <span className="companion-creature" aria-hidden="true"><i className="companion-ear left" /><i className="companion-ear right" />
         <span className="companion-face"><i /><i /></span><span className="companion-mouth" /></span>
       <span className="companion-caption">{busy ? "在想了" : completed ? "讲完啦" : "随问"}</span>
@@ -216,7 +226,7 @@ export const Companion = forwardRef<CompanionHandle, {
         <label htmlFor="companion-preferences">你希望我怎样解释？</label>
         <p>只记住你明确设置的偏好，随时可以修改或清空。</p>
         <textarea id="companion-preferences" value={preferenceDraft} maxLength={500} rows={5}
-          placeholder="例如：先用生活例子解释，再给代码；回答简短一些。" onChange={(event) => setPreferenceDraft(event.target.value)} />
+          placeholder="例如：先用生活例子解释，再给代码；回答简短一些。" onChange={(event) => { preferenceDirty.current = true; setPreferenceDraft(event.target.value); }} />
         <button className="companion-primary" type="button" disabled={saving || preferences === preferenceDraft.trim()} onClick={() => void savePreferences()}>
           <Check size={16} />{saving ? "正在保存…" : "保存偏好"}</button>
         <div className="companion-memory-note"><strong>我会记住什么</strong><p>当前阅读引用、这段答疑里的追问，以及你设置的解释偏好。</p>
