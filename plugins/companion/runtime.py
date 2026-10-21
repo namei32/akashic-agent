@@ -183,10 +183,10 @@ class Companion:
         try:
             reader = self.ctx.require(MESSAGE_CATALOG).reader(self.thread(request.parent))
             history = await reader.read_async(lambda r: r.read_tail(limit=12).messages)
-            parent_reader = self.ctx.require(MESSAGE_CATALOG).reader(request.parent)
-            background = await parent_reader.read_async(lambda r: r.read_tail(limit=4).messages) if request.parent else ()
+            parent_reader = self.ctx.require(MESSAGE_CATALOG).reader(request.parent) if request.parent else None
+            background = await parent_reader.read_async(lambda r: r.read_tail(limit=4).messages) if parent_reader else ()
             reference = request.reference
-            original = None if reference is None or not reference.message_id else await parent_reader.read_async(
+            original = None if parent_reader is None or reference is None or not reference.message_id else await parent_reader.read_async(
                 lambda r: r.get(reference.message_id))
             preferences = await self.preferences()
             materials = {"当前讨论": [text(m)[:2000] for m in background if text(m)],
@@ -204,7 +204,7 @@ class Companion:
                 nonlocal attempt
                 if value.get("attempt_status"):
                     current = json.loads(value["attempt_status"]).get("attempt")
-                    if attempt is not None and current != attempt:
+                    if current != attempt:
                         run.text = ""
                     attempt = current
                 run.text += value.get("content_delta", "")

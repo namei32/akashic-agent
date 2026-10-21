@@ -47,7 +47,7 @@ export function SelectionQuote({ onQuote, onAsk }: { onQuote: (markdown: string)
 
   if (!anchor) return null;
   return createPortal(<div className={`selection-menu${anchor.below ? " is-below" : ""}`}
-    style={{ left: anchor.left, top: anchor.top }}
+    style={{ left: Math.max(onAsk ? 86 : 34, Math.min(anchor.left, innerWidth - (onAsk ? 86 : 34))), top: anchor.top }}
     ><button type="button" className="selection-quote"
     // 按下时不能让按钮抢走焦点、清掉选区，否则点击时已经读不到选中的文字。
     onMouseDown={(event) => event.preventDefault()}
