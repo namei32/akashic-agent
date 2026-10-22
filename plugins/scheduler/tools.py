@@ -15,22 +15,36 @@ from plugins.ledger.contract import ContentPart
 
 from .schedule import ScheduledJob, compute_fire_at, is_cron_expr, parse_duration
 from .store import JobStore, Operation
+from .contract import TaskSessions
 from core.common.file_io import run_file_io
 
 
 class ScheduleInput(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     action: Literal["notify", "run"] = Field(description=(
-        "notify：到点把 text 原文推送给用户，不调用模型；run：到点在当前会话里按 text 执行一轮任务，"
+        "notify：到点把 text 原文推送给用户，不调用模型；run：到点在目标会话里按 text 执行一轮任务，"
         "可以使用工具，最后一条回复作为通知推送"))
     trigger: Literal["at", "after", "every"]
     when: str = Field(min_length=1, description="at: 14:30 或 ISO 时间；after: 5m；every: 1h 或 cron")
     text: str = Field(min_length=1, description="notify 的推送原文，或 run 的任务指令")
     context: Literal["none", "session"] = Field(default="none", description=(
-        "run 是否带上本会话的聊天历史；天气、新闻这类独立任务用 none，需要参考之前对话时用 session"))
+        "run 是否带上目标会话的聊天历史；天气、新闻这类独立任务用 none，需要参考之前对话时用 session"))
     timezone: str = Field(default_factory=lambda: os.environ.get("TZ", ""))
     name: str | None = None
     request_time: str | None = Field(default=None, description="原消息接收的 ISO 时间；after 从此刻计算延迟")
+    destination: Literal['current', 'new', 'existing'] = Field(default='current',
+        description='current 在当前会话执行；new 新建固定复用的 Akashic 专用会话；existing 选择已有会话')
+    session_id: str | None = Field(default=None, description='existing 的目标会话 ID，先用 list_schedule_sessions 查询')
+    session_title: str | None = Field(default=None, min_length=1, max_length=200,
+        description='new 的会话名称，默认使用任务名称')
+
+    @model_validator(mode='after')
+    def check_destination(self) -> Self:
+        if (self.destination == 'existing') != bool(self.session_id):
+            raise ValueError('只有 existing 必须提供 session_id')
+        if self.session_title is not None and self.destination != 'new':
+            raise ValueError('只有 new 可以提供 session_title')
+        return self
 
 
 # 调用所在会话及其投递渠道：(session_id, channel, address)。
@@ -81,11 +95,13 @@ class ScheduleTool:
     idempotent = True
 
     def __init__(self, store: JobStore, tasks: TaskAdmission, kind: Literal["schedule", "cancel"],
-                 target: Target, *, now: Callable[[], datetime] = lambda: datetime.now(UTC)):
+                 target: Target, *, sessions: TaskSessions | None = None,
+                 now: Callable[[], datetime] = lambda: datetime.now(UTC)):
         self._store = store
         self._tasks = tasks
         self._kind = kind
         self._target = target
+        self._sessions = sessions
         self._now = now
 
     async def prepare(self, arguments: Mapping[str, object], source: CallSource | None = None) -> Mapping[str, object] | str:
@@ -118,12 +134,24 @@ class ScheduleTool:
                 channel=channel, chat_id=address, session_id=session_id, text=request.text,
                 interval_seconds=interval, cron_expr=cron, context=request.context, name=request.name,
                 timezone=request.timezone, created_at=self._now())
+            new_session = None
+            if request.destination != 'current':
+                if self._sessions is None:
+                    raise ValueError('任务会话选择不可用')
+                selected = (self._sessions.allocate(job.id) if request.destination == 'new'
+                            else await self._sessions.resolve(request.session_id or ''))
+                job.session_id, job.channel, job.chat_id = selected['session_id'], selected['channel'], selected['recipient']
+                if request.destination == 'new':
+                    new_session = {'title': request.session_title or request.name or '定时任务', 'parent': session_id}
             payload = self._store.encode_job(job)
             _ = self._store.decode_job(payload)
         except (ValidationError, ValueError, TypeError, OverflowError, ZoneInfoNotFoundError) as error:
             return str(error)
         label = f"「{job.name}」" if job.name else job.id[:8]
-        return {"job": payload, "response": f"已注册定时任务 {label}，首次触发时间：{fire_at.isoformat()}"}
+        prepared: dict[str, object] = {"job": payload, "response": f"已注册定时任务 {label}，首次触发时间：{fire_at.isoformat()}，会话：{job.session_id}"}
+        if new_session is not None:
+            prepared['new_session'] = new_session
+        return prepared
 
     async def invoke(self, key: str, arguments: Mapping[str, object]) -> Result:
         """只接纳 Tool owner 已固定的执行参数，结果与文件变更同一次提交。"""
@@ -140,9 +168,19 @@ class ScheduleTool:
         else:
             job = arguments["job"]
             response = arguments["response"]
-            if set(arguments) != {"job", "response"} or not isinstance(job, Mapping) or not isinstance(response, str):
+            if set(arguments) - {"job", "response", "new_session"} or not isinstance(job, Mapping) or not isinstance(response, str):
                 raise ValueError("原调度参数损坏")
-            operation = await self._store.add(key, self._store.decode_job(dict(cast(Mapping[str, object], job))), response)
+            decoded = self._store.decode_job(dict(cast(Mapping[str, object], job)))
+            if key in (await run_file_io(self._store.read)).operations:
+                return _result(await self._store.add(key, decoded, response))
+            if (new_session := arguments.get('new_session')) is not None:
+                if self._sessions is None or not isinstance(new_session, Mapping):
+                    raise ValueError('原新建会话参数损坏')
+                title, parent = new_session.get('title'), new_session.get('parent')
+                if not isinstance(title, str) or not isinstance(parent, str):
+                    raise ValueError('原新建会话参数损坏')
+                await self._sessions.ensure(decoded.session_id, title, inherit_from=parent)
+            operation = await self._store.add(key, decoded, response)
         return _result(operation)
 
     async def query(self, key: str) -> Result | None:
@@ -173,7 +211,7 @@ class ListSchedules:
         for job in jobs:
             label = f"「{job.name}」" if job.name else job.id[:8]
             display = job.fire_at.astimezone(ZoneInfo(job.timezone)).strftime("%Y-%m-%d %H:%M:%S %Z")
-            lines.append(f"• {label} [{job.action}/{job.trigger}] 下次: {display} 内容: {job.text[:40]} 已运行: {job.run_count}次")
+            lines.append(f"• {label} [{job.action}/{job.trigger}] 会话: {job.session_id} 下次: {display} 内容: {job.text[:40]} 已运行: {job.run_count}次")
         return Result("success", (ContentPart("text", "\n".join(lines)),))
 
     async def query(self, key: str) -> Result | None:

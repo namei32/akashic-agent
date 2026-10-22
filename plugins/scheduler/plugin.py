@@ -17,6 +17,7 @@ from plugins.ledger.contract import (
     MESSAGE_CATALOG,
     MESSAGE_WRITERS,
     OWNER_STATE,
+    SESSION_ADMIN, SESSION_ADMISSION,
     MessageReader,
 )
 from agent.plugin_composition.tasks import TASKS, Task
@@ -31,7 +32,8 @@ from .inputs import (
     ALL_TOOLS, CONTENT, CONVERSATION_COMPLETE, DELIVERY, DELIVERY_SENDERS, INPUT_ORIGIN,
     TOOL_LOADING_PRESENTATION, TOOLS, CallSource,
 )
-from .contract import SCHEDULER_INSPECTION
+from .contract import SCHEDULER_INSPECTION, TASK_SESSIONS
+from .sessions import SessionTargets
 from .inspection import SchedulerInspectionProvider
 from .runtime import SchedulerRuntime
 from .store import Fire, JobStore
@@ -40,12 +42,12 @@ from .tools import CancelInput, ListSchedules, ScheduleInput, ScheduleTool
 
 api_version = 3
 name = "scheduler"
-version = "5.0.0"
-desc = "持久调度：到点在创建任务的会话里执行，最终回复按原触发投递"
+version = "5.1.0"
+desc = "持久调度：选择当前或专用会话执行，最终回复按原触发投递"
 
 
 inject = (
-    BINDINGS, TASKS, MESSAGE_CATALOG, MESSAGE_WRITERS, OWNER_STATE,
+    BINDINGS, TASKS, MESSAGE_CATALOG, MESSAGE_WRITERS, OWNER_STATE, SESSION_ADMIN, SESSION_ADMISSION,
     CONTENT,
     CONVERSATION_COMPLETE,
     DELIVERY_SENDERS,
@@ -76,6 +78,8 @@ async def apply(ctx: Context) -> None:
     config = Config.model_validate(ctx.config)
     store = JobStore(ctx.workspace_file("schedules.json"))
     _ = await ctx.provide(SCHEDULER_INSPECTION, SchedulerInspectionProvider(store))
+    sessions = SessionTargets(ctx)
+    _ = await ctx.provide(TASK_SESSIONS, sessions)
     watcher: asyncio.Task[None] | None = None
     catalog = ctx.require(TOOLS)
     _ = await catalog.declare_group(ctx, description=desc)
@@ -93,12 +97,12 @@ async def apply(ctx: Context) -> None:
         return None if route is None else (message.session_id, *route)
 
     for action, schema, description in (
-        ("schedule", ScheduleInput.model_json_schema(), "在当前会话新增一次或周期定时任务"),
+        ("schedule", ScheduleInput.model_json_schema(), "创建一次或周期任务，可选择当前、新建专用或已有会话"),
         ("cancel", CancelInput.model_json_schema(), "取消明确匹配的定时任务"),
     ):
         @asynccontextmanager
         async def open_tool(_state: object, action: Literal["schedule", "cancel"] = cast(Literal["schedule", "cancel"], action)) -> AsyncGenerator[ScheduleTool]:
-            yield ScheduleTool(store, ctx.require(TASKS).open(ctx), action, target)
+            yield ScheduleTool(store, ctx.require(TASKS).open(ctx), action, target, sessions=sessions)
 
         _ = await catalog.register(
             ctx,
@@ -122,6 +126,30 @@ async def apply(ctx: Context) -> None:
         idempotent=True,
         parallel=True,
     )
+
+    class ListSessions:
+        idempotent = True
+
+        async def prepare(self, arguments, source=None):
+            return 'list_schedule_sessions 不接收参数' if arguments else {}
+
+        async def invoke(self, key, arguments):
+            from .inputs import Result
+            from plugins.ledger.contract import ContentPart
+            choices = await sessions.choices()
+            text = '\n'.join(f"{item['session_id']} · {item['label']}" for item in choices)
+            return Result('success', (ContentPart('text', text or '暂无可选会话，可使用 destination=new'),))
+
+        async def query(self, key):
+            return None
+
+    @asynccontextmanager
+    async def open_sessions(_state):
+        yield ListSessions()
+
+    _ = await catalog.register(ctx, name='list_schedule_sessions', description='列出可用于定时任务的已有会话',
+        parameters={'type': 'object', 'properties': {}, 'additionalProperties': False},
+        open=open_sessions, idempotent=True, parallel=True)
 
     # 程序在目标会话的执行位里运行，入口仍以 scheduler 身份签发模型与消息 writer。
     @ctx.entrypoint
