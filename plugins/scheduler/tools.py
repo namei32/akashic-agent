@@ -15,7 +15,7 @@ from plugins.ledger.contract import ContentPart
 
 from .schedule import ScheduledJob, compute_fire_at, is_cron_expr, parse_duration
 from .store import JobStore, Operation
-from .contract import TaskSessions
+from plugins.conversation.contract import TaskSessions
 from core.common.file_io import run_file_io
 
 

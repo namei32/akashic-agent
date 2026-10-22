@@ -17,7 +17,6 @@ from plugins.ledger.contract import (
     MESSAGE_CATALOG,
     MESSAGE_WRITERS,
     OWNER_STATE,
-    SESSION_ADMIN, SESSION_ADMISSION,
     MessageReader,
 )
 from agent.plugin_composition.tasks import TASKS, Task
@@ -32,8 +31,8 @@ from .inputs import (
     ALL_TOOLS, CONTENT, CONVERSATION_COMPLETE, DELIVERY, DELIVERY_SENDERS, INPUT_ORIGIN,
     TOOL_LOADING_PRESENTATION, TOOLS, CallSource,
 )
-from .contract import SCHEDULER_INSPECTION, TASK_SESSIONS
-from .sessions import SessionTargets
+from .contract import SCHEDULER_INSPECTION
+from plugins.conversation.contract import TASK_SESSIONS
 from .inspection import SchedulerInspectionProvider
 from .runtime import SchedulerRuntime
 from .store import Fire, JobStore
@@ -47,7 +46,7 @@ desc = "持久调度：选择当前或专用会话执行，最终回复按原触
 
 
 inject = (
-    BINDINGS, TASKS, MESSAGE_CATALOG, MESSAGE_WRITERS, OWNER_STATE, SESSION_ADMIN, SESSION_ADMISSION,
+    BINDINGS, TASKS, MESSAGE_CATALOG, MESSAGE_WRITERS, OWNER_STATE, TASK_SESSIONS,
     CONTENT,
     CONVERSATION_COMPLETE,
     DELIVERY_SENDERS,
@@ -78,8 +77,7 @@ async def apply(ctx: Context) -> None:
     config = Config.model_validate(ctx.config)
     store = JobStore(ctx.workspace_file("schedules.json"))
     _ = await ctx.provide(SCHEDULER_INSPECTION, SchedulerInspectionProvider(store))
-    sessions = SessionTargets(ctx)
-    _ = await ctx.provide(TASK_SESSIONS, sessions)
+    sessions = ctx.require(TASK_SESSIONS)
     watcher: asyncio.Task[None] | None = None
     catalog = ctx.require(TOOLS)
     _ = await catalog.declare_group(ctx, description=desc)

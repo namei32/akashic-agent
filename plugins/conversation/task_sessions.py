@@ -6,8 +6,8 @@ from uuid import NAMESPACE_URL, uuid5
 
 from agent.plugin_composition import Context
 from core.common.file_io import run_file_io
-from plugins.ledger.contract import MESSAGE_CATALOG, SESSION_ADMISSION, SESSION_ADMIN, SessionAttributes
-from .inputs import INPUT_ORIGIN
+from plugins.ledger.contract import MESSAGE_CATALOG, SESSION_ADMISSION, SESSION_ADMIN, SessionAttributes, ContentPart, Control
+from plugins.delivery_policy.contract import INPUT_ORIGIN
 
 
 class UnavailableSession(ValueError):
@@ -56,7 +56,11 @@ class SessionTargets:
                 target = await self.resolve(entry.session_id)
             except UnavailableSession:
                 continue
-            targets.append({**target, 'label': entry.title or entry.session_id})
+            first = entry.first_message
+            parts = () if first is None or isinstance(first.body, Control) else first.body.parts
+            preview = next((part.value.strip().replace('\n', ' ')[:48] for part in parts
+                            if isinstance(part, ContentPart) and part.kind == 'text' and isinstance(part.value, str)), '')
+            targets.append({**target, 'label': entry.title or preview or '未命名会话'})
         return tuple(targets)
 
     async def ensure(self, session_id: str, title: str, *, inherit_from: str | None = None) -> None:

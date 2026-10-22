@@ -13,6 +13,7 @@ from plugins.ledger.contract import (
     MESSAGE_WRITERS,
     OWNER_STATE,
     SESSION_ADMISSION,
+    SESSION_ADMIN,
     MessageConflict,
     MessageReader,
     SessionAttributes,
@@ -41,7 +42,9 @@ from plugins.conversation.contract import (
     CHECK_ORIGIN as CHECK_ORIGIN,
     CONVERSATION_COMPLETE_V2 as CONVERSATION_COMPLETE,
     ConversationCompleteV2 as ConversationComplete,
+    TASK_SESSIONS,
 )
+from plugins.delivery_policy.contract import INPUT_ORIGIN
 from plugins.sources.contract import (
     SOURCE_CHANGED_V3 as SOURCE_CHANGED,
     SOURCE_SESSION_V4 as SOURCE_SESSION,
@@ -54,10 +57,11 @@ from plugins.sources.contract import (
 
 from .commands import CONTENT, CONVERSATION_COMMANDS, SOURCE_CHECK, run_commands
 from .source import update_selection
+from .task_sessions import SessionTargets
 
 api_version = 3
 name = "conversation"
-version = "1.0.0"
+version = "1.1.0"
 desc = "接纳和控制同一来源的消息，程序由调用者另行选择"
 inject = (
     BINDINGS, OWNER_STATE, TASKS, ARTIFACT_READ, COMMANDS, CONTENT, SOURCE_CHECK,
@@ -179,6 +183,10 @@ async def apply(ctx: Context) -> None:
     _ = await ctx.provide(CHECK_ORIGIN, check_origin)
     _ = await ctx.provide(CONVERSATION_COMMANDS, command)
     _ = await ctx.provide(CONVERSATION_COMPLETE, complete)
+    async def task_sessions(child: Context):
+        await child.provide(TASK_SESSIONS, SessionTargets(child))
+    await ctx.inject((MESSAGE_CATALOG, SESSION_ADMISSION, SESSION_ADMIN, INPUT_ORIGIN),
+                     task_sessions, name='task-sessions')
     _ = await ctx.require(SOURCES).register(ctx, name="conversation", open=open, accept=accept, channels=None,
         needs_reply=lambda reader: ctx.require(SOURCE_SESSION).needs_reply(reader, "conversation"))
 
