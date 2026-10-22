@@ -24,6 +24,10 @@ class SessionTargets:
         return {'session_id': 'akashic:' + address, 'channel': 'akashic', 'recipient': address}
 
     async def resolve(self, session_id: str) -> Mapping[str, str]:
+        async with self.ctx.runtime_scope():
+            return await self._resolve(session_id)
+
+    async def _resolve(self, session_id: str) -> Mapping[str, str]:
         catalog, origin = self.ctx.require(MESSAGE_CATALOG), self.ctx.require(INPUT_ORIGIN)
         def read():
             if not catalog.exists(session_id):
@@ -40,6 +44,10 @@ class SessionTargets:
         return await run_file_io(read)
 
     async def choices(self) -> tuple[Mapping[str, str], ...]:
+        async with self.ctx.runtime_scope():
+            return await self._choices()
+
+    async def _choices(self) -> tuple[Mapping[str, str], ...]:
         catalog = self.ctx.require(MESSAGE_CATALOG)
         entries = await run_file_io(lambda: catalog.sessions(visibility='listed', limit=200).items)
         targets = []
@@ -52,6 +60,10 @@ class SessionTargets:
         return tuple(targets)
 
     async def ensure(self, session_id: str, title: str, *, inherit_from: str | None = None) -> None:
+        async with self.ctx.runtime_scope():
+            await self._ensure(session_id, title, inherit_from=inherit_from)
+
+    async def _ensure(self, session_id: str, title: str, *, inherit_from: str | None = None) -> None:
         if not session_id.startswith('akashic:') or not session_id[8:]:
             raise ValueError('新建任务会话必须属于 Akashic')
         ctx, catalog = self.ctx, self.ctx.require(MESSAGE_CATALOG)
