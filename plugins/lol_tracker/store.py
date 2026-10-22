@@ -80,8 +80,8 @@ class Store:
                     db.execute("INSERT OR IGNORE INTO matches VALUES(?,?,?,?,?)",
                                (key, str(match["match_id"]), hashlib.sha256(data.encode()).hexdigest(),
                                 ended.astimezone(UTC).isoformat(), data))
-            db.execute("INSERT INTO snapshots VALUES(?,?,?)", (fingerprint, observed.isoformat(), text))
-        return True
+            created = db.execute("INSERT OR IGNORE INTO snapshots VALUES(?,?,?)", (fingerprint, observed.isoformat(), text)).rowcount
+        return bool(created)
 
     def latest(self) -> dict | None:
         with self.db() as db:
@@ -108,10 +108,24 @@ class Store:
             row = db.execute("SELECT * FROM reports WHERE id=?", (identity,)).fetchone()
             return dict(row) if row else None
 
-    def claim(self, identity: str, facts: dict) -> bool:
+    def claim(self, identity: str, facts: dict, destination: dict | None = None) -> bool:
         with self.db() as db:
-            return bool(db.execute("INSERT OR IGNORE INTO reports(id,created_at,facts) VALUES(?,?,?)",
-                                   (identity, datetime.now(UTC).isoformat(), encoded(facts))).rowcount)
+            created = bool(db.execute("INSERT OR IGNORE INTO reports(id,created_at,facts) VALUES(?,?,?)",
+                                     (identity, datetime.now(UTC).isoformat(), encoded(facts))).rowcount)
+            if created and destination is not None:
+                db.execute('INSERT INTO metadata VALUES(?,?)', ('report-destination:' + identity, encoded(destination)))
+            return created
+
+    def destination(self, identity: str) -> dict | None:
+        with self.db() as db:
+            row = db.execute('SELECT value FROM metadata WHERE key=?', ('report-destination:' + identity,)).fetchone()
+        if row is None:
+            return None  # 没有该记录的是升级前沿 EventMail/Wake 投递的报告。
+        value = json.loads(row[0])
+        if (not isinstance(value, dict) or set(value) != {'session_id', 'channel', 'recipient'}
+            or any(not isinstance(item, str) or not item or item.strip() != item for item in value.values())):
+            raise ValueError('日报目标记录损坏')
+        return value
 
     def finish(self, identity: str, body: str, error: str | None = None):
         with self.db() as db:
@@ -121,10 +135,21 @@ class Store:
         with self.db() as db:
             db.execute("UPDATE reports SET published=1,receipt=? WHERE id=?", (encoded(receipt), identity))
 
+    def delivery_result(self, identity: str, receipt: dict):
+        if receipt.get('kind') != 'session-delivery-v1' or receipt.get('status') not in {'delivered', 'rejected', 'failed'}:
+            raise ValueError('日报发送回执无效')
+        with self.db() as db:
+            db.execute('UPDATE reports SET published=?,receipt=? WHERE id=? AND published=0',
+                       (int(receipt['status'] == 'delivered'), encoded(receipt), identity))
+
     def pending(self) -> list[dict]:
         with self.db() as db:
             return [dict(row) for row in db.execute("SELECT * FROM reports WHERE published=0 ORDER BY created_at")]
 
     def reports(self, limit: int = 20) -> list[dict]:
         with self.db() as db:
-            return [dict(row) for row in db.execute("SELECT id,created_at,body,error,published FROM reports ORDER BY created_at DESC LIMIT ?", (limit,))]
+            records = [dict(row) for row in db.execute('SELECT id,created_at,body,error,published,receipt FROM reports ORDER BY created_at DESC LIMIT ?', (limit,))]
+        for record in records:
+            record['receipt'] = json.loads(record['receipt']) if record['receipt'] else None
+            record['destination'] = self.destination(record['id'])
+        return records

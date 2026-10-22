@@ -11,7 +11,10 @@ from agent.plugin_composition import RUNTIME_STARTED, RUNTIME_STOPPING, Context
 from plugins.models.contract import CHAT_MODELS
 from agent.plugin_composition.plugin_config import PLUGIN_CONFIG
 from plugins.ui.contract import UI
-from plugins.ledger.contract import ContentPart
+from plugins.ledger.contract import ContentPart, BINDINGS, MESSAGE_CATALOG, MESSAGE_WRITERS
+from plugins.content.contract import CONTENT
+from plugins.delivery.contract import DELIVERY_GUARDED_START, DELIVERY_SENDERS
+from plugins.conversation.contract import TASK_SESSIONS
 from plugins.eventmail.contract import EVENTMAIL_ALERT_SOURCE
 from plugins.tools.contract import TOOLS, Result
 from core.common.file_io import run_file_io
@@ -23,9 +26,10 @@ from .store import Store, encoded
 
 api_version = 3
 name = "lol_tracker"
-version = "1.0.2"
-desc = "查询关注玩家的国服英雄联盟战绩，生成每日分析并交由 Wake 推送"
-inject = (PLUGIN_CONFIG, TOOLS, CHAT_MODELS)
+version = "1.1.0"
+desc = "查询关注玩家的国服英雄联盟战绩，每日分析发送到固定的独立会话"
+inject = (PLUGIN_CONFIG, TOOLS, CHAT_MODELS, TASK_SESSIONS, CONTENT, BINDINGS,
+          MESSAGE_CATALOG, MESSAGE_WRITERS, DELIVERY_GUARDED_START, DELIVERY_SENDERS)
 
 
 class Query(BaseModel):
@@ -69,6 +73,7 @@ async def apply(ctx: Context) -> None:
                            parameters=Query.model_json_schema(), open=open_history, idempotent=True)
 
     async def alerts(child: Context):
+        # 只补齐升级前已创建报告的原 EventMail 回执；新报告不再走 Wake。
         source = child.require(EVENTMAIL_ALERT_SOURCE).bind("lol_tracker")
         def attach():
             runtime.report_alert = child.entrypoint(source.report)
