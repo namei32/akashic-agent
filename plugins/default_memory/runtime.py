@@ -6,6 +6,7 @@ import json
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from dataclasses import replace
+from uuid import uuid4
 from plugins.akasha.contract import MemoryScopes
 from plugins.content.contract import Content
 from plugins.ledger.contract import Input, Message, MessageCatalog
@@ -21,7 +22,8 @@ from .store import Store, digest
 class Runtime:
     def __init__(self, store: Store, catalog: MessageCatalog, projection: TurnProjection,
                  content: Content, scopes: MemoryScopes, models: ChatModels, embeddings: Embeddings,
-                 *, sources: tuple[str, ...], model_id: str | None = None, max_chars: int = 6000):
+                 *, sources: tuple[str, ...], model_id: str | None = None, max_chars: int = 6000,
+                 auto_learn: bool = False):
         self.store = store
         self.catalog = catalog
         self.projection = projection
@@ -36,7 +38,10 @@ class Runtime:
         self.recall_lock = asyncio.Lock()
         self.errors: dict[str, str] = {}
         self.last_total = 0
-        self.paused = False
+        self.auto_learn = auto_learn
+        self.control_lock = asyncio.Lock()
+        self.changed = asyncio.Event()
+        self.current_source: str | None = None
 
     async def vectors(self, texts: Sequence[str]) -> tuple[tuple[float, ...], ...]:
         descriptor = self.embeddings.describe()
@@ -75,19 +80,41 @@ class Runtime:
         vectors = await self.vectors([fact.summary for fact in draft.facts]) if draft.facts else ()
         return await run_io(self.store.apply, source, draft, vectors)
 
+    async def set_paused(self, paused: bool, *, request_id: str | None = None,
+                         expected_version: int | None = None) -> dict[str, object]:
+        try:
+            async with self.control_lock:
+                return await run_io(self.store.set_paused, paused, request_id or uuid4().hex,
+                                    expected_version=expected_version)
+        finally:
+            # A committed resume remains effective even when its acknowledgement
+            # is cancelled; the next admission reads the durable control.
+            self.changed.set()
+
+    async def _admit(self, source: Source | None = None) -> bool:
+        # The durable control and admission are ordered independently of the
+        # long model call. A pause can return while an admitted turn settles.
+        async with self.control_lock:
+            control = await run_io(self.store.control)
+            if control["paused"]:
+                return False
+            if source is not None:
+                self.current_source = source.key
+            return True
+
     async def consume(self, *, limit: int | None = None, retry: bool = False) -> dict[str, object]:
         async with self.learning_lock:
+            if not await self._admit():
+                return await self.status()
             if retry:
                 await run_io(self.store.retry_epoch, advance=True)
             self.errors = await run_io(self.store.failures)
-            if self.paused:
-                return await self.status()
             sources = await self.sources_snapshot()
             self.last_total = len(sources)
             learned = await run_io(self.store.learned)
             attempted = 0
             for source in sources:
-                if self.paused or (limit is not None and attempted >= limit):
+                if limit is not None and attempted >= limit:
                     break
                 previous = learned.get(source.key)
                 if previous is not None and previous[0] != source.digest:
@@ -96,18 +123,20 @@ class Runtime:
                     continue
                 if source.key in self.errors:
                     continue
+                if not await self._admit(source):
+                    break
                 try:
                     attempted += 1
                     await self.learn(source)
                 except asyncio.CancelledError:
                     raise
                 except (ValueError, RuntimeError, TimeoutError) as error:
-                    # Expose failures and retain the draft/cursor. Automatic events
-                    # do not repeatedly charge for the same invalid model response.
                     self.errors[source.key] = str(error)
                     await run_io(self.store.note_failure, source.key, str(error))
                     if ModelError.matches(error):
                         break
+                finally:
+                    self.current_source = None
             return await self.status()
 
     async def audit(self) -> dict[str, object]:
@@ -121,8 +150,10 @@ class Runtime:
 
     async def status(self) -> dict[str, object]:
         value = await run_io(self.store.status)
-        return {**value, "eligible_turns": self.last_total, "paused": self.paused,
-                "failures": dict(self.errors)}
+        control = await run_io(self.store.control) if value["initialized"] else {"paused": False, "version": 0}
+        return {**value, "eligible_turns": self.last_total, "paused": control["paused"],
+                "control_version": control["version"], "auto_learn": self.auto_learn,
+                "current_source": self.current_source, "failures": dict(self.errors)}
 
     def route(self, session_id: str, *, write: bool = False) -> str:
         route = self.scopes.route(session_id)

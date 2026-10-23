@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
+from typing import cast
 from collections.abc import Iterator, Mapping, Sequence
 from .schema import Draft, Fact, Memory, Source
 from .retrieval import cosine, normalized
@@ -241,6 +242,51 @@ class Store:
             db.execute("INSERT INTO receipts VALUES (?,?,?)", (key, fingerprint, encode(result)))
             db.commit()
             return result
+
+    @staticmethod
+    def _control(db: sqlite3.Connection) -> dict[str, object]:
+        row = db.execute("SELECT value FROM metadata WHERE key='learning_control'").fetchone()
+        if row is None:
+            return {"paused": False, "version": 0}
+        value = json.loads(row[0])
+        if (not isinstance(value, dict) or set(value) != {"paused", "version"}
+                or type(value["paused"]) is not bool or type(value["version"]) is not int
+                or value["version"] < 0):
+            raise ValueError("Default Memory learning control is corrupt")
+        return value
+
+    def control(self) -> dict[str, object]:
+        with self.connection() as db:
+            return self._control(db)
+
+    def set_paused(self, paused: bool, request_id: str, *,
+                   expected_version: int | None = None) -> dict[str, object]:
+        """One durable control change; delayed retries cannot undo newer intent."""
+        if type(paused) is not bool or not request_id or len(request_id) > 160:
+            raise ValueError("Invalid learning control request")
+        if expected_version is not None and (type(expected_version) is not int or expected_version < 0):
+            raise ValueError("Invalid learning control version")
+        key = "control:" + request_id
+        fingerprint = digest([paused, expected_version])
+        with self.connection(write=True) as db:
+            db.execute("BEGIN IMMEDIATE")
+            saved = db.execute("SELECT fingerprint,value FROM receipts WHERE key=?", (key,)).fetchone()
+            if saved is not None:
+                if saved[0] != fingerprint:
+                    raise ValueError("Learning control request ID reused for different arguments")
+                return json.loads(saved[1])
+            current = self._control(db)
+            if expected_version is not None and current["version"] != expected_version:
+                raise ValueError("学习状态已改变，请刷新后再操作")
+            # Even a repeated intent supersedes older, not-yet-delivered commands.
+            version = cast(int, current["version"]) + 1
+            result: dict[str, object] = {"paused": paused, "version": version}
+            db.execute("INSERT INTO metadata VALUES ('learning_control',?) "
+                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (encode(result),))
+            receipt = {**result, "request_id": request_id}
+            db.execute("INSERT INTO receipts VALUES (?,?,?)", (key, fingerprint, encode(receipt)))
+            db.commit()
+            return receipt
 
     def failures(self) -> dict[str, str]:
         with self.connection() as db:
