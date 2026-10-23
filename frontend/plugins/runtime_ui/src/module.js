@@ -37,8 +37,16 @@ function mountRuntime(host, http) {
   };
   const request = async (path, signal = abort.signal) => {
     const response = await http.request(path, { signal });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.detail || `读取失败：HTTP ${response.status}`);
+    const failure = `读取失败：HTTP ${response.status}`;
+    let payload;
+    try {
+      payload = await response.json();
+    } catch {
+      throw new Error(response.ok
+        ? "运行目录返回了无效数据，请刷新后重试。"
+        : `${failure}。服务未返回错误详情，请查看运行日志。`);
+    }
+    if (!response.ok) throw new Error(typeof payload?.detail === "string" ? payload.detail : failure);
     return payload;
   };
   const clearDetail = () => {

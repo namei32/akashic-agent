@@ -142,7 +142,7 @@ def _driver_context(generation_id: str, identity: ComputerCall, call_id: str) ->
 
 api_version = 3
 name = "computer"
-version = "2.0.0"
+version = "2.0.1"
 desc = "The user's logged-in browser: tabs, anonymous contexts, and visual control"
 author = "Akashic Core"
 inject = (UI,
@@ -335,7 +335,7 @@ async def apply(ctx: Context) -> None:
         ctx,
         McpServerDefinition(
             name="computer",
-            command=("mcp_server.py",),
+            command=("python", "mcp_server.py"),
             workload_env=(WorkloadEnv("COMPUTER_URL", workload, "gateway"),),
         ),
     )

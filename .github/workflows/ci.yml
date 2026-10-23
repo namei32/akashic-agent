@@ -74,7 +74,9 @@ jobs:
           .venv/bin/python scripts/runtime_diagnostics_scenario.py
 
       - name: Run frontend typecheck
-        run: npm run typecheck
+        run: |
+          npm run typecheck
+          npm run test:runtime-ui
 
       - name: Build and load plugin web modules
         run: |
