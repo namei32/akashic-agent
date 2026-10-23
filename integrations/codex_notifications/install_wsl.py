@@ -181,7 +181,7 @@ def main() -> int:
         parser.error("WSL 发行版或用户名称无效")
     for name in ("workspace", "windows_codex_home", "state", "install_root", "systemd_dir"):
         path = getattr(args, name).expanduser().resolve()
-        if any(char in str(path) for char in '\n\r"%`$'):
+        if any(char in str(path) for char in '\n\r"%`$&|<>^;'):
             parser.error("安装路径不能含换行、引号或命令展开字符")
         setattr(args, name, path)
     if not args.windows_codex_home.is_dir():
@@ -211,8 +211,8 @@ def main() -> int:
     finally:
         box.close()
     arguments = [python, str(target / "bridge.py"), "collect", "--state", str(args.state)]
-    windows = "wsl.exe " + " ".join('"' + value + '"' for value in
-        ["--distribution", args.distro, "--user", args.wsl_user, "--exec", *arguments])
+    windows = subprocess.list2cmdline(["wsl.exe", "--distribution", args.distro,
+        "--user", args.wsl_user, "--exec", *arguments])
     hook_path = args.windows_codex_home / "hooks.json"
     previous = json.loads(hook_path.read_text(encoding="utf-8-sig")) if hook_path.exists() else {}
     if not isinstance(previous, dict):
