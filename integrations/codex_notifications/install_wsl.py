@@ -133,7 +133,8 @@ def install_plugin(endpoint: str, destination: Path) -> None:
     if hashlib.sha256(bundle.read_bytes()).hexdigest() != record["sha256"]:
         raise ValueError("已准备的插件包摘要不匹配")
     operation_path = output / "operation.json"
-    if operation_path.exists():
+    existing_operation = operation_path.exists()
+    if existing_operation:
         saved_operation = json.loads(operation_path.read_text())
         if not isinstance(saved_operation, dict) or not isinstance(saved_operation.get("update_id"), str):
             raise ValueError("已保存的插件安装身份无效")
@@ -144,8 +145,9 @@ def install_plugin(endpoint: str, destination: Path) -> None:
     async def activate():
         async with asyncio.timeout(90):
             async with await AsyncAkashic.connect(endpoint) as client:
-                await client.request("plugin/install", {**operation, "source": str(bundle),
-                    "marketplace": "local", "ref": "", "sparse": []})
+                if not existing_operation:
+                    await client.request("plugin/install", {**operation, "source": str(bundle),
+                        "marketplace": "local", "ref": "", "sparse": []})
                 while True:
                     status = await client.request("plugin/update", operation)
                     if not isinstance(status, dict):

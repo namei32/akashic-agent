@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import json
 import os
+import shutil
 from pathlib import Path
 import sys
 
@@ -33,12 +34,16 @@ async def run(directory: Path) -> dict:
         process = await asyncio.create_subprocess_exec(sys.executable,
             str(ROOT / "integrations/codex_notifications/install_wsl.py"), "--workspace", str(workspace),
             "--windows-codex-home", str(windows), "--distro", "Ubuntu-24.04", "--wsl-user", "namei",
-            "--state", str(state), "--install-root", str(artifacts), "--systemd-dir", str(units), "--no-start",
+            "--state", str(state), "--install-root", str(artifacts), "--systemd-dir", str(units), "--no-start", "--install-plugin",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         out, err = await asyncio.wait_for(process.communicate(), 90)
         return process.returncode, out.decode(), err.decode()
 
-    async with application(directory, replying=False, extra_sources=configure):
+    def without_receiver(sources):
+        configure(sources)
+        shutil.rmtree(sources / "codex_notifications")
+
+    async with application(directory, replying=False, extra_sources=without_receiver):
         code, out, err = await install(directory / "workspace")
         assert code == 0, (out, err)
         details = json.loads(out.splitlines()[-1])
@@ -61,7 +66,7 @@ async def run(directory: Path) -> dict:
         assert (await install(directory / "workspace"))[0] == 1
         assert saved_bridge.read_text().endswith('# scenario tampering\n')
         assert hook_file.read_bytes() == before_hook
-    return {"real_wsl_install": True, "existing_hooks_and_notify_preserved": True,
+    return {"real_wsl_install": True, "plugin_install_and_repeat": True, "existing_hooks_and_notify_preserved": True,
             "windows_command_generated": True, "idempotent_install": True,
             "unavailable_receiver_does_not_change_hooks": True, "changed_artifact_rejected": True}
 
