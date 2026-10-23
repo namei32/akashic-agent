@@ -87,6 +87,7 @@ async def run(directory: Path) -> dict[str, object]:
     frozen = asyncio.Event()
     release = asyncio.Event()
     handlers: set[asyncio.Task] = set()
+    routed: dict[str, str] = {}
 
     async def serve(reader, writer):
         task = asyncio.current_task()
@@ -120,10 +121,16 @@ async def run(directory: Path) -> dict[str, object]:
                 # 定时轮里再建一个原文提醒，目标沿用本次触发的会话。
                 steps = [[("load_tools", {"plugin": "scheduler"})], [("tool_call", {"name": "schedule", "arguments": {
                     "action": "notify", "trigger": "after", "when": "1s", "text": "followup-notice", "timezone": "UTC"}})]]
+            elif case in {'route_new', 'route_existing', 'route_missing'}:
+                destination = {'destination': 'new', 'session_title': '每日战绩'} if case == 'route_new' else {
+                    'destination': 'existing', 'session_id': routed.get('session_id', '') if case == 'route_existing' else 'akashic:missing'}
+                steps = [[('load_tools', {'plugin': 'scheduler'})], [('tool_call', {'name': 'schedule', 'arguments': {
+                    'action': 'notify', 'trigger': 'every' if case == 'route_new' else 'after', 'when': '1s',
+                    'text': case + '-notice', 'name': case, 'timezone': 'UTC', **destination}})]]
             elif case not in {"frozen", "removed"}:
                 # interrupt 一次提交两个调用：用户插话时第二个可能还没开始。
                 steps.append([("tool_call", {"name": name, "arguments": {}})] * (2 if case in {"interrupt", "cancelled"} else 1))
-            if case != "followup":
+            if case != "followup" and not case.startswith('route_'):
                 steps.append([("tool_call", {"name": "memorize", "arguments": {}})])
             if len(calls) <= len(steps):
                 result = {"calls": [{"id": f"{case}-{len(calls)}-{index}", "name": tool, "arguments": arguments}
@@ -148,6 +155,11 @@ async def run(directory: Path) -> dict[str, object]:
         for name in ("scheduler", "timer", "delivery_policy"):
             shutil.copytree(ROOT / "plugins" / name, sources / name, ignore=shutil.ignore_patterns("__pycache__"))
         delivery_sources(sources)
+        sender = sources / 'test_sender/plugin.py'
+        sender.write_text(sender.read_text().replace(
+            'await ctx.require(inject[0]).register(ctx, name="test", idempotent=True, open=open)',
+            'await ctx.require(inject[0]).register(ctx, name="test", idempotent=True, open=open)\n'
+            '    await ctx.require(inject[0]).register(ctx, name="akashic", idempotent=True, open=open)'))
         entry = sources / "test_provider/plugin.py"
         source = entry.read_text()
         start, end = source.index("    class Driver:"), source.index("    descriptor =")
@@ -221,6 +233,46 @@ async def run(directory: Path) -> dict[str, object]:
                 log.writer(session_id, author="assistant", source="seed", body_types=(Output,),
                            content={"text": check_text}).append(
                     "seed:" + session_id, Output((ContentPart("text", "history-secret"),), "complete"))
+
+            # 通过真实渠道输入、模型工具调用和调度执行，核对专用会话和重放后的固定目标。
+            async def request_destination(case: str):
+                address = 'task-creation:' + case
+                await root.context.require(CHANNEL_INPUT)('test:' + address, case, ChannelInboundMessage(
+                    'test', 'user', address, 'case:' + case, datetime.now(UTC), {}))
+                async with asyncio.timeout(30):
+                    while not any(isinstance(row.body, Output) and row.body.finish == 'complete'
+                                  and 'completed:' + case in str(row.body.parts)
+                                  for row in log.reader('test:' + address).snapshot()):
+                        await asyncio.sleep(.02)
+
+            await request_destination('route_new')
+            async with asyncio.timeout(30):
+                while True:
+                    state = await asyncio.to_thread(store.read)
+                    fresh = [fire for fire in state.fires.values() if fire.job.name == 'route_new' and fire.status == 'delivered']
+                    if len(fresh) >= 2:
+                        break
+                    await asyncio.sleep(.02)
+            routed['session_id'] = fresh[0].job.session_id
+            assert routed['session_id'].startswith('akashic:')
+            assert {fire.job.session_id for fire in fresh} == {routed['session_id']}
+            assert log.reader(routed['session_id']).title == '每日战绩'
+            async with scheduler_context.runtime_scope():
+                await store.cancel('stop-route-new', (fresh[0].job.id,))
+            # 重新打开真实 JobStore 后，任务身份和目的地保持不变。
+            assert JobStore(workspace / 'schedules.json').read().fires[fresh[0].key].job.session_id == routed['session_id']
+            original_rows = rows(workspace)
+            await request_destination('route_existing')
+            async with asyncio.timeout(30):
+                while not any(fire.job.name == 'route_existing' and fire.status == 'delivered'
+                              for fire in (await asyncio.to_thread(store.read)).fires.values()):
+                    await asyncio.sleep(.02)
+            assert any('route_existing-notice' in str(row.body) for row in log.reader(routed['session_id']).snapshot())
+            assert not any(row.source.startswith('scheduler:') for case in ('route_new', 'route_existing')
+                           for row in log.reader('test:task-creation:' + case).snapshot())
+            await request_destination('route_missing')
+            assert not any(job.name == 'route_missing' for job in (await asyncio.to_thread(store.read)).jobs.values())
+            assert set(original_rows).issubset(rows(workspace))
 
             # 2. scheduler 已启动后安装 provider；真实模型加载并调用其工具。
             await install(late)
@@ -350,7 +402,9 @@ async def run(directory: Path) -> dict[str, object]:
                 calls = (workspace / "plugin-data" / (name + "-lab") / "calls.jsonl").read_text().splitlines()
                 assert len(calls) == count, (name, calls)
             sent = (workspace / "plugin-data/test_sender-builtin/sent.jsonl").read_text().splitlines()
-            assert len(sent) == 10 and len(set(sent)) == 10
+            base_sent = [line for line in sent if not json.loads(line)[1].startswith('task-creation:')
+                         and json.loads(line)[1] != routed['session_id'].removeprefix('akashic:')]
+            assert len(base_sent) == 10 and len(set(sent)) == len(sent)
             with sqlite3.connect(workspace / "sessions.db") as connection:
                 assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
     finally:
@@ -361,7 +415,8 @@ async def run(directory: Path) -> dict[str, object]:
         (directory / "requests.json").write_text(json.dumps(requests, ensure_ascii=False, indent=2))
     return {"in_session": True, "history_none_isolated": True, "history_session_included": True,
             "late_registration": True, "concurrent_fixed_views": True, "uninstall": True,
-            "disabled_tools_rejected": True, "messages_preserved": True, "deliveries": 10, "user_preempts_task": True, "cancelled_round_closed": True, "followup_from_task": True,
+            "disabled_tools_rejected": True, "messages_preserved": True, "deliveries": len(sent), "dedicated_sessions": True,
+            "user_preempts_task": True, "cancelled_round_closed": True, "followup_from_task": True,
             "model_failure_settled": True, "model_requests": {key: len(value) for key, value in requests.items()}}
 
 
