@@ -48,6 +48,7 @@ from plugins.models.contract import (
 )
 from plugins.models.contract import BoundModelDescriptor
 from plugins.models.contract import ModelCallStats
+from plugins.models.contract import ModelUsageQuery
 
 MODEL_ROLES = ("default", "fast", "agent", "vision")
 _LEGACY_OPENAI_DRIVER_IDS = ("openai", "deepseek", "qwen")
@@ -632,6 +633,15 @@ class ModelsStore:
                 **{**usage, "coverage": cast(UsageCoverage, usage["coverage"])},
             ),
         )
+
+    def read_usage_report(self, query: ModelUsageQuery) -> dict[str, object]:
+        """统计仅借用只读连接；同一响应内的总计与明细来自同一快照。"""
+        from .usage_report import read_report
+
+        with self._connect(read_only=True) as connection:
+            connection.execute("BEGIN")
+            columns = require_model_calls_schema(connection)
+            return read_report(connection, query, has_attempt="attempt" in columns)
 
     def add_connection(self, command: AddConnection) -> int:
         """Add one connection and credential as one revision."""
