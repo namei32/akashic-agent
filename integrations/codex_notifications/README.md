@@ -60,7 +60,8 @@ Windows Hook 用 `commandWindows` 通过 `wsl.exe --distribution ... --user ... 
 安装器不会写入 Codex 信任记录或绕过信任审核。
 
 服务依赖 WSL 中已启用 systemd 和该用户的运行会话；使用 `--no-start` 可以只准备
-配置。用户服务的实际状态以 `systemctl --user is-active` 为准，不能用安装命令退出
+配置。需要注销终端后继续运行时，管理员可执行 `loginctl enable-linger <WSL用户名>`
+启用用户服务驻留；这不会让已经关机或休眠的 Windows 继续执行任务。用户服务的实际状态以 `systemctl --user is-active` 为准，不能用安装命令退出
 成功代替桌面 Hook 已触发。机器休眠、WSL 停止或尚未信任 Hook 时不能收到新事件。
 
 ```bash
