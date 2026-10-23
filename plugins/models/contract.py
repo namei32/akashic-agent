@@ -17,6 +17,7 @@ from dataclasses import (
     replace,
     dataclass,
 )
+from datetime import datetime
 from types import MappingProxyType
 from collections.abc import (
     AsyncGenerator,
@@ -603,6 +604,25 @@ class ModelCallStats:
 
 
 MODEL_CALL_STATS = ServiceKey[Callable[[str], ModelCallStats]]("models.call-stats.v1")
+
+
+@dataclass(frozen=True, slots=True)
+class ModelUsageQuery:
+    """UTC 时间窗口内的调用统计；cursor 仅用于明细翻页。"""
+
+    start: datetime
+    end: datetime
+    model: str | None = None
+    cursor: str | None = None
+
+
+class ModelUsageReports(Protocol):
+    async def report(self, query: ModelUsageQuery) -> dict[str, object]:
+        """返回字段级覆盖、聚合和最多 50 条明细；不含正文、凭据或失败原文。"""
+        ...
+
+
+MODEL_USAGE_REPORTS = ServiceKey[ModelUsageReports]("models.usage-reports.v1")
 
 
 class CacheUsageRead(Protocol):
