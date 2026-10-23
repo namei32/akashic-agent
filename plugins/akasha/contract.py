@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Annotated, Any, Literal, Protocol, Self
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, FiniteFloat, model_validator
 from plugins.ledger.contract import CallRef
@@ -108,3 +109,17 @@ class RecallRecordsRead(Protocol):
 
 # Akasha dashboard 读取查询出处，不取得学习 writer。
 AKASHA_RECORDS_VIEW = ServiceKey[Callable[[], RecallRecordsRead]]("akasha.recall-records.v1")
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryRoute:
+    """Project policy routing, shared without transferring the policy writer."""
+    write: str | None
+    read: str | None
+
+
+class MemoryScopes(Protocol):
+    def route(self, session_id: str) -> MemoryRoute: ...
+
+
+MEMORY_SCOPES = ServiceKey[MemoryScopes]("akasha.memory-scopes.v1")

@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -22,6 +21,8 @@ from plugins.ledger.contract import (
     SessionAttributes,
 )
 
+from .contract import MemoryRoute as Route
+
 LearnPolicy = Literal["global", "isolated", "off"]
 LEARN_POLICIES: tuple[LearnPolicy, ...] = get_args(LearnPolicy)
 DEFAULT_GRAPH = "default"
@@ -34,14 +35,6 @@ class MemoryDisabled(ValueError):
 
 class PolicyLocked(ValueError):
     """已有 Session 按旧策略路由，改写需要显式重建协议。"""
-
-
-@dataclass(frozen=True, slots=True)
-class Route:
-    """None disables the corresponding learning or recall route."""
-
-    write: str | None
-    read: str | None
 
 
 def graph_key(isolated: tuple[tuple[str, str], ...]) -> str:
