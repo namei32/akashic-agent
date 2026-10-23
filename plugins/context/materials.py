@@ -162,10 +162,12 @@ class ContextMaterials:
     def __init__(
         self, ctx: Context, *, prompt_sources: Mapping[str, str],
         summary_source: tuple[str, str] | None = None,
+        recall_source: tuple[str, str] | None = None,
     ):
         self._ctx = ctx
         self._prompt_sources = dict(prompt_sources)
         self._summary_source = summary_source
+        self._recall_source = recall_source
         self._sources: dict[str, _Source] = {}
 
     async def register(
@@ -229,6 +231,11 @@ class ContextMaterials:
                 for name, source in active.items()
                 if source.kind not in exclude_kinds
             }
+            if self._recall_source is not None and "recall" not in exclude_kinds:
+                name, plugin_id = self._recall_source
+                selected = sources.get(name)
+                if selected is None or selected.kind != "recall" or selected.plugin_id != plugin_id:
+                    raise ValueError(f"所选长期记忆尚未就绪: {plugin_id}；请恢复提供者或显式切换记忆配置")
             if self._summary_source is not None:
                 name, plugin_id = self._summary_source
                 source = sources.get(name)
