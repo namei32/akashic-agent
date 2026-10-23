@@ -162,6 +162,10 @@ plugin = "telegram_sender@release"
 [rows."akasha"]
 plugin = "akasha@release"
 
+[rows."default_memory"]
+plugin = "default_memory@release"
+disabled = true
+
 [rows."drift"]
 plugin = "drift@release"
 
