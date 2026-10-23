@@ -378,7 +378,11 @@ async def run(ctx: Context, interest: Interest) -> None:
             _identity, rule, model_id = select_learning()
             return rule, embedder(rule, model_id)
 
-    target = SemanticInterest(learning, ctx.require(MESSAGE_CATALOG), ctx.require(MESSAGE_EMBEDDINGS), select_interest, fill_missing=not config.memory_enabled)
+    target = SemanticInterest(
+        learning, ctx.require(MESSAGE_CATALOG), ctx.require(MESSAGE_EMBEDDINGS), select_interest,
+        fill_missing=not config.memory_enabled,
+        member=lambda session_id: policies.route(session_id).write is not None,
+    )
     def readiness() -> str | None:
         try:
             ctx.require(EMBEDDINGS).describe()

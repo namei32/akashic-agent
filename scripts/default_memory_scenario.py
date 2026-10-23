@@ -182,6 +182,10 @@ async def run(folder: Path) -> dict[str, object]:
         scores = await interest.score(["coffee"], cutoff=datetime.now(UTC).isoformat())
         assert scores[0] > 0, scores
         assert not (workspace / "memory/akasha.db").exists()
+        with sqlite3.connect(workspace / "sessions-derived.db") as derived:
+            assert derived.execute(
+                "SELECT count(*) FROM message_embeddings WHERE message_id IN ('off','off:reply','hidden','hidden:reply','excluded','excluded:reply')"
+            ).fetchone()[0] == 0
         await append("scenario:retry", "retry", "I prefer tea; malformed fixture.")
         before = snapshot(workspace)
         failed = await port.consume()
