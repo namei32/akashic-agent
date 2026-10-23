@@ -74,14 +74,16 @@ function Usage({ctx}: {ctx: WebHostContextV1}) {
       </select>
       <button type="button" aria-disabled={busy} onClick={refresh}>刷新</button>
     </div>
-    <div className="usage-read-status" role="status">{busy ? loaded ? "正在更新，暂显示上次结果…" : "正在读取调用记录…"
-      : loaded ? `${date(loaded.report.start)} — ${date(loaded.report.end)} · ${loaded.selection.model || "全部模型"}` : ""}</div>
+    <div className="usage-read-status" role="status">
+      <span>{loaded ? `${date(loaded.report.start)} — ${date(loaded.report.end)}` : "\u00a0"}</span>
+      <span>{busy ? loaded ? "正在更新，暂显示上次结果…" : "正在读取调用记录…"
+        : error ? loaded ? "已保留上次结果" : "\u00a0" : "按调用开始时间 · 设备本地时区"}</span>
+    </div>
     {error && <p className="usage-error" role="alert">{error}{loaded && "。以下保留上次读取结果。"}
       <button type="button" onClick={() => setSelection(value => ({...value}))}>重试</button></p>}
     {loaded && report ? <div className="usage-results" aria-busy={busy}>
       <Overview totals={report.summary} />
-      <section className="usage-chart-section"><div className="usage-section-heading"><h2>用量走势</h2><span>已知输入 / 输出</span></div>
-        <Trend report={report} /></section>
+      <section className="usage-chart-section"><Trend report={report} /></section>
       <section className="usage-calls-section"><div className="usage-section-heading"><h2>调用明细</h2><span>{number(report.summary.calls)} 次尝试</span></div>
         <Calls calls={report.calls} pageKey={JSON.stringify(loaded.selection)} />
         <nav className="usage-pagination" aria-label="调用分页">

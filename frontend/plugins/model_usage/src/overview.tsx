@@ -5,7 +5,7 @@ export function ExactNumber({value, label}: {value: number | null; label: string
   if (value === null) return <>—</>;
   return <details className="usage-exact" onBlur={event => {
     if (!event.currentTarget.contains(event.relatedTarget)) event.currentTarget.open = false;
-  }} onKeyDown={event => { if (event.key === "Escape") { event.currentTarget.open = false; event.stopPropagation(); } }}>
+  }} onKeyDown={event => { if (event.key === "Escape") { event.preventDefault(); event.currentTarget.open = false; event.stopPropagation(); } }}>
     <summary title="查看完整数值" aria-label={`${label} ${number(value)}，查看完整数值`}>{compact(value)}</summary>
     <span>{number(value)} <small>tokens</small></span>
   </details>;
