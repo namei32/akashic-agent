@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from datetime import UTC, datetime, timedelta
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -19,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 
-def seed(workspace: Path):
+def seed(workspace: Path, *, preview: bool = False):
     from plugins.models.contract import BoundModelDescriptor, CapabilitySources, LLMResponse, ModelCapabilities, ModelUsage
     from plugins.models.store import ModelsStore
 
@@ -54,6 +55,17 @@ def seed(workspace: Path):
                           next_attempt_at=0, send_evidence="unknown")
         finish(start("retry"), exact)
         start("unsettled")
+        if preview:
+            # 浏览器用真实账本覆盖大数、长型号和所有用量未知；HTTP 回归仍用原 57 条。
+            for index in range(4):
+                model = replace(binding, binding_id="large", model="example/reasoning-model-2026-10-preview")
+                identity = start(f"preview-large:{index}", model)
+                store.finish_call(identity, usage=ModelUsage(input_tokens=1_024_768, output_tokens=8_192,
+                    cached_input_tokens=700_000, reasoning_output_tokens=3_200, coverage="exact", covered_request_count=1),
+                    failure=None, duration_ms=25_000, first_token_ms=12_500)
+            for index in range(2):
+                model = replace(binding, binding_id="unknown", model="usage-unavailable")
+                finish(start(f"preview-unknown:{index}", model), None)
     finally:
         store.close()
     return binding
@@ -79,7 +91,7 @@ async def run(directory: Path, port: int | None) -> dict[str, bool]:
     os.environ.update(HOME=str(home), AKASHIC_PLUGIN_HOME=str(home), AKASHIC_PLUGIN_DISTRIBUTION="",
                       AKASHIC_EXTRA_PLUGIN_DIRS="", AKASHIC_EXECUTION_MODE="local")
     PluginSelection(workspace).initialize()
-    seed(workspace)
+    seed(workspace, preview=port is not None)
     shutil.copytree(ROOT / "plugins", sources, ignore=shutil.ignore_patterns("__pycache__"))
     if port is not None:
         shutil.copytree(ROOT / "static/dashboard", sources / "ui/static/dashboard", dirs_exist_ok=True)
