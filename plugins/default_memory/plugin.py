@@ -71,8 +71,15 @@ async def apply(ctx: Context) -> None:
     async def rpc_backfill(params: BaseModel):
         request = Backfill.model_validate(params.model_dump())
         return await runtime.consume(limit=request.limit, retry=request.retry)
+    async def rpc_pause(_params: BaseModel):
+        runtime.paused = True
+        return await runtime.status()
+    async def rpc_resume(_params: BaseModel):
+        runtime.paused = False
+        return await runtime.status()
     for name, model, operation in (
         ("status", Empty, rpc_status), ("audit", Empty, rpc_audit), ("backfill", Backfill, rpc_backfill),
+        ("pause", Empty, rpc_pause), ("resume", Empty, rpc_resume),
     ):
         await ctx.provide(RpcMethod.key("default-memory/" + name), RpcMethod(model, ctx.entrypoint(operation)))
     health = await ctx.health("learning", required=False)
