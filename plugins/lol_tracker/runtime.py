@@ -12,17 +12,20 @@ from zoneinfo import ZoneInfo
 
 from agent.plugin_composition import Context
 from plugins.models.contract import CHAT_MODELS, ModelError, ModelRequest
+from plugins.ledger.contract import MESSAGE_CATALOG
 from core.common.file_io import run_file_io
 
 from .analysis import ANALYSIS_PROMPT, metrics, render
 from .config import Config
 from .store import Store, encoded
+from .delivery import ReportDelivery
 
 
 class Runtime:
     def __init__(self, ctx: Context, config: Config, store: Store):
         self.ctx, self.config, self.store = ctx, config, store
         self.report_alert: Callable[..., Awaitable[Mapping[str, object]]] | None = None
+        self.delivery = ReportDelivery(ctx, store)
         self.running = False
         self.error = ""
         self.lock = asyncio.Lock()
@@ -49,11 +52,19 @@ class Runtime:
         await run_file_io(lambda: self.store.ingest(read()))
 
     async def status(self) -> dict:
+        async with self.ctx.runtime_scope():
+            return await self._status()
+
+    async def _status(self) -> dict:
         snapshot = await run_file_io(self.store.latest)
         collector_status = snapshot.get("status", "waiting") if snapshot else "waiting"
         if snapshot and datetime.now(UTC) - datetime.fromisoformat(snapshot["observed_at"]) > timedelta(minutes=15):
             collector_status = "stale"
-        return {"running": self.running, "error": self.error, "push_available": self.report_alert is not None,
+        session_id = self.config.report_session_id or self.delivery.default_target()['session_id']
+        catalog = self.ctx.require(MESSAGE_CATALOG)
+        session_exists = await run_file_io(lambda: catalog.exists(session_id) and not catalog.reader(session_id).deleted)
+        return {"running": self.running, "error": self.error, "push_available": True,
+                "report_session_id": session_id, "report_session_exists": session_exists,
                 "observed_at": snapshot.get("observed_at") if snapshot else None,
                 "collector_status": collector_status,
                 "collector_error": snapshot.get("error") if snapshot else None,
@@ -89,7 +100,8 @@ class Runtime:
             if previous:
                 return previous
             facts = await self.facts(start, end, title)
-            claimed = await run_file_io(lambda: self.store.claim(identity, facts))
+            destination = await self.delivery.target(self.config.report_session_id)
+            claimed = await run_file_io(lambda: self.store.claim(identity, facts, destination))
             if not claimed:
                 existing = await run_file_io(lambda: self.store.report(identity))
                 if existing is None:
@@ -117,10 +129,8 @@ class Runtime:
                 raise RuntimeError("报告未持久保存")
             return saved
 
-    async def publish_pending(self):
+    async def publish_pending(self, *, retry_id: str | None = None):
         publish = self.report_alert
-        if publish is None:
-            return
         for report in await run_file_io(self.store.pending):
             if report["body"] is None:
                 # A previous model request may have completed remotely. Do not silently bill it again.
@@ -130,6 +140,16 @@ class Runtime:
                 report = await run_file_io(partial(self.store.report, report["id"]))
                 if report is None:
                     raise RuntimeError("待发送报告丢失")
+            destination = await run_file_io(partial(self.store.destination, report['id']))
+            if destination is not None:
+                receipt = await self.delivery.send(report, retry=report['id'] == retry_id)
+                await run_file_io(partial(self.store.delivery_result, report['id'], receipt))
+                if receipt['status'] != 'delivered':
+                    self.error = str(receipt.get('error') or '日报尚未送达')
+                continue
+            if publish is None:
+                self.error = '升级前的报告等待原通知通道恢复；新报告使用独立会话'
+                continue
             receipt = await publish(event_id=report["id"],
                 payload={"title": "英雄联盟战绩汇总", "text": report["body"],
                          "report_id": report["id"], "source": "lol_tracker", "category": "subscribed_daily_report"},
@@ -165,6 +185,10 @@ class Runtime:
             self.running = False
 
     async def manual(self, request_id: str, days: int) -> dict:
+        async with self.ctx.runtime_scope():
+            return await self._manual(request_id, days)
+
+    async def _manual(self, request_id: str, days: int) -> dict:
         if not self.running:
             raise ValueError("请先开启英雄联盟战绩插件")
         try:
@@ -178,5 +202,13 @@ class Runtime:
             end = min(end, datetime.fromisoformat(latest["observed_at"]).astimezone(end.tzinfo))
         report = await self.make_report("manual:" + request_id, end-timedelta(days=days), end, f"近 {days} 天")
         async with self.lock:
-            await self.publish_pending()
-        return {"report_id": report["id"], "status": "queued", "body": report["body"]}
+            await self.publish_pending(retry_id=report['id'])
+        current = await run_file_io(partial(self.store.report, report['id']))
+        destination = await run_file_io(partial(self.store.destination, report['id']))
+        if current is None:
+            raise RuntimeError('报告不存在')
+        if destination is not None and not current['published']:
+            receipt = json.loads(current['receipt']) if current['receipt'] else {}
+            raise ValueError(receipt.get('error') or '报告已保存，但还未确认送达')
+        return {'report_id': report['id'], 'status': 'delivered' if destination is not None else 'queued',
+                'session_id': destination['session_id'] if destination else None, 'body': current['body']}

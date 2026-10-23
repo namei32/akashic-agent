@@ -683,6 +683,16 @@ H3 前的 `WakeStateStore` 保存以下表；H3 后旧 writer 已删除，H2 只
 
 **F-012：** EventMail mail、Wake attempt、provider effect、Session message 和 delivery settlement 各有唯一 owner。候选 generation 不能移除仍被 `prepared/delivered/projected` ledger row 引用的 target service；`settled/rejected/failed` 不形成该发布 fence。
 
+### 9.6 LoL 日报目标与发送回执
+
+`plugin-data/lol_tracker-builtin/matches.sqlite3` 由 LoL 插件拥有。采集事实追加并按指纹去重；
+`reports` 首次创建时与 `metadata` 的 `report-destination:<id>` 一起提交固定目标。目标记录只增不改，
+配置改选只影响新报告。正文只从空值补齐一次；新报告的 `receipt/published` 根据真实 Delivery 结果更新，
+只有 delivered 记成功。旧报告没有 destination，保留原 EventMail 提交回执及恢复路线。
+可见报告是 Ledger 中来源为 `lol_tracker` 的原消息，发送选择与回执由 Delivery 拥有。
+停用和卸载保留全部事实、正文和回执；当前没有自动删除或搬迁旧消息协议。恢复与回退边界见
+[0127](../decisions/0127-lol-reports-own-destination.md)。
+
 ## 10. 插件数据与 Skill/MCP 能力发布
 
 ### 10.1 `plugin-data/`
