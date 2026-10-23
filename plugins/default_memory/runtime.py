@@ -84,9 +84,9 @@ class Runtime:
             sources = await self.sources_snapshot()
             self.last_total = len(sources)
             learned = await asyncio.to_thread(self.store.learned)
-            applied = 0
+            attempted = 0
             for source in sources:
-                if self.paused or (limit is not None and applied >= limit):
+                if self.paused or (limit is not None and attempted >= limit):
                     break
                 previous = learned.get(source.key)
                 if previous is not None and previous[0] != source.digest:
@@ -96,8 +96,8 @@ class Runtime:
                 if source.key in self.errors:
                     continue
                 try:
+                    attempted += 1
                     await self.learn(source)
-                    applied += 1
                 except asyncio.CancelledError:
                     raise
                 except (ValueError, RuntimeError, TimeoutError) as error:
@@ -105,6 +105,8 @@ class Runtime:
                     # do not repeatedly charge for the same invalid model response.
                     self.errors[source.key] = str(error)
                     await asyncio.to_thread(self.store.note_failure, source.key, str(error))
+                    if ModelError.matches(error):
+                        break
             return await self.status()
 
     async def audit(self) -> dict[str, object]:
