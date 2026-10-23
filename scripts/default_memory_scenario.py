@@ -249,8 +249,31 @@ async def run(folder: Path) -> dict[str, object]:
         await port.consume()
         assert requests["chat"] == 4, requests
         assert snapshot(workspace) == before
+        # Explicit procedure memory uses the real registered tool and stores its steps.
+        append = host.live_root.context.require(ServiceKey("scenario.append"))
+        await append("scenario:explicit", "remember-user",
+                     "Remember my reporting procedure: inspect evidence, then write the report.", finish=False)
+        before_explicit = snapshot(workspace)
+        tools = host.live_root.context.require(TOOLS)
+        bindings = host.live_root.context.require(BINDINGS)
+        tool = next(ref for ref in host.live_root.context.require(ALL_TOOLS)().refs if ref.name == "remember_memory")
+        binding = await tools.bind(tool, bindings)
+        messages = host.live_root.context.require(MESSAGE_CATALOG).reader("scenario:explicit").snapshot()
+        source = CallSource(CallRef("scenario-remember-call", 0), messages)
+        async with tools.open(bindings.describe(binding, TOOLS)) as bound:
+            prepared = await bound.prepare({"summary": "Reporting procedure", "kind": "procedure",
+                                            "steps": ["Inspect evidence", "Write report"]}, source)
+            assert isinstance(prepared, dict), prepared
+            result = await bound.invoke(source.effect_key, prepared)
+            assert result.outcome == "success"
+            assert await bound.query(source.effect_key) == result
+            assert await bound.invoke(source.effect_key, prepared) == result
+        with sqlite3.connect(workspace / "memory/default-v2.db") as db:
+            facts = [json.loads(row[0]) for row in db.execute("SELECT fact FROM memory_items WHERE kind='procedure'")]
+            assert len(facts) == 1 and facts[0]["steps"] == ["Inspect evidence", "Write report"], facts
+        assert snapshot(workspace) == before_explicit
         return {"real_plugin_composition": True, "http_driver": True, "eligible_only": True, "project_isolation": True, "wake_new_evidence": True,
-                "idempotent_learning": True, "frozen_recall": True, "forget_and_restart": True, "durable_failure_and_explicit_retry": True, "cancellation_drains_sqlite": True,
+                "idempotent_learning": True, "frozen_recall": True, "forget_and_restart": True, "durable_failure_and_explicit_retry": True, "cancellation_drains_sqlite": True, "explicit_procedure_memory": True,
                 "original_rows_unchanged": True, "requests": requests}
     finally:
         await host.terminate_all()

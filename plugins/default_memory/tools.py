@@ -25,6 +25,8 @@ class RememberArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
     summary: str = Field(min_length=1, max_length=2000)
     kind: Literal["profile", "preference", "procedure", "event"] = "preference"
+    steps: tuple[str, ...] = Field(default=(), max_length=12)
+    tool_requirement: str = Field(default="", max_length=200)
 
 
 class ForgetArgs(BaseModel):
@@ -101,7 +103,8 @@ class MemoryTool:
                                                  args.memory_ids, args.reason, [str(data["user_id"])])
                 return self.result(record)
             args = RememberArgs.model_validate(data["arguments"])
-            fact = Fact(kind=args.kind, summary=args.summary, evidence_ids=(str(data["user_id"]),))
+            fact = Fact(kind=args.kind, summary=args.summary, steps=args.steps,
+                        tool_requirement=args.tool_requirement, evidence_ids=(str(data["user_id"]),))
             source = Source(identity, graph, session, str(data["user_id"]), str(data["timestamp"]),
                             (str(data["user_id"]),), (str(data["user_id"]),), fingerprint, "")
             draft = check(Draft(facts=(fact,)), source, ())
