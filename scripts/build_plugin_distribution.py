@@ -48,7 +48,7 @@ CORE_PATHS = (
     "docker/host-runtime",
 )
 
-_BUNDLE_PATHS = tuple(Path("bundles") / (mode + ".toml") for mode in ("base", "headless", "minimal"))
+_BUNDLE_PATHS = tuple(Path("bundles") / (mode + ".toml") for mode in ("base", "headless", "minimal", "companion-preview"))
 _RUNTIME_WIRING = (
     ("docker/host-runtime/Dockerfile.distribution", "Dockerfile.distribution"),
     ("docker/host-runtime/distribution-entrypoint.sh", "distribution-entrypoint.sh"),

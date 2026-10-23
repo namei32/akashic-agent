@@ -1,4 +1,4 @@
-import { Quote } from "lucide-react";
+import { MessageCircle, Quote } from "lucide-react";
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 
@@ -12,7 +12,7 @@ type Anchor = { left: number; top: number; below: boolean };
 
 // 在一条消息里选中一段文字后，选区上方浮出"引用"：把选中内容作为 Markdown 引用块接到草稿后面，针对一句追问。
 // 只在鼠标等精细指针下出现；触屏有系统自带的选择菜单，不再叠一层。整条引用仍走消息操作行的"引用此消息"。
-export function SelectionQuote({ onQuote }: { onQuote: (markdown: string) => void }) {
+export function SelectionQuote({ onQuote, onAsk }: { onQuote: (markdown: string) => void; onAsk?: (text: string, messageId: string) => void }) {
   const [anchor, setAnchor] = useState<Anchor | null>(null);
 
   // 必要 effect：选区与滚动都是 document 级事件，只能在这里订阅。
@@ -46,8 +46,9 @@ export function SelectionQuote({ onQuote }: { onQuote: (markdown: string) => voi
   }, []);
 
   if (!anchor) return null;
-  return createPortal(<button type="button" className={`selection-quote${anchor.below ? " is-below" : ""}`}
-    style={{ left: anchor.left, top: anchor.top }}
+  return createPortal(<div className={`selection-menu${anchor.below ? " is-below" : ""}`}
+    style={{ left: Math.max(onAsk ? 86 : 34, Math.min(anchor.left, innerWidth - (onAsk ? 86 : 34))), top: anchor.top }}
+    ><button type="button" className="selection-quote"
     // 按下时不能让按钮抢走焦点、清掉选区，否则点击时已经读不到选中的文字。
     onMouseDown={(event) => event.preventDefault()}
     onClick={() => {
@@ -59,7 +60,15 @@ export function SelectionQuote({ onQuote }: { onQuote: (markdown: string) => voi
     }}>
     <Quote size={14} aria-hidden="true" />
     <span>引用</span>
-  </button>, document.body);
+  </button>{onAsk ? <button type="button" className="selection-quote" onMouseDown={(event) => event.preventDefault()}
+    onClick={() => {
+      const selection = window.getSelection();
+      const text = selection?.toString().trim();
+      const node = selection?.rangeCount ? selection.getRangeAt(0).startContainer : null;
+      const id = node ? closestComposed(node, MESSAGE)?.getAttribute("data-message-id") : null;
+      if (!text || !id) return;
+      setAnchor(null); selection?.removeAllRanges(); onAsk(text.slice(0, 4000), id);
+    }}><MessageCircle size={14} aria-hidden="true" /><span>问桌宠</span></button> : null}</div>, document.body);
 }
 
 type Endpoints = Pick<StaticRange, "startContainer" | "startOffset" | "endContainer" | "endOffset">;

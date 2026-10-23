@@ -1,0 +1,6 @@
+# Local browser verification uses an empty state and no managed Computer desktop.
+schema_version = 1
+
+[rows."computer"]
+plugin = "computer@release"
+disabled = true

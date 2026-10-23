@@ -43,6 +43,9 @@ plugin = "shell-ui@release"
 [rows."conversation-ui"]
 plugin = "conversation-ui@release"
 
+[rows."companion"]
+plugin = "companion@release"
+
 [rows."projects"]
 plugin = "projects@release"
 

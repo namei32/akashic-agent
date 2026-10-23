@@ -27,6 +27,8 @@ import { SelectionQuote } from "./selection-quote";
 import { MarqueeText } from "./marquee-text";
 import { CopyNotice, useCopyLastCode } from "./copy-last-code";
 import { isGeneratingChatStatus, lastInputResult } from "./web-chat-status";
+import { Companion, type CompanionHandle } from "./companion";
+import { CompanionActions } from "./companion-context";
 
 interface DesktopChatViewProps {
   embeddedShell: boolean;
@@ -46,6 +48,16 @@ export function DesktopChatView({ embeddedShell, controller }: DesktopChatViewPr
   const theme = useTheme();
   const rail = useSidebarRail();
   const composerApi = useRef<ComposerApi | null>(null);
+  const companion = useRef<CompanionHandle | null>(null);
+  const [companionAvailable, setCompanionAvailable] = useState(false);
+  const companionSources = useRef(controller);
+  useLayoutEffect(() => { companionSources.current = controller; }, [controller]);
+  const askCompanion = useCallback((id: string) => {
+    const current = companionSources.current;
+    const message = current.timelineMessages.find((item) => item.id === id);
+    const content = message ? timelineText(message) : current.messages.find((item) => item.id === id)?.content;
+    if (content) companion.current?.explain({ message_id: message ? id : null, text: content.slice(0, 4000) });
+  }, []);
   // 空输入框按 ↑ 取回的上一条提问。
   const lastInput = useMemo(() => lastUserInput(controller.timelineMessages), [controller.timelineMessages]);
   // 改一改再问：原文接在已有草稿之后，不覆盖用户正在写的内容。
@@ -110,6 +122,7 @@ export function DesktopChatView({ embeddedShell, controller }: DesktopChatViewPr
   const shellClass = embeddedShell ? "chat-shell is-embedded" : "chat-shell";
 
   return (
+    <CompanionActions.Provider value={companionAvailable ? askCompanion : null}>
     <main className={shellClass}>
       <div className="chat-shell-body" style={rail.style}>
         <DesktopSidebar
@@ -185,7 +198,9 @@ export function DesktopChatView({ embeddedShell, controller }: DesktopChatViewPr
           <NarrowReadingChrome />
           <ComposerPageKeys />
           <ReadingReturnButton generating={isGeneratingChatStatus(status)} />
-          {hasMessages ? <SelectionQuote onQuote={editInput} /> : null}
+          {hasMessages ? <SelectionQuote onQuote={editInput} onAsk={companionAvailable ? (text, id) => {
+            companion.current?.explain({ message_id: controller.timelineMessages.some((m) => m.id === id) ? id : null, text });
+          } : undefined} /> : null}
           {hasMessages ? <MediaGalleryViewer /> : null}
           <SessionReadingMemory sessionId={activeSessionId}
             ready={!historyLoading && timelineMessages.at(-1)?.session_id === activeSessionId
@@ -234,7 +249,10 @@ export function DesktopChatView({ embeddedShell, controller }: DesktopChatViewPr
         </div>
       </section>
       </div>
+      <Companion key={activeSessionId || "new"} ref={companion} parent={activeSessionId || ""}
+        onAvailable={setCompanionAvailable} onQuote={editInput} />
     </main>
+    </CompanionActions.Provider>
   );
 }
 
