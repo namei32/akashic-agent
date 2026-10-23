@@ -42,6 +42,14 @@ class Config(BaseModel):
     timezone: str = "Asia/Shanghai"
     window: str = "previous_day"
     analysis_enabled: bool = True
+    report_session_id: str = Field(default='', max_length=512, description='留空使用固定的英雄联盟战绩专用会话')
+
+    @field_validator('report_session_id')
+    @classmethod
+    def session(cls, value: str) -> str:
+        if value != value.strip() or any(ord(char) < 32 for char in value):
+            raise ValueError('日报会话 ID 无效')
+        return value
 
     @field_validator("daily_time")
     @classmethod

@@ -1,6 +1,8 @@
 """Codex must accept the immutable messages and tools in a ModelRequest."""
 
 import json
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 
 import httpx
 import pytest
@@ -42,11 +44,21 @@ async def test_frozen_request_can_be_estimated_and_sent(lite):
         )
 
     class Credential:
-        async def read(self):
+        connection_id = "test-connection"
+        auth_identity = "test"
+
+        async def read(self) -> Mapping[str, str]:
             return {
                 "driver": "codex", "access_token": "fixture", "account_id": "test",
                 "expires_at": "2099-01-01T00:00:00+00:00",
             }
+
+        async def refresh(self, payload: Mapping[str, str]) -> None:
+            raise AssertionError("Fresh fixture credentials must not be refreshed")
+
+        @asynccontextmanager
+        async def exclusive(self) -> AsyncIterator[None]:
+            yield
 
     http = HttpClient(lambda: httpx.AsyncClient(
         base_url="https://codex.invalid", transport=httpx.MockTransport(handle),
