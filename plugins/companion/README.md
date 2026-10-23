@@ -15,6 +15,8 @@
 
 ## 验证入口
 
+自动回归：`pytest -q tests/test_companion.py`，覆盖真实插件 HTTP 的引用校验、会话隔离、请求去重、停止后保留内容、重启恢复及同源保护。
+
 类型检查：`npm run typecheck`。依赖边界：`python scripts/plugin_boundary.py check --base <base>`。
 
 浏览器验证应使用独立 `--state`，可用 `AKASHIC_PLUGIN_BUNDLE=companion-preview` 关闭 Computer。按真实安装链启动后，配置测试模型并检查：
