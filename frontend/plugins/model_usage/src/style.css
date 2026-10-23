@@ -3,6 +3,7 @@
   --usage-type-section: 1.0625rem;
   --usage-type-body: 1rem;
   --usage-type-small: .8125rem;
+  --usage-chart-type: 12px;
   --usage-primary-columns: 4;
   --usage-call-height: 25rem;
   container-type: inline-size;
@@ -25,7 +26,7 @@
 .usage-periods button[aria-pressed="true"] { border-bottom-color: var(--ak-ink-primary); font-weight: 650; }
 .usage-filters select { flex: 1 1 10rem; width: 0; min-width: 9rem; background: var(--ak-paper-sheet); }
 .usage-filters > button { border-color: transparent; }
-.usage-read-status { min-height: 24px; padding-top: 10px; overflow-wrap: anywhere; }
+.usage-read-status { display: flex; flex-direction: column; min-height: 52px; padding-top: 10px; overflow-wrap: anywhere; }
 .usage-primary { display: grid; grid-template-columns: repeat(var(--usage-primary-columns), minmax(0, 1fr)); gap: 20px 12px; padding: 20px 0 16px; margin: 0; }
 .usage-primary dt { font-size: var(--usage-type-small); color: var(--ak-ink-secondary); }
 .usage-primary dd { margin: 4px 0 0; min-height: 44px; display: flex; align-items: baseline; gap: 4px; font-size: var(--usage-type-metric); line-height: 1.45; white-space: nowrap; }
@@ -47,15 +48,22 @@
 .usage-secondary dd { margin: 3px 0 0; color: var(--ak-ink-primary); font-size: var(--usage-type-body); overflow-wrap: anywhere; }
 .model-usage section { margin-top: 22px; }
 .usage-section-heading { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
-.usage-trend { margin: 0; }
-.usage-trend svg { display: block; width: 100%; height: 140px; overflow: visible; }
-.usage-trend line { stroke: var(--ak-rule-default); }
-.usage-series-0 { fill: var(--ak-chart-1); }
-.usage-series-1 { fill: var(--ak-chart-2); }
-.usage-trend figcaption { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; margin-top: 8px; font-size: var(--usage-type-small); color: var(--ak-ink-secondary); }
-.usage-legend { display: inline-flex; align-items: center; gap: 6px; }
-.usage-legend i { width: 8px; height: 8px; background: var(--ak-chart-1); }
-.usage-legend i:nth-of-type(2) { margin-left: 8px; background: var(--ak-chart-2); }
+.usage-chart { --usage-series-color: var(--ak-chart-1); }
+.usage-chart.is-output { --usage-series-color: var(--ak-chart-2); }
+.usage-chart-switch { display: flex; gap: 4px; }
+.usage-chart-switch button { padding: 4px 10px; border-color: transparent; font-size: var(--usage-type-small); }
+.usage-chart-switch button[aria-pressed="true"] { border-color: var(--ak-rule-default); background: var(--ak-paper-quiet); }
+.usage-chart-readout { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0 8px; min-height: 50px; font-size: var(--usage-type-small); color: var(--ak-ink-secondary); }
+.usage-chart-readout strong { color: var(--usage-series-color); font-weight: 600; font-size: var(--usage-type-section); }
+.usage-chart-readout > small { grid-column: 1 / -1; }
+.usage-chart-interactive { border-radius: 3px; }
+.usage-chart svg { display: block; width: 100%; height: 174px; overflow: visible; touch-action: pan-y; }
+.usage-chart text { fill: var(--ak-ink-secondary); font-family: var(--ak-type-reading); font-size: var(--usage-chart-type); }
+.usage-chart-grid { stroke: var(--ak-rule-subtle); }
+.usage-chart-selection { fill: var(--ak-paper-quiet); }
+.usage-chart-bar { fill: var(--usage-series-color); }
+.usage-chart-bar.is-unknown { fill: none; stroke: var(--ak-ink-muted); stroke-dasharray: 2 2; }
+.usage-chart-hint { font-size: var(--usage-type-small); color: var(--ak-ink-secondary); }
 .usage-table-scroll { height: var(--usage-call-height); max-width: 100%; overflow: auto; overscroll-behavior: contain; }
 .model-usage table { width: 100%; border-collapse: separate; border-spacing: 0; text-align: left; font-size: var(--usage-type-small); }
 .model-usage th { position: sticky; z-index: 1; top: 0; background: var(--ak-paper-sheet); font-weight: 500; color: var(--ak-ink-secondary); border-bottom: 1px solid var(--ak-rule-default); white-space: nowrap; }
@@ -82,7 +90,7 @@
 .usage-pagination { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 12px; font-size: var(--usage-type-small); }
 .usage-pagination button { border-color: transparent; padding-inline: 4px; }
 .usage-notes { margin-top: 18px; border-top: 1px solid var(--ak-rule-subtle); }
-.usage-notes p { max-width: 65ch; }
+.usage-notes p { max-width: 65ch; font-size: var(--usage-type-body); }
 .usage-empty { padding: 24px 0 !important; color: var(--ak-ink-secondary); }
 .usage-skeleton { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; min-height: 240px; padding-top: 20px; }
 .usage-skeleton > div { height: 60px; background: var(--ak-paper-quiet); }
@@ -103,8 +111,9 @@
 }
 @media (hover: hover) { .model-usage button:not([aria-disabled="true"]):hover, .model-usage summary:hover { background: var(--ak-paper-quiet); } }
 @media (forced-colors: active) {
-  .usage-state::before, .usage-legend i { forced-color-adjust: none; background: CanvasText; }
+  .usage-state::before { forced-color-adjust: none; background: CanvasText; }
   .usage-periods button[aria-pressed="true"] { border-color: Highlight; }
-  .usage-trend rect { forced-color-adjust: none; fill: CanvasText; }
-  .usage-trend .usage-series-1 { fill: Highlight; }
+  .usage-chart-bar { forced-color-adjust: none; fill: CanvasText; }
+  .usage-chart-bar.is-unknown { fill: none; stroke: CanvasText; }
+  .usage-chart-switch button[aria-pressed="true"] { outline: 1px solid Highlight; }
 }
