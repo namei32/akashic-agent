@@ -159,7 +159,10 @@ async def run(folder: Path) -> dict[str, object]:
         assert not status["failures"], status
         assert status["learning"] == {"applied": 2}, status
         assert requests["chat"] == 2, requests
-        query = await port.recall("scenario:first", "scenario:global", "coffee")
+        query_method = root.context.require(RpcMethod.key("default-memory/query"))
+        query = await query_method.call(query_method.params.model_validate({
+            "request_id": "scenario:first", "session_id": "scenario:global", "query": "coffee",
+        }))
         assert "black coffee" in query["text"], query
         assert "secret" not in query["text"], query
         private = await port.recall("scenario:private", "scenario:private", "coffee")
@@ -171,7 +174,7 @@ async def run(folder: Path) -> dict[str, object]:
         else:
             raise AssertionError("Recall-disabled project leaked memory")
         after_requests = dict(requests)
-        assert await port.recall("scenario:first", "scenario:global", "coffee") == query
+        assert await port.recall("operator:scenario:first", "scenario:global", "coffee") == query
         await port.consume()
         assert requests == after_requests, (requests, after_requests)
         assert snapshot(workspace) == before
@@ -221,7 +224,7 @@ async def run(folder: Path) -> dict[str, object]:
         await host.load_all()
         port = host.live_root.context.require(DEFAULT_MEMORY)
         assert (await port.recall("scenario:after-forget", "scenario:global", "coffee"))["memory_ids"] == []
-        assert await port.recall("scenario:first", "scenario:global", "coffee") == query
+        assert await port.recall("operator:scenario:first", "scenario:global", "coffee") == query
         await port.consume()
         assert requests["chat"] == 4, requests
         assert snapshot(workspace) == before
