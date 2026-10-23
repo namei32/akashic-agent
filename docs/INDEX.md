@@ -81,6 +81,8 @@ Issue 1179 的当前实现与重大决定见 [边界②③审查入口](design/p
 兼容读取退役前先看 [hua-home 数据盘点与截止方案](design/compatibility-cutoff-inventory.md)，
 按实际状态区分结构转换、不可变历史读取与当前恢复协议。
 
+[Default Memory 当前插件与历史保全迁移](design/default-memory-current-plugin.md) 说明结构化记忆替换、完整历史补学与回退。
+
 ## 4. 数据任务的额外入口
 
 涉及消息、记忆、附件、配置、凭据、调度、plugin-data，或裁切、压缩、重建、同步、迁移、覆盖、卸载、删除时，先读 [持久化状态地图](design/persistence-state-map.md) 的相关对象及其勘误，再按 STA-003 核对本次增、改、减与恢复方式。地图中的推断和未知不能充当删除依据。
