@@ -65,6 +65,10 @@ disabled = true
 plugin = "models@release"
 disabled = true
 
+[rows."model_usage"]
+plugin = "model_usage@release"
+disabled = true
+
 [rows."session_title"]
 plugin = "session_title@release"
 disabled = true
