@@ -1,7 +1,6 @@
 """Explicit recall and user-directed edits with durable tool receipts."""
 from __future__ import annotations
 
-import asyncio
 import json
 from dataclasses import asdict
 from collections.abc import Mapping
@@ -9,6 +8,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from plugins.ledger.contract import ContentPart, Input, json_value
 from plugins.tools.contract import CallSource, Result
+from .io import run_io
 from .learning import check, text
 from .schema import Draft, Fact, Source
 from .store import digest
@@ -71,7 +71,7 @@ class MemoryTool:
         return Result("success", (ContentPart("text", value),))
 
     async def query(self, key: str) -> Result | None:
-        record = await asyncio.to_thread(self.runtime.store.receipt, "tool:" + key)
+        record = await run_io(self.runtime.store.receipt, "tool:" + key)
         return None if record is None else self.result(record)
 
     async def invoke(self, key: str, arguments: Mapping[str, object]) -> Result:
@@ -83,7 +83,7 @@ class MemoryTool:
             raise ValueError("Memory tool arguments do not belong to this call")
         fingerprint = digest(data)
         identity = "tool:" + key
-        previous = await asyncio.to_thread(self.runtime.store.receipt, identity, fingerprint) if self.action != "recall" else None
+        previous = await run_io(self.runtime.store.receipt, identity, fingerprint) if self.action != "recall" else None
         if previous is not None:
             return self.result(previous)
         session = str(data["session_id"])
@@ -97,7 +97,7 @@ class MemoryTool:
         async with self.runtime.learning_lock:
             if self.action == "forget":
                 args = ForgetArgs.model_validate(data["arguments"])
-                record = await asyncio.to_thread(self.runtime.store.forget, identity, fingerprint, graph,
+                record = await run_io(self.runtime.store.forget, identity, fingerprint, graph,
                                                  args.memory_ids, args.reason, [str(data["user_id"])])
                 return self.result(record)
             args = RememberArgs.model_validate(data["arguments"])
@@ -106,10 +106,10 @@ class MemoryTool:
                             (str(data["user_id"]),), (str(data["user_id"]),), fingerprint, "")
             draft = check(Draft(facts=(fact,)), source, ())
             descriptor = self.runtime.embeddings.describe()
-            await asyncio.to_thread(self.runtime.store.space, descriptor.identity, descriptor.dimensions, initialize=True)
-            draft = await asyncio.to_thread(self.runtime.store.stage, source, draft, "explicit-user-tool")
+            await run_io(self.runtime.store.space, descriptor.identity, descriptor.dimensions, initialize=True)
+            draft = await run_io(self.runtime.store.stage, source, draft, "explicit-user-tool")
             vectors = await self.runtime.vectors([value.summary for value in draft.facts])
-            ids = await asyncio.to_thread(self.runtime.store.apply, source, draft, vectors)
-            record = await asyncio.to_thread(self.runtime.store.save_receipt, identity, fingerprint,
+            ids = await run_io(self.runtime.store.apply, source, draft, vectors)
+            record = await run_io(self.runtime.store.save_receipt, identity, fingerprint,
                                              {"text": "已保存长期记忆：" + "、".join(ids), "memory_ids": list(ids)})
             return self.result(record)

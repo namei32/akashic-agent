@@ -11,6 +11,7 @@ from plugins.content.contract import Content
 from plugins.ledger.contract import Input, Message, MessageCatalog
 from plugins.models.contract import ChatModels, Embeddings, ModelError
 from plugins.turn_projection.contract import TurnProjection
+from .io import run_io
 from .learning import collect, extract, check, text
 from .retrieval import normalized, render, retrieve
 from .schema import Draft, Source
@@ -39,7 +40,7 @@ class Runtime:
 
     async def vectors(self, texts: Sequence[str]) -> tuple[tuple[float, ...], ...]:
         descriptor = self.embeddings.describe()
-        await asyncio.to_thread(self.store.space, descriptor.identity, descriptor.dimensions, initialize=True)
+        await run_io(self.store.space, descriptor.identity, descriptor.dimensions, initialize=True)
         async with self.embeddings.bind(model_id=descriptor.model_id) as model:
             if model.descriptor.identity != descriptor.identity:
                 raise ValueError("Embedding provider changed while opening")
@@ -55,35 +56,35 @@ class Runtime:
         class Routes:
             def route(self, session_id: str):
                 return routes[session_id]
-        return await asyncio.to_thread(collect, self.catalog, self.projection, self.content,
+        return await run_io(collect, self.catalog, self.projection, self.content,
                                        Routes(), self.sources, heads)
 
     async def learn(self, source: Source) -> tuple[str, ...]:
         descriptor = self.embeddings.describe()
-        await asyncio.to_thread(self.store.space, descriptor.identity, descriptor.dimensions, initialize=True)
-        draft = await asyncio.to_thread(self.store.draft, source)
+        await run_io(self.store.space, descriptor.identity, descriptor.dimensions, initialize=True)
+        draft = await run_io(self.store.draft, source)
         if draft is None:
-            items = await asyncio.to_thread(self.store.items, source.graph)
+            items = await run_io(self.store.items, source.graph)
             # Only scoped memories enter the extraction prompt.
             cues = "\n".join(row["text"] for row in json.loads(source.text) if row["role"] == "user")
             cue_vector = (await self.vectors([cues]))[0] if items else None
             candidates = tuple(hit.memory for hit in retrieve(items, cues, cue_vector, datetime.fromisoformat(source.timestamp), limit=12))
-            epoch = await asyncio.to_thread(self.store.retry_epoch)
+            epoch = await run_io(self.store.retry_epoch)
             draft, model = await extract(source, candidates, self.models, model_id=self.model_id, retry_epoch=epoch)
-            draft = await asyncio.to_thread(self.store.stage, source, draft, model)
+            draft = await run_io(self.store.stage, source, draft, model)
         vectors = await self.vectors([fact.summary for fact in draft.facts]) if draft.facts else ()
-        return await asyncio.to_thread(self.store.apply, source, draft, vectors)
+        return await run_io(self.store.apply, source, draft, vectors)
 
     async def consume(self, *, limit: int | None = None, retry: bool = False) -> dict[str, object]:
         async with self.learning_lock:
             if retry:
-                await asyncio.to_thread(self.store.retry_epoch, advance=True)
-            self.errors = await asyncio.to_thread(self.store.failures)
+                await run_io(self.store.retry_epoch, advance=True)
+            self.errors = await run_io(self.store.failures)
             if self.paused:
                 return await self.status()
             sources = await self.sources_snapshot()
             self.last_total = len(sources)
-            learned = await asyncio.to_thread(self.store.learned)
+            learned = await run_io(self.store.learned)
             attempted = 0
             for source in sources:
                 if self.paused or (limit is not None and attempted >= limit):
@@ -104,7 +105,7 @@ class Runtime:
                     # Expose failures and retain the draft/cursor. Automatic events
                     # do not repeatedly charge for the same invalid model response.
                     self.errors[source.key] = str(error)
-                    await asyncio.to_thread(self.store.note_failure, source.key, str(error))
+                    await run_io(self.store.note_failure, source.key, str(error))
                     if ModelError.matches(error):
                         break
             return await self.status()
@@ -119,7 +120,7 @@ class Runtime:
                 "source_digests": {source.key: source.digest for source in sources}}
 
     async def status(self) -> dict[str, object]:
-        value = await asyncio.to_thread(self.store.status)
+        value = await run_io(self.store.status)
         return {**value, "eligible_turns": self.last_total, "paused": self.paused,
                 "failures": dict(self.errors)}
 
@@ -135,7 +136,7 @@ class Runtime:
         graph = self.route(session_id)
         fingerprint = digest([session_id, graph, query, limit])
         async with self.recall_lock:
-            old = await asyncio.to_thread(self.store.receipt, key, fingerprint)
+            old = await run_io(self.store.receipt, key, fingerprint)
             if old is not None:
                 return old
             if not self.store.path.exists():
@@ -148,7 +149,7 @@ class Runtime:
                 if not ModelError.matches(error):
                     raise
                 degraded = str(error)
-            items = await asyncio.to_thread(self.store.items, graph)
+            items = await run_io(self.store.items, graph)
             now = datetime.fromisoformat(timestamp) if timestamp else datetime.now(UTC)
             hits = retrieve(items, query, vector, now, limit=limit)
             rendered, presented = render(hits, max_chars=self.max_chars)
@@ -159,7 +160,7 @@ class Runtime:
                 "scores": [{"id": hit.memory.id, "score": hit.score, "rrf": hit.fusion, "lane": hit.lane} for hit in hits],
                 "degraded": degraded,
             }
-            return await asyncio.to_thread(self.store.save_receipt, key, fingerprint, result)
+            return await run_io(self.store.save_receipt, key, fingerprint, result)
 
     async def prepare(self, snapshot: tuple[Message, ...], source: str) -> Mapping[str, object]:
         turns = self.projection.project(snapshot, source)
