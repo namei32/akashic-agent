@@ -204,6 +204,27 @@ async def run(folder: Path) -> dict[str, object]:
         recovered = await port.consume(retry=True)
         assert not recovered["failures"] and recovered["learning"] == {"applied": 3}, recovered
         assert requests["chat"] == 4, requests
+        # A real competing SQLite writer holds the disk operation open.
+        # Cancellation must not release the plugin call while that job runs.
+        held = sqlite3.connect(workspace / "memory/default-v2.db")
+        held.execute("BEGIN IMMEDIATE")
+        before_cancel = dict(requests)
+        pending = asyncio.create_task(port.recall("scenario:cancel", "scenario:global", "coffee"))
+        try:
+            await asyncio.sleep(.15)
+            pending.cancel()
+            await asyncio.sleep(.05)
+            assert not pending.done(), "Cancellation released an unfinished disk job"
+        finally:
+            held.rollback()
+            held.close()
+        try:
+            await pending
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("Expected cancellation after the disk job settled")
+        assert requests == before_cancel
         memory_id = query["memory_ids"][0]
         # Use the registered, bound tool against an actual call source.
         tools = root.context.require(TOOLS)
@@ -229,7 +250,7 @@ async def run(folder: Path) -> dict[str, object]:
         assert requests["chat"] == 4, requests
         assert snapshot(workspace) == before
         return {"real_plugin_composition": True, "http_driver": True, "eligible_only": True, "project_isolation": True, "wake_new_evidence": True,
-                "idempotent_learning": True, "frozen_recall": True, "forget_and_restart": True, "durable_failure_and_explicit_retry": True,
+                "idempotent_learning": True, "frozen_recall": True, "forget_and_restart": True, "durable_failure_and_explicit_retry": True, "cancellation_drains_sqlite": True,
                 "original_rows_unchanged": True, "requests": requests}
     finally:
         await host.terminate_all()

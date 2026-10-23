@@ -17,6 +17,7 @@ from plugins.ledger.contract import MESSAGE_CATALOG
 from plugins.models.contract import CHAT_MODELS, EMBEDDINGS
 from plugins.tools.contract import TOOLS
 from plugins.turn_projection.contract import TURN_PROJECTION
+from .io import run_io
 from .contract import DEFAULT_MEMORY
 from .runtime import Runtime
 from .store import Store
@@ -150,8 +151,8 @@ async def apply(ctx: Context) -> None:
         lock_handle = path.open("a+")
         try:
             fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            await asyncio.to_thread(store.initialize)
-            runtime.errors = await asyncio.to_thread(store.failures)
+            await run_io(store.initialize)
+            runtime.errors = await run_io(store.failures)
         except BaseException:
             lock_handle.close()
             lock_handle = None
