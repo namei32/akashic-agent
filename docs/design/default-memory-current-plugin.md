@@ -95,7 +95,8 @@ SQLite 使用 WAL 和 FULL synchronous，读模型服务前不持有 SQL 写事�
 
 发行版默认关闭 Default Memory；迁移时显式选择 staging，默认不自动调用模型。`/default_memory_backfill` 是明确的全历史模型调用入口，
 `/default_memory_status` 展示实际状态，`/default_memory_pause` 暂停后续轮次。
-Gateway 提供 `default-memory/status`、`default-memory/audit`、`default-memory/backfill` 同义入口。
+Gateway 提供 `default-memory/status`、`default-memory/audit`、`default-memory/backfill` 同义入口，
+以及 pause/resume 和只读取记忆、保存查询回执的 query；query 不向对话追加测试消息。
 
 ## 验收
 
