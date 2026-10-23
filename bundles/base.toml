@@ -52,6 +52,9 @@ plugin = "projects@release"
 [rows."models"]
 plugin = "models@release"
 
+[rows."model_usage"]
+plugin = "model_usage@release"
+
 [rows."session_title"]
 plugin = "session_title@release"
 
