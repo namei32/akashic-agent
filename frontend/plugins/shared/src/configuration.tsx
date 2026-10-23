@@ -5,7 +5,7 @@ import "./configuration.css";
 
 export interface Status {
   input_ref: string; enabled: boolean | null; ready: boolean; blocked: boolean;
-  can_enable?: boolean; reason: string; has_token?: boolean;
+  can_enable?: boolean; can_disable?: boolean; disable_reason?: string; support_notice?: string; reason: string; has_token?: boolean;
   values: Record<string, unknown>; targets?: {channel: string; recipient: string; session_id: string; label: string}[];
 }
 export interface FormProps { values: Record<string, unknown>; change: (key: string, value: unknown) => void; status: Status; }
@@ -276,11 +276,12 @@ function Configuration({ctx, definition, embed}: {ctx: WebHostContextV1; definit
     {error && <div className="config-error" role="alert"><p>{error}</p><button type="button" disabled={busy && !sessionStorage.getItem(pendingKey) && !sessionStorage.getItem(lastKey)} onClick={() => { const id = sessionStorage.getItem(pendingKey) ?? sessionStorage.getItem(lastKey); if (busy && id) { void poll(id); return; } if (dirty) setLeave(() => () => { void load(); }); else void load(); }}>重新加载</button></div>}
     {!status ? !error && <p role="status">正在读取配置…</p> : <form onSubmit={event => void save(event)}>
       {/* 引导（intent="enable"）自己说明阻塞原因；设置详情页照常显示原因与禁用的开关。 */}
+      {status.support_notice && <p className="config-hint">{status.support_notice}</p>}
       {status.reason && !(embed.intent === "enable" && status.blocked) && <p className="config-hint" role="status">{status.reason}</p>}
       {!(embed.intent === "enable" && status.blocked) && <>
         {!(embed.intent === "enable" && status.can_enable !== false) && <label className="config-toggle">
-          <span><strong>启用{/^[A-Za-z0-9]/.test(definition.title) ? " " : ""}{definition.title}</strong><small>{status.can_enable === false ? "前置条件满足后才能开启" : "关闭后停用，已有数据保留"}</small></span>
-          <input type="checkbox" role="switch" checked={enabled === true} disabled={busy || (enabled !== true && status.can_enable === false)}
+          <span><strong>启用{/^[A-Za-z0-9]/.test(definition.title) ? " " : ""}{definition.title}</strong><small>{enabled === true && status.can_disable === false ? status.disable_reason || "其他功能正在依赖此服务" : status.can_enable === false ? "前置条件满足后才能开启" : "关闭后停用，已有数据保留"}</small></span>
+          <input type="checkbox" role="switch" checked={enabled === true} disabled={busy || (enabled !== true && status.can_enable === false) || (enabled === true && status.can_disable === false)}
             onChange={event => { edits.current += 1; setEnabled(event.target.checked); markDirty(true); setPreset(false); }} />
         </label>}
         {enabled === true && definition.fields && <fieldset disabled={busy} className="config-fields"><legend className="sr-only">连接配置</legend>{definition.fields({values, change, status})}</fieldset>}
