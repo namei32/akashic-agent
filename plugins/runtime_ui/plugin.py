@@ -6,7 +6,7 @@ from .directory import DIRECTORY, RuntimeDirectory
 
 api_version = 3
 name = "runtime-ui"
-version = "1.1.0"
+version = "1.1.1"
 
 inject = (UI, RUNTIME_CATALOG)
 
