@@ -20,11 +20,12 @@ class SemanticInterest:
     """用已完成对话的固定向量衡量候选兴趣，不重建历史向量或写学习图。"""
 
     def __init__(self, learning: Learning, catalog: MessageCatalog, embeddings: MessageEmbeddings,
-                 select: Callable[[], Awaitable[tuple[LearningConfig, Embed]]]):
+                 select: Callable[[], Awaitable[tuple[LearningConfig, Embed]]], *, fill_missing: bool = False):
         self._learning = learning
         self._catalog = catalog
         self._embeddings = embeddings
         self._select = select
+        self._fill_missing = fill_missing
 
     async def score(self, texts: Sequence[str], *, cutoff: str) -> tuple[float, ...]:
         """沿用 0.9 输入加 0.1 回复的最大余弦四次方，只采用 cutoff 前的证据。"""
@@ -34,6 +35,16 @@ class SemanticInterest:
         if any(not isinstance(text, str) for text in texts):
             raise TypeError("兴趣候选必须是字符串")
         rule, embed = await self._select()
+        if self._fill_missing:
+            missing = await run_memory_job(lambda: self._missing(rule, through))
+            records = self._embeddings.bind(self._learning.text)
+            for start in range(0, len(missing), 32):
+                batch = missing[start:start + 32]
+                vectors = await embed([self._learning.text(message) for message in batch])
+                if len(vectors) != len(batch):
+                    raise ValueError("Interest embedding result count mismatch")
+                for message, vector in zip(batch, vectors, strict=True):
+                    await run_memory_job(lambda: records.save(message, model=rule.embedding_model, embedding=vector))
         prototypes = await run_memory_job(lambda: self._prototypes(rule, through))
 
         # 2. 仅嵌入本轮非空候选；无历史证据返回零，provider 错误保持失败。
@@ -53,6 +64,26 @@ class SemanticInterest:
                 similarity = max(float(np.dot(candidate / norm, prototype)) for prototype in prototypes)
                 scores[index] = min(0.999, max(0.0, similarity) ** 4)
         return tuple(scores)
+
+    def _missing(self, rule: LearningConfig, through: datetime):
+        """Support-only mode keeps new Wake evidence without writing a graph."""
+        records = self._embeddings.bind(self._learning.text)
+        samples = self._learning.samples(self._catalog, rule, heads=self._catalog.snapshot_heads())
+        eligible = [sample for sample in samples
+                    if sample.ending.recorded_at <= through
+                    and isinstance(sample.ending.body, Output)
+                    and sample.ending.body.finish == "complete"
+                    and self._learning.text(sample.ending).strip()][-256:]
+        messages = {}
+        for sample in eligible:
+            users = [message for message in sample.messages
+                     if isinstance(message.body, Input) and self._learning.text(message).strip()]
+            if not users:
+                continue
+            for message in (*users, sample.ending):
+                if records.read(message, model=rule.embedding_model, dimension=rule.dimension) is None:
+                    messages[message.message_id] = message
+        return tuple(messages.values())
 
     def _prototypes(self, rule: LearningConfig, through: datetime) -> list[np.ndarray]:
         """Read the fixed historical inputs off the host event loop."""

@@ -16,7 +16,7 @@ from typing import Literal, Self, cast
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from agent.plugin_composition import RUNTIME_STARTED, RUNTIME_STOPPING, Context, ServiceKey
-from plugins.akasha.contract import EMBEDDING_MEMORY_PLUGIN
+from plugins.akasha.contract import EMBEDDING_MEMORY_PLUGIN, MEMORY_SCOPES
 from plugins.models.contract import EMBEDDINGS
 from plugins.ui.contract import (
     UI_SLOTS,
@@ -78,7 +78,7 @@ _REPLAY_STATUS_NAME = ".akasha-replay-status.json"
 
 api_version = 3
 name = "akasha"
-version = "4.1.0"
+version = "4.2.0"
 desc = "从消息学习并提供普通 Context 材料与记忆工具"
 workspace_roots = ("memory",)
 
@@ -94,6 +94,7 @@ class Config(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
     enabled: bool | None = True
+    memory_enabled: bool = True
     sources: tuple[str, ...] = Field(
         default=("conversation", "programmatic", "legacy-unattributed"), min_length=1,
     )
@@ -109,7 +110,7 @@ class Config(BaseModel):
     forgetting_enabled: bool = AkashaConfig.forgetting_enabled
 
     def settings(self) -> AkashaConfig:
-        settings = AkashaConfig(**self.model_dump(exclude={"sources", "enabled"}))
+        settings = AkashaConfig(**self.model_dump(exclude={"sources", "enabled", "memory_enabled"}))
         settings.validate()
         return settings
 
@@ -164,10 +165,6 @@ async def run(ctx: Context, interest: Interest) -> None:
             )
         return await run_rebuild()
 
-    _ = await ctx.require(COMMANDS).register(ctx, CommandDefinition(
-        name="akasha_reindex", description="从 canonical 来源全量重建 Akasha 学习图",
-        handler=request_reindex, read_only=False, input_hint="confirm",
-    ))
     settings = config.settings()
     memory_path = resolve_memory_path(ctx.workspace_root("memory"), settings.db_path)
     rebuild_backup_root = ctx.data_root / "backups" / "rebuild"
@@ -187,7 +184,6 @@ async def run(ctx: Context, interest: Interest) -> None:
         "content": {"akasha.feedback": check_feedback, "akasha.recall": check_recall},
     })
     # 同一 Root 只允许一个 embedding 记忆系统；一个 Akasha 实例管理全部图。
-    _ = await ctx.provide(EMBEDDING_MEMORY_PLUGIN, object())
     memories: dict[str, MessageMemory] = {}
     memory_rule: LearningConfig | None = None
     watcher: asyncio.Task[None] | None = None
@@ -235,6 +231,10 @@ async def run(ctx: Context, interest: Interest) -> None:
     policies = ScopePolicies(
         ctx.require(OWNER_STATE).open_scoped(ctx, "scope-policy"), ctx.require(MESSAGE_CATALOG),
     )
+
+    class ScopeReader:
+        route = staticmethod(ctx.entrypoint(policies.route))
+    await ctx.provide(MEMORY_SCOPES, ScopeReader())
 
     def read_path(session_id: str | None) -> Path:
         """显式召回与反馈共用图路由，已知故障不能绕过。"""
@@ -378,7 +378,7 @@ async def run(ctx: Context, interest: Interest) -> None:
             _identity, rule, model_id = select_learning()
             return rule, embedder(rule, model_id)
 
-    target = SemanticInterest(learning, ctx.require(MESSAGE_CATALOG), ctx.require(MESSAGE_EMBEDDINGS), select_interest)
+    target = SemanticInterest(learning, ctx.require(MESSAGE_CATALOG), ctx.require(MESSAGE_EMBEDDINGS), select_interest, fill_missing=not config.memory_enabled)
     def readiness() -> str | None:
         try:
             ctx.require(EMBEDDINGS).describe()
@@ -395,6 +395,28 @@ async def run(ctx: Context, interest: Interest) -> None:
             interest.readiness = None
         return close
     await ctx.effect(attach_interest, label="interest-worker")
+
+
+    if not config.memory_enabled:
+        # Preserve historical inspector and project settings while another
+        # memory provider owns recall. No graph writer or recall tools start.
+        async def start_history(_event: object) -> None:
+            nonlocal running, inspector
+            running = True
+            existing = records()
+            inspector = RecallInspector(
+                read=existing.read, list_records=existing.list,
+                legacy_page=existing.legacy_page,
+                catalog=ctx.require(MESSAGE_CATALOG),
+            )
+        await ctx.on(RUNTIME_STARTED, start_history)
+        return
+
+    _ = await ctx.provide(EMBEDDING_MEMORY_PLUGIN, object())
+    _ = await ctx.require(COMMANDS).register(ctx, CommandDefinition(
+        name="akasha_reindex", description="从 canonical 来源全量重建 Akasha 学习图",
+        handler=request_reindex, read_only=False, input_hint="confirm",
+    ))
 
     def unavailable(key: str) -> MaterialData:
         reason = health.reason or graph_errors.get(key)
