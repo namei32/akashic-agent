@@ -16,3 +16,6 @@
 插件没有独立 HTTP 监听，不调用模型，不读取 Codex 数据库或认证信息。
 会话被手动删除后，通知不会将它恢复；原事件与历史消息均保留。
 状态归属及失败边界见 [ADR-0128](../../docs/decisions/0128-codex-notifications-use-local-gateway.md)。
+
+Windows 桌面端与 WSL 的安装、Hook 信任和本地发件箱操作见
+[桥接安装说明](../../integrations/codex_notifications/README.md)。
