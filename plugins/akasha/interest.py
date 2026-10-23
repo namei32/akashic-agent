@@ -20,12 +20,14 @@ class SemanticInterest:
     """用已完成对话的固定向量衡量候选兴趣，不重建历史向量或写学习图。"""
 
     def __init__(self, learning: Learning, catalog: MessageCatalog, embeddings: MessageEmbeddings,
-                 select: Callable[[], Awaitable[tuple[LearningConfig, Embed]]], *, fill_missing: bool = False):
+                 select: Callable[[], Awaitable[tuple[LearningConfig, Embed]]], *, fill_missing: bool = False,
+                 member: Callable[[str], bool] = lambda _session: True):
         self._learning = learning
         self._catalog = catalog
         self._embeddings = embeddings
         self._select = select
         self._fill_missing = fill_missing
+        self._member = member
 
     async def score(self, texts: Sequence[str], *, cutoff: str) -> tuple[float, ...]:
         """沿用 0.9 输入加 0.1 回复的最大余弦四次方，只采用 cutoff 前的证据。"""
@@ -71,6 +73,7 @@ class SemanticInterest:
         samples = self._learning.samples(self._catalog, rule, heads=self._catalog.snapshot_heads())
         eligible = [sample for sample in samples
                     if sample.ending.recorded_at <= through
+                    and self._member(sample.ending.session_id)
                     and isinstance(sample.ending.body, Output)
                     and sample.ending.body.finish == "complete"
                     and self._learning.text(sample.ending).strip()][-256:]
