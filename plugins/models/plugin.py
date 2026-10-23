@@ -10,6 +10,7 @@ from plugins.models.contract import (
     MODEL_DRIVERS,
 )
 from plugins.models.contract import MODEL_CACHE_USAGE, MODEL_CALL_STATS
+from plugins.models.contract import MODEL_USAGE_REPORTS
 from plugins.gateway.contract import RpcMethod
 from plugins.ui.contract import UI, UI_SLOTS, PluginUiDefinition, PluginUiRpcInvalidRequest
 
@@ -31,6 +32,7 @@ from .settings import MODEL_SETTINGS
 from .state import ModelsState
 from .store import ModelsStore
 from .usage import CacheUsage
+from .usage_report import UsageReports
 
 api_version = 3
 name = "models"
@@ -70,6 +72,7 @@ async def apply(ctx: Context) -> None:
     _ = await ctx.provide(MODEL_SETTINGS, state.settings)
     _ = await ctx.provide(MODEL_CALLS, store.read_call)
     _ = await ctx.provide(MODEL_CALL_STATS, store.read_call_stats)
+    _ = await ctx.provide(MODEL_USAGE_REPORTS, UsageReports(store.read_usage_report))
     usage = CacheUsage(ctx, store)
     _ = await ctx.provide(MODEL_CACHE_USAGE, usage)
     _ = await ctx.provide(MODEL_DISPLAY, display_facts)

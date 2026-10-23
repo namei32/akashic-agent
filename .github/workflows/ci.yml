@@ -87,3 +87,6 @@ jobs:
               resolve_web_module(path.parent, path.name)
               print(f"Loaded {path}")
           PY
+
+      - name: Verify model usage through installed plugin HTTP
+        run: .venv/bin/python scripts/model_usage_scenario.py
