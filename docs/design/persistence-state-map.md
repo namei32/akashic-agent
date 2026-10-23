@@ -1143,3 +1143,9 @@ Yoyo `20260909_02_execution_failures` 当时由 workspace 独占锁保护，迁�
 ## 分发来源组合（0082）
 
 `PluginSelection` 仍独占完整运行输入；停止期准备后只提交一次完整 Root。v4 descriptor 可增加不可变的 `distribution_source` commit，读取时核对归档 provenance；旧 descriptor、Root 和源码不改写。首次 distribution receipt 永久保留作为旧 cache 来源证明，启动标记不再是版本选择。内置升级只增加归档与固定 Python 环境；退役只减少当前 selection 成员，旧 cache、环境、plugin-data、配置、Message 和 Session 均不自动减少。manifest 只为新默认项增加选择，保留既有布尔值；内置停用及外置同 ID 覆盖的卸载保留 false。选择版本即接受 Core/内置 Yoyo：停止期持锁推进成功账本，迁移后才提交组合。内置配置允许由迁移更新并归档，失败重试保留已迁移输入；外置配置与数据仍由自身负责。迁移步骤只按已声明合同增加或更新状态，不授予删除权。准备/CAS/运行成功分别报告，已执行的数据写入不因旧 selection 保留而自动回滚。详见 [0082](../decisions/0082-distribution-owned-plugin-composition.md)。
+
+## Codex 回合通知
+
+`codex_notifications` 通过 Ledger OwnerState 追加 `event:<digest>`，固定原事件与目标；
+Ledger / Delivery 保存消息和投递选择。没有自动删除或历史改写协议。正常接纳、重投、
+停用和会话删除的完整边界见 [ADR-0128](../decisions/0128-codex-notifications-use-local-gateway.md)。
