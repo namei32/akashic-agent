@@ -6,7 +6,7 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import asdict
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 from collections.abc import Iterator, Mapping, Sequence
@@ -193,6 +193,7 @@ class Store:
                 result.append(identity)
             db.execute("UPDATE learning SET state='applied',result=? WHERE source_key=?",
                        (encode(result), source.key))
+            self._metadata(db, "last_learned_at", datetime.now(UTC).isoformat())
             db.commit()
             return tuple(result)
 
@@ -288,6 +289,63 @@ class Store:
             db.commit()
             return receipt
 
+    @staticmethod
+    def _metadata(db: sqlite3.Connection, key: str, value: object) -> None:
+        db.execute("INSERT INTO metadata VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                   (key, encode(value)))
+
+    @staticmethod
+    def _retry_sources(db: sqlite3.Connection) -> tuple[str, ...]:
+        row = db.execute("SELECT value FROM metadata WHERE key='retry_sources'").fetchone()
+        value = [] if row is None else json.loads(row[0])
+        if not isinstance(value, list) or any(not isinstance(key, str) for key in value):
+            raise ValueError("Corrupt retry queue")
+        return tuple(value)
+
+    def retry_sources(self) -> tuple[str, ...]:
+        with self.connection() as db:
+            return self._retry_sources(db)
+
+    def request_retry(self, request_id: str, expected_version: int, eligible: Sequence[str]) -> dict[str, object]:
+        if not request_id or len(request_id) > 128 or type(expected_version) is not int or expected_version < 0:
+            raise ValueError("Invalid retry request")
+        key, fingerprint = "control:" + request_id, digest(["retry", expected_version])
+        with self.connection(write=True) as db:
+            db.execute("BEGIN IMMEDIATE")
+            saved = db.execute("SELECT fingerprint,value FROM receipts WHERE key=?", (key,)).fetchone()
+            if saved is not None:
+                if saved[0] != fingerprint:
+                    raise ValueError("Retry request ID reused for different arguments")
+                return json.loads(saved[1])
+            control = self._control(db)
+            if control["version"] != expected_version:
+                raise ValueError("学习状态已改变，请刷新后再操作")
+            if control["paused"]:
+                raise ValueError("学习仍在暂停，请先恢复后再重试失败项")
+            row = db.execute("SELECT value FROM metadata WHERE key='failures'").fetchone()
+            failures = {} if row is None else json.loads(row[0])
+            targets = sorted(set(failures).intersection(eligible))
+            if targets:
+                epoch = db.execute("SELECT value FROM metadata WHERE key='retry_epoch'").fetchone()
+                self._metadata(db, "retry_epoch", (0 if epoch is None else int(epoch[0])) + 1)
+                self._metadata(db, "retry_sources", sorted(set(self._retry_sources(db)).union(targets)))
+                self._metadata(db, "failures", {k: v for k, v in failures.items() if k not in targets})
+            version = expected_version + 1
+            self._metadata(db, "learning_control", {"paused": False, "version": version})
+            receipt = {"request_id": request_id, "version": version, "requested": len(targets),
+                       "ineligible": len(failures) - len(targets), "source_keys": targets}
+            db.execute("INSERT INTO receipts VALUES (?,?,?)", (key, fingerprint, encode(receipt)))
+            db.commit()
+            return receipt
+
+    def settle_retry(self, key: str) -> None:
+        with self.connection(write=True) as db:
+            db.execute("BEGIN IMMEDIATE")
+            pending = self._retry_sources(db)
+            if key in pending:
+                self._metadata(db, "retry_sources", [source for source in pending if source != key])
+            db.commit()
+
     def failures(self) -> dict[str, str]:
         with self.connection() as db:
             row = db.execute("SELECT value FROM metadata WHERE key='failures'").fetchone()
@@ -315,14 +373,27 @@ class Store:
                 db.commit()
             return epoch
 
-    def status(self) -> dict[str, object]:
+    def status(self, source_keys: Sequence[str] | None = None) -> dict[str, object]:
         if not self.path.exists():
             return {"initialized": False}
         with self.connection() as db:
+            row = db.execute("SELECT value FROM metadata WHERE key='last_learned_at'").fetchone()
+            failure_row = db.execute("SELECT value FROM metadata WHERE key='failures'").fetchone()
+            failures = {} if failure_row is None else json.loads(failure_row[0])
+            progress = None
+            if source_keys is not None:
+                applied = {row[0] for row in db.execute(
+                    "SELECT source_key FROM learning WHERE state='applied' AND source_key IN (SELECT value FROM json_each(?))",
+                    (encode(list(source_keys)),))}
+                failed = set(failures).intersection(source_keys) - applied
+                progress = {"eligible": len(source_keys), "applied": len(applied), "failed": len(failed),
+                            "pending": len(source_keys) - len(applied) - len(failed)}
             return {
                 "initialized": True,
                 "learning": dict(db.execute("SELECT state,count(*) FROM learning GROUP BY state")),
                 "memories": dict(db.execute("SELECT status,count(*) FROM memory_items GROUP BY status")),
                 "kinds": dict(db.execute("SELECT kind,count(*) FROM memory_items WHERE status='active' GROUP BY kind")),
                 "receipts": db.execute("SELECT count(*) FROM receipts").fetchone()[0],
+                "last_learned_at": None if row is None else json.loads(row[0]),
+                "retry_pending": len(self._retry_sources(db)), "progress": progress, "failures": failures,
             }
