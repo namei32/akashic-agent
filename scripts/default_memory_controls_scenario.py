@@ -1,6 +1,7 @@
 """Real plugin/HTTP/SQLite scenario for durable learning controls and provider loss."""
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import os
@@ -9,11 +10,13 @@ import sqlite3
 import subprocess
 import tempfile
 from pathlib import Path
+from fastapi import FastAPI, Request
+from fastapi.responses import Response, JSONResponse
 
 from default_memory_scenario import ROOT, PROBE, snapshot
 
 
-async def run(folder: Path) -> dict[str, object]:
+async def run(folder: Path, serve_port: int | None = None, drop_ack: bool = False) -> dict[str, object]:
     from agent.plugins.install import install_git_plugin
     from agent.plugins.manager import PluginManager
     from agent.plugins.selection import PluginSelection
@@ -29,6 +32,7 @@ async def run(folder: Path) -> dict[str, object]:
 
     calls = {"chat": 0, "embedding": 0}
     entered, release = asyncio.Event(), asyncio.Event()
+    invalid_inputs = {"invalid fixture", "manual fixture", "visible failure", "ineligible fixture"}
 
     async def serve(reader, writer):
         try:
@@ -61,6 +65,10 @@ async def run(folder: Path) -> dict[str, object]:
                           "choices": [{"index": 0, "message": {"role": "assistant", "content": json.dumps({"facts": facts, "retract": []})},
                                        "finish_reason": "stop"}],
                           "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}}
+                marker = next((value for value in invalid_inputs if value in prompt), None)
+                if marker:
+                    result["choices"][0]["message"]["content"] = "invalid structured memory"
+                    invalid_inputs.remove(marker)
             else:
                 result = {"data": [{"id": "memory-fixture"}, {"id": "embedding-fixture"}]}
             body = json.dumps(result).encode()
@@ -77,8 +85,10 @@ async def run(folder: Path) -> dict[str, object]:
     workspace.mkdir()
     PluginSelection(workspace).initialize()
     for name in ("ledger", "commands", "content", "context", "tools", "turn_projection",
-                 "models", "openai_compatible"):
+                 "models", "openai_compatible", "ui", "shell_ui"):
         shutil.copytree(ROOT / "plugins" / name, sources / name, ignore=shutil.ignore_patterns("__pycache__"))
+    if serve_port is not None:
+        shutil.copytree(ROOT / "static/dashboard", sources / "ui/static/dashboard", dirs_exist_ok=True)
     (sources / "memory_probe").mkdir()
     (sources / "memory_probe/plugin.py").write_text(PROBE)
     os.environ.update(HOME=str(folder / "home"), AKASHIC_PLUGIN_HOME=str(folder / "home"), AKASHIC_PLUGIN_DISTRIBUTION="")
@@ -262,13 +272,118 @@ async def run(folder: Path) -> dict[str, object]:
             assert prepared == repeated and calls["embedding"] == embeddings
         assert "black coffee" in json.dumps(prepared), prepared
         assert snapshot(workspace) == before
+        # Requests go through the installed plugin's actual HTTP endpoint.
+        import httpx
+        from plugins.ui.contract import WEB_UI
+        async def web_headers():
+            catalog = json.loads(await host.live_root.context.require(WEB_UI).bootstrap())
+            module = next(value for value in catalog["modules"] if value["pluginId"] == "default_memory@lab")
+            return {"x-akashic-web-snapshot": catalog["snapshotId"], "x-akashic-web-catalog": catalog["catalogId"],
+                    "x-akashic-web-module": module["pluginId"], "x-akashic-web-generation": module["generationId"]}
+        async def http(method, path="", body=None):
+            endpoint = next(value for value in host.live_root.endpoints() if value.name == "dashboard")
+            async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(uds=endpoint.address), base_url="http://local") as web:
+                return await web.request(method, "/api/dashboard/default-memory" + path, json=body, headers=await web_headers())
+        async def action(action, identity, version, expected=200):
+            response = await http("POST", "/control", {"action": action, "request_id": identity, "expected_version": version})
+            assert response.status_code == expected, response.text
+            return response.json()
+        overview = (await http("GET")).json()
+        assert overview["progress"] == {"eligible": 3, "applied": 3, "pending": 0, "failed": 0}, overview
+        assert overview["last_learned_at"] and overview["last_scan_at"], overview
+        await action("pause", "http-pause", 5)
+        await action("retry", "paused-retry", 6, expected=409)
+        await action("resume", "http-resume", 6)
+        append = host.live_root.context.require(ServiceKey("scenario.append"))
+        await append("scenario:failure", "failure", "I prefer muted notifications. invalid fixture")
+        async with asyncio.timeout(10):
+            while not (await rpc("status"))["failures"]:
+                await asyncio.sleep(.02)
+        before = snapshot(workspace)
+        accepted = await action("retry", "http-retry", 7)
+        assert accepted["control_receipt"]["requested"] == 1, accepted
+        await wait_applied(4)
+        assert calls["chat"] == 5, calls
+        await action("pause", "after-http-retry", 8)
+        old = await action("retry", "http-retry", 7)
+        assert old["paused"] and old["control_version"] == 9 and old["control_receipt"]["version"] == 8, old
+        assert snapshot(workspace) == before
+
+        # Cold start and manual mode retain the durable result. A retry in
+        # manual mode processes only its failed sources, not unrelated backlog.
+        await host.terminate_all()
+        save_config(workspace / "plugin-data/default_memory-lab", {"mode": "active", "auto_learn": False})
+        host = make_host()
+        await host.load_all()
+        await action("resume", "manual-resume", 9)
+        append = host.live_root.context.require(ServiceKey("scenario.append"))
+        await append("scenario:manual", "manual-failure", "I prefer clear headings. manual fixture")
+        await append("scenario:backlog", "untouched", "I prefer readable text.")
+        await host.live_root.context.require(DEFAULT_MEMORY).consume(limit=1)
+        before = snapshot(workspace)
+        await action("retry", "manual-retry", 10)
+        state = await wait_applied(5)
+        assert state["progress"] == {"eligible": 6, "applied": 5, "pending": 1, "failed": 0}, state
+        assert not state["auto_learn"] and state["retry_pending"] == 0, state
+        assert calls["chat"] == 7, calls
+        for _ in range(3):
+            response = await http("GET")
+            assert response.status_code == 200
+        assert snapshot(workspace) == before
+
+        if serve_port is None:
+            await append("scenario:ineligible", "policy-failure", "I prefer text. ineligible fixture", scope=(("project", "no-retry"),))
+            await host.live_root.context.require(DEFAULT_MEMORY).consume()
+            failed_before = (await rpc("status"))["failures"]
+            assert len(failed_before) == 1
+            # Session scope policies are set-once. An operator can instead
+            # narrow this plugin's allowed message sources across a restart.
+            await host.terminate_all()
+            save_config(workspace / "plugin-data/default_memory-lab",
+                        {"mode": "active", "auto_learn": False, "sources": ["programmatic"]})
+            host = make_host()
+            await host.load_all()
+            before = snapshot(workspace)
+            previous_calls = dict(calls)
+            refused = await action("retry", "ineligible-retry", 11)
+            assert refused["control_receipt"]["requested"] == 0 and refused["control_receipt"]["ineligible"] == 1, refused
+            assert refused["failures"] == failed_before and refused["retry_pending"] == 0, refused
+            assert calls == previous_calls and snapshot(workspace) == before
+
+        if serve_port is not None:
+            import uvicorn
+            await append("scenario:visible", "visible", "I prefer examples. visible failure")
+            await host.live_root.context.require(DEFAULT_MEMORY).consume()
+            app = FastAPI()
+            @app.get("/api/chat/web-ui/bootstrap")
+            async def bootstrap():
+                return Response(await host.live_root.context.require(WEB_UI).bootstrap(), media_type="application/json")
+            @app.get("/api/chat/web-ui/state")
+            async def web_state():
+                return await host.live_root.context.require(WEB_UI).state()
+            endpoint = next(value for value in host.live_root.endpoints() if value.name == "dashboard")
+            async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(uds=endpoint.address), base_url="http://local") as web:
+                lose_ack = drop_ack
+                @app.api_route("/{path:path}", methods=["GET", "POST"])
+                async def forward(request: Request, path: str):
+                    nonlocal lose_ack
+                    reply = await web.request(request.method, "/" + path, params=request.query_params, content=await request.body(),
+                        headers={key: value for key, value in request.headers.items() if key != "host"})
+                    if lose_ack and request.method == "POST" and path.endswith("/control") and reply.status_code == 200:
+                        lose_ack = False
+                        return JSONResponse({"detail": "测试代理已转发操作，模拟确认响应丢失"}, status_code=503)
+                    return Response(reply.content, status_code=reply.status_code,
+                        headers={key: value for key, value in reply.headers.items() if key not in {"content-length", "content-encoding"}})
+                print("MEMORY_BROWSER_READY", workspace, flush=True)
+                await uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=serve_port, log_level="warning")).serve()
+
         return {"pause_during_model_call": True, "paused_backfill_stays_paused": True,
                 "restart_preserves_pause": True, "recall_while_paused": True,
                 "resume_wakes_backlog": True, "stale_control_rejected": True,
                 "request_and_command_replay": True, "settings_dependency_guard": True,
                 "missing_recall_fails_loudly": True, "provider_restore_preserves_pause": True,
                 "cancelled_ack_commits_and_wakes": True, "automatic_context_recall": True,
-                "original_rows_unchanged": True, "calls": calls}
+                "original_rows_unchanged": True, "http_progress_and_retry": True, "retry_replay_after_new_pause": True, "manual_retry_leaves_other_backlog": True, "calls": calls}
     finally:
         release.set()
         await host.terminate_all()
@@ -277,5 +392,9 @@ async def run(folder: Path) -> dict[str, object]:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--serve", type=int)
+    parser.add_argument("--lose-first-control-response", action="store_true")
+    args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="default-memory-controls-") as directory:
-        print(json.dumps(asyncio.run(run(Path(directory))), ensure_ascii=False))
+        print(json.dumps(asyncio.run(run(Path(directory), args.serve, args.lose_first_control_response)), ensure_ascii=False))
