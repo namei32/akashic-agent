@@ -50,12 +50,13 @@ async def apply(ctx: Context) -> None:
     runtime = Runtime(store, ctx.require(MESSAGE_CATALOG), ctx.require(TURN_PROJECTION),
                       ctx.require(CONTENT), ctx.require(MEMORY_SCOPES), ctx.require(CHAT_MODELS),
                       ctx.require(EMBEDDINGS), sources=config.sources,
-                      model_id=config.extraction_model, max_chars=config.max_chars, auto_learn=config.auto_learn)
+                      model_id=config.extraction_model, max_chars=config.max_chars, auto_learn=config.auto_learn, mode=config.mode)
     # Operations are owned by this plugin even when invoked by an operator.
     class Port:
         status = staticmethod(ctx.entrypoint(runtime.status))
         set_paused = staticmethod(ctx.entrypoint(runtime.set_paused))
         consume = staticmethod(ctx.entrypoint(runtime.consume))
+        retry_failed = staticmethod(ctx.entrypoint(runtime.retry_failed))
         audit = staticmethod(ctx.entrypoint(runtime.audit))
         recall = staticmethod(ctx.entrypoint(runtime.recall))
     await ctx.provide(DEFAULT_MEMORY, Port())
@@ -100,6 +101,16 @@ async def apply(ctx: Context) -> None:
         ("query", RecallQuery, rpc_recall),
     ):
         await ctx.provide(RpcMethod.key("default-memory/" + name), RpcMethod(model, ctx.entrypoint(operation)))
+    from importlib import import_module
+    from plugins.ui.contract import UI
+    async def ui(child: Context) -> None:
+        await child.require(UI).register(
+            child, web="web_module.js", dashboard=lambda: import_module(".dashboard", __package__),
+            requires=("shell.settings.v1",),
+            contract_digests={"shell.settings.v1": "1f4dd2eaee9118c799590a36745975150c46979a3f62b431f73aa29e949ce189"},
+        )
+    await ctx.inject((UI, DEFAULT_MEMORY), ui, name="ui")
+
     health = await ctx.health("learning", required=False)
     watcher: asyncio.Task[None] | None = None
     lock_handle = None
@@ -172,16 +183,21 @@ async def apply(ctx: Context) -> None:
                 runtime.changed.set()
 
         async with asyncio.TaskGroup() as tasks:
-            tasks.create_task(notifications(), name="default-memory-catalog")
+            if config.auto_learn:
+                tasks.create_task(notifications(), name="default-memory-catalog")
             while True:
                 await runtime.changed.wait()
                 runtime.changed.clear()
                 async with ctx.runtime_scope():
-                    result = await runtime.consume()
+                    if not config.auto_learn and not await runtime.has_retry():
+                        continue
+                    result = await runtime.consume(retry_only=not config.auto_learn)
                     if result["failures"]:
                         health.degrade(f"Default Memory 有 {len(runtime.errors)} 个待重试轮次；/default_memory_status 查看")
                     else:
                         health.recover()
+                    if not result["paused"] and await runtime.has_retry():
+                        runtime.changed.set()
 
     async def start(_event: object) -> None:
         nonlocal lock_handle, watcher
@@ -196,8 +212,8 @@ async def apply(ctx: Context) -> None:
             lock_handle.close()
             lock_handle = None
             raise
-        if config.auto_learn:
-            watcher = await ctx.spawn(follow(), name="default-memory-learning")
+        runtime.changed.set()
+        watcher = await ctx.spawn(follow(), name="default-memory-learning")
 
     async def stop(_event: object = None) -> None:
         nonlocal lock_handle

@@ -23,7 +23,7 @@ class Runtime:
     def __init__(self, store: Store, catalog: MessageCatalog, projection: TurnProjection,
                  content: Content, scopes: MemoryScopes, models: ChatModels, embeddings: Embeddings,
                  *, sources: tuple[str, ...], model_id: str | None = None, max_chars: int = 6000,
-                 auto_learn: bool = False):
+                 auto_learn: bool = False, mode: str = "staging"):
         self.store = store
         self.catalog = catalog
         self.projection = projection
@@ -39,6 +39,9 @@ class Runtime:
         self.errors: dict[str, str] = {}
         self.last_total = 0
         self.auto_learn = auto_learn
+        self.mode = mode
+        self.last_scan_at: str | None = None
+        self.last_source_keys: tuple[str, ...] | None = None
         self.control_lock = asyncio.Lock()
         self.changed = asyncio.Event()
         self.current_source: str | None = None
@@ -91,6 +94,25 @@ class Runtime:
             # is cancelled; the next admission reads the durable control.
             self.changed.set()
 
+    async def retry_failed(self, *, request_id: str, expected_version: int) -> dict[str, object]:
+        sources = await self.sources_snapshot()
+        try:
+            async with self.control_lock:
+                receipt = await run_io(self.store.request_retry, request_id, expected_version,
+                                       [source.key for source in sources])
+                self.errors = await run_io(self.store.failures)
+                return receipt
+        finally:
+            self.changed.set()
+
+    async def has_retry(self) -> bool:
+        return bool(await run_io(self.store.retry_sources))
+
+    def scanned(self, sources: Sequence[Source]) -> None:
+        self.last_total = len(sources)
+        self.last_source_keys = tuple(source.key for source in sources)
+        self.last_scan_at = datetime.now(UTC).isoformat()
+
     async def _admit(self, source: Source | None = None) -> bool:
         # The durable control and admission are ordered independently of the
         # long model call. A pause can return while an admitted turn settles.
@@ -102,7 +124,7 @@ class Runtime:
                 self.current_source = source.key
             return True
 
-    async def consume(self, *, limit: int | None = None, retry: bool = False) -> dict[str, object]:
+    async def consume(self, *, limit: int | None = None, retry: bool = False, retry_only: bool = False) -> dict[str, object]:
         async with self.learning_lock:
             if not await self._admit():
                 return await self.status()
@@ -110,29 +132,44 @@ class Runtime:
                 await run_io(self.store.retry_epoch, advance=True)
             self.errors = await run_io(self.store.failures)
             sources = await self.sources_snapshot()
-            self.last_total = len(sources)
+            self.scanned(sources)
+            pending_retry = set(await run_io(self.store.retry_sources))
+            for key in pending_retry - set(self.last_source_keys or ()):
+                await run_io(self.store.note_failure, key, "重试轮次已不符合当前学习条件，未调用模型")
+                await run_io(self.store.settle_retry, key)
+            self.errors = await run_io(self.store.failures)
             learned = await run_io(self.store.learned)
             attempted = 0
             for source in sources:
+                if retry_only and source.key not in pending_retry:
+                    continue
                 if limit is not None and attempted >= limit:
                     break
                 previous = learned.get(source.key)
                 if previous is not None and previous[0] != source.digest:
                     raise ValueError("Learned source prefix changed; operator verification required")
                 if previous is not None and previous[1] == "applied":
+                    if source.key in pending_retry:
+                        await run_io(self.store.settle_retry, source.key)
                     continue
                 if source.key in self.errors:
+                    if source.key in pending_retry:
+                        await run_io(self.store.settle_retry, source.key)
                     continue
                 if not await self._admit(source):
                     break
                 try:
                     attempted += 1
                     await self.learn(source)
+                    if source.key in pending_retry:
+                        await run_io(self.store.settle_retry, source.key)
                 except asyncio.CancelledError:
                     raise
                 except (ValueError, RuntimeError, TimeoutError) as error:
                     self.errors[source.key] = str(error)
                     await run_io(self.store.note_failure, source.key, str(error))
+                    if source.key in pending_retry:
+                        await run_io(self.store.settle_retry, source.key)
                     if ModelError.matches(error):
                         break
                 finally:
@@ -141,7 +178,7 @@ class Runtime:
 
     async def audit(self) -> dict[str, object]:
         sources = await self.sources_snapshot()
-        self.last_total = len(sources)
+        self.scanned(sources)
         by_session: dict[str, int] = {}
         for source in sources:
             by_session[source.session_id] = by_session.get(source.session_id, 0) + 1
@@ -149,11 +186,12 @@ class Runtime:
                 "source_digests": {source.key: source.digest for source in sources}}
 
     async def status(self) -> dict[str, object]:
-        value = await run_io(self.store.status)
+        value = await run_io(self.store.status, self.last_source_keys)
         control = await run_io(self.store.control) if value["initialized"] else {"paused": False, "version": 0}
         return {**value, "eligible_turns": self.last_total, "paused": control["paused"],
                 "control_version": control["version"], "auto_learn": self.auto_learn,
-                "current_source": self.current_source, "failures": dict(self.errors)}
+                "current_source": self.current_source, "mode": self.mode,
+                "last_scan_at": self.last_scan_at, "failures": value.get("failures", {})}
 
     def route(self, session_id: str, *, write: bool = False) -> str:
         route = self.scopes.route(session_id)
