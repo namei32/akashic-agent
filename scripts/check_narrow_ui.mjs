@@ -29,7 +29,7 @@ const { values } = parseArgs({
   },
 });
 assert(values.url, "请显式提供 --url，选择本次验收的服务");
-assert(["all", "models"].includes(values.page), "page 只接受 all 或 models");
+assert(["all", "models", "model-usage"].includes(values.page), "page 只接受 all、models 或 model-usage");
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const output = resolve(values.output);
 const bundles = new Map(
@@ -480,6 +480,85 @@ async function models(page, prefix) {
   await view.getByRole("button", { name: "关闭设置", exact: true }).click();
 }
 
+/** 已安装模型用量插件的真实读取、键盘、分页和窄屏路径。 */
+async function modelUsage(page, width) {
+  const panel = page.locator("dialog.shell-settings-dialog[open]");
+  const usage = panel.locator(".model-usage");
+  const ready = () => usage.locator('.usage-results[aria-busy="false"]').waitFor();
+  await ready();
+  assert.equal(await panel.getByRole("heading", {name: "模型用量", exact: true}).count(), 1);
+  async function capture(label) {
+    const geometry = await usage.evaluate(element => ({width: element.clientWidth, scrollWidth: element.scrollWidth,
+      left: element.getBoundingClientRect().left, right: element.getBoundingClientRect().right}));
+    assert(geometry.scrollWidth <= geometry.width + 1, "模型用量页面横向溢出");
+    assert(geometry.left >= -1 && geometry.right <= width + 1, "模型用量超出视口");
+    if (width <= 760) {
+      const small = await usage.locator("button,select,summary").evaluateAll(elements => elements.filter(element => {
+        const box = element.getBoundingClientRect();
+        return box.width > 0 && box.height > 0 && (box.width < 43.5 || box.height < 43.5);
+      }).map(element => element.textContent));
+      assert.deepEqual(small, [], "触控目标不足 44px");
+    }
+    const screenshot = `${width}-model-usage-${label}.png`;
+    await page.screenshot({path: resolve(output, screenshot), animations: "disabled"});
+    report.screens.push({label, viewport: page.viewportSize(), ...geometry, screenshot});
+  }
+  const exact = usage.locator(".usage-exact").first();
+  await exact.locator("summary").click();
+  assert(await exact.locator("span").isVisible());
+  await exact.locator("summary").press("Escape");
+  assert(await panel.isVisible(), "完整数值 Escape 不应关闭设置");
+  assert.equal(await exact.getAttribute("open"), null);
+  const axis = await usage.locator(".usage-chart svg text").allTextContents();
+  await usage.getByRole("group", {name: "趋势指标"}).getByRole("button", {name: "输出", exact: true}).click();
+  assert.notDeepEqual(await usage.locator(".usage-chart svg text").allTextContents(), axis, "输入输出应分别使用刻度");
+  const chart = usage.locator(".usage-chart-interactive");
+  await chart.focus(); await chart.press("End");
+  const lastX = await usage.locator(".usage-chart-selection").getAttribute("x");
+  await chart.press("ArrowLeft");
+  assert.notEqual(await usage.locator(".usage-chart-selection").getAttribute("x"), lastX);
+  await chart.press("Escape");
+  assert(await panel.isVisible());
+  await capture("overview");
+  const expand = usage.locator(".usage-expand").first();
+  if (await expand.count()) {
+    await expand.click(); await usage.locator(".usage-detail-row").first().waitFor();
+    await capture("details"); await expand.click();
+  }
+  const next = usage.getByRole("button", {name: "下一页", exact: true});
+  if (await next.getAttribute("aria-disabled") === "false") {
+    await next.scrollIntoViewIfNeeded();
+    const outer = panel.locator(".shell-settings-page");
+    const before = await outer.evaluate(element => element.scrollTop);
+    await next.click();
+    await usage.getByText("第 2 页 · 最多 50 条", {exact: true}).waitFor();
+    await ready();
+    assert(Math.abs(await outer.evaluate(element => element.scrollTop) - before) <= 2, "分页使外层页面跳动");
+    assert(await next.evaluate(element => element.getRootNode().activeElement === element), "分页丢失键盘焦点");
+    assert.equal(await usage.locator(".usage-table-scroll").evaluate(element => element.scrollTop), 0);
+    await capture("page-two");
+  }
+  const model = usage.getByRole("combobox", {name: "模型", exact: true});
+  if (await model.locator('option[value="usage-unavailable"]').count()) {
+    await model.selectOption("usage-unavailable");
+    await usage.getByText("2 次调用", {exact: true}).waitFor(); await ready();
+    assert.equal((await usage.locator(".usage-primary dd").first().innerText()).trim(), "—");
+    assert(await usage.locator(".usage-chart-bar.is-unknown").count() > 0);
+    await capture("unknown-usage");
+  }
+  // 仅中断本浏览器的一次真实 HTTP 读取，检查旧结果保留与恢复，不伪造统计响应。
+  const retained = await usage.locator(".usage-summary").innerText();
+  const fail = route => route.abort("failed");
+  await page.route("**/api/dashboard/model-usage?*", fail);
+  await usage.getByRole("button", {name: "刷新", exact: true}).click();
+  await usage.getByRole("alert").waitFor();
+  assert.equal(await usage.locator(".usage-summary").innerText(), retained);
+  await page.unroute("**/api/dashboard/model-usage?*", fail);
+  await usage.getByRole("button", {name: "重试", exact: true}).click();
+  await usage.getByRole("alert").waitFor({state: "hidden"}); await ready();
+  report.pages.push({width, page: "model-usage", keyboard: true, pagination: true, networkRecovery: true});
+}
+
 try {
   for (const width of values.widths.split(",").map(Number)) {
     assert(
@@ -574,6 +653,11 @@ try {
     );
     try {
       await page.goto(values.url, { waitUntil: "domcontentloaded" });
+      if (values.page === "model-usage") {
+        await modelUsage(page, width);
+        await context.close();
+        continue;
+      }
       // 全新 workspace 首跑时整屏引导会异步弹出并遮住导航；
       // 给它一个出现窗口，像用户一样关掉；看过后同一 context 内不再复现。
       if (
