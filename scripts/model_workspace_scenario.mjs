@@ -68,6 +68,9 @@ async function mount(provider, initialCatalog = null, {beforeWrite = () => {}, b
           catalog.models.push({id: model.model_id, connectionId, kind: model.kind, model: model.model, availability: "available", capabilities: {inputModalities: ["text"]}, capabilitySources: {inputModalities: "fixture"}});
           result = {revision: ++catalog.revision, status: "committed"};
         } else if (payload.type === "start_auth") {
+          if (provider.id === "codex") {
+            assert.deepEqual(payload.input, {}, "Codex login accepts provider input only; account identity comes from the authorized token");
+          }
           connectionId = payload.connection_id;
           result = {revision: catalog.revision, status: "pending", attemptId: "fixture-attempt", challenge: {interval: 5}};
         } else if (payload.type === "finish_auth") {
@@ -108,7 +111,7 @@ async function mount(provider, initialCatalog = null, {beforeWrite = () => {}, b
   return {catalog, commands, timers, async close() { dispose(); await settle(); dom.window.close(); }};
 }
 
-for (const activateProvider of [activateOpenCode, activateCodex]) {
+for (const activateProvider of [activateCodex, activateOpenCode]) {
   const provider = providerEntry(activateProvider);
   const fixture = await mount(provider);
   try {
@@ -124,6 +127,8 @@ for (const activateProvider of [activateOpenCode, activateCodex]) {
     }
     await settle();
     assert.deepEqual(fixture.commands.map(command => command.type), ["start_auth", "finish_auth"]);
+    assert.deepEqual(fixture.commands[0].input, provider.id === "codex" ? {} : {name: "OpenCode Go"});
+    checks.push(`${provider.id}: login forwards the provider's fields without adding an account identity`);
     assert.equal(fixture.catalog.models.length, 0, "authentication and discovery never adopt candidates");
     const choice = document.querySelector(".settings-sheet-row input");
     assert.equal(choice.checked, false);
@@ -139,6 +144,25 @@ for (const activateProvider of [activateOpenCode, activateCodex]) {
     await fixture.close();
   }
 }
+
+const reloginFixture = await mount(providerEntry(activateCodex), {
+  revision: 1,
+  connections: [{id: "saved", name: "Saved", driverId: "codex", authIdentity: "previous-account", availability: "available"}],
+  models: [], roleBindings: {}, defaultEmbeddingModelId: null,
+});
+try {
+  document.querySelector("[data-connections] button").click();
+  await settle();
+  document.querySelector("[data-start]").click();
+  await settle();
+  assert.equal(reloginFixture.commands[0].connection_id, "saved");
+  assert.deepEqual(reloginFixture.commands[0].input, {}, "relogin does not force the previous account identity into provider input");
+  assert.equal(reloginFixture.timers.length, 1);
+  document.querySelector("[data-close]").click();
+  await settle();
+  assert.deepEqual(reloginFixture.commands.map(command => command.type), ["start_auth", "cancel_auth"]);
+  checks.push("Codex relogin preserves the saved connection ID without submitting the previous account identity; closing cancels its attempt");
+} finally { await reloginFixture.close(); }
 
 for (const manual of [false, true]) {
   const fixture = await mount(providerEntry(activateOpenAI));

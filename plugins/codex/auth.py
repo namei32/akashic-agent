@@ -24,7 +24,9 @@ _REFRESH_SKEW_SECONDS = 120
 async def start_auth(input: Mapping[str, Any]) -> Mapping[str, Any]:
     """Begin one device login and separate private state from public challenge."""
 
-    unknown = sorted(set(input) - {"auth_base", "api_base"})
+    # Older models UIs added auth_identity to every provider's login input.
+    # Ignore that metadata; the authorized token supplies the account identity.
+    unknown = sorted(set(input) - {"auth_base", "api_base", "auth_identity"})
     if unknown:
         raise ValueError(f"unsupported Codex auth input: {', '.join(unknown)}")
     auth_base = (_string(input.get("auth_base")) or CODEX_AUTH_BASE).rstrip("/")
@@ -300,6 +302,9 @@ def _string(value: object) -> str:
 def _integer(value: object, *, default: int) -> int:
     if value is None:
         return default
+    # Device authorization returns interval as a decimal string.
+    if isinstance(value, str) and value.isascii() and value.isdecimal() and len(value) <= 20:
+        value = int(value)
     if isinstance(value, bool) or not isinstance(value, int):
         raise AuthenticationError("Codex 响应包含无效整数").exception()
     return value
