@@ -83,6 +83,7 @@ Issue 1179 的当前实现与重大决定见 [边界②③审查入口](design/p
 按实际状态区分结构转换、不可变历史读取与当前恢复协议。
 
 [Default Memory 当前插件与历史保全迁移](design/default-memory-current-plugin.md) 说明结构化记忆替换、完整历史补学与回退。
+[Default Memory 的 LongMemEval 评测](design/default-memory-longmemeval.md) 说明固定数据、真实插件回放、对照与评分边界。
 
 ## 4. 数据任务的额外入口
 
