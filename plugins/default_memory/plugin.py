@@ -17,6 +17,7 @@ from plugins.ledger.contract import MESSAGE_CATALOG
 from plugins.models.contract import CHAT_MODELS, EMBEDDINGS
 from plugins.tools.contract import TOOLS
 from plugins.turn_projection.contract import TURN_PROJECTION
+from .io import run_io
 from .contract import DEFAULT_MEMORY
 from .runtime import Runtime
 from .store import Store
@@ -49,10 +50,11 @@ async def apply(ctx: Context) -> None:
     runtime = Runtime(store, ctx.require(MESSAGE_CATALOG), ctx.require(TURN_PROJECTION),
                       ctx.require(CONTENT), ctx.require(MEMORY_SCOPES), ctx.require(CHAT_MODELS),
                       ctx.require(EMBEDDINGS), sources=config.sources,
-                      model_id=config.extraction_model, max_chars=config.max_chars)
+                      model_id=config.extraction_model, max_chars=config.max_chars, auto_learn=config.auto_learn)
     # Operations are owned by this plugin even when invoked by an operator.
     class Port:
         status = staticmethod(ctx.entrypoint(runtime.status))
+        set_paused = staticmethod(ctx.entrypoint(runtime.set_paused))
         consume = staticmethod(ctx.entrypoint(runtime.consume))
         audit = staticmethod(ctx.entrypoint(runtime.audit))
         recall = staticmethod(ctx.entrypoint(runtime.recall))
@@ -64,6 +66,9 @@ async def apply(ctx: Context) -> None:
     class Backfill(Empty):
         limit: int | None = Field(default=None, ge=1)
         retry: bool = False
+    class Control(Empty):
+        request_id: str | None = Field(default=None, min_length=1, max_length=128)
+        expected_version: int | None = Field(default=None, ge=0, strict=True)
     class RecallQuery(Empty):
         request_id: str = Field(min_length=1, max_length=128)
         session_id: str = Field(min_length=1)
@@ -76,19 +81,22 @@ async def apply(ctx: Context) -> None:
     async def rpc_backfill(params: BaseModel):
         request = Backfill.model_validate(params.model_dump())
         return await runtime.consume(limit=request.limit, retry=request.retry)
-    async def rpc_pause(_params: BaseModel):
-        runtime.paused = True
-        return await runtime.status()
-    async def rpc_resume(_params: BaseModel):
-        runtime.paused = False
-        return await runtime.status()
+    async def rpc_control(params: BaseModel, paused: bool):
+        request = Control.model_validate(params.model_dump())
+        receipt = await runtime.set_paused(paused, request_id=request.request_id,
+                                           expected_version=request.expected_version)
+        return {**await runtime.status(), "control_receipt": receipt}
+    async def rpc_pause(params: BaseModel):
+        return await rpc_control(params, True)
+    async def rpc_resume(params: BaseModel):
+        return await rpc_control(params, False)
     async def rpc_recall(params: BaseModel):
         request = RecallQuery.model_validate(params.model_dump())
         return await runtime.recall("operator:" + request.request_id, request.session_id,
                                     request.query, limit=request.limit)
     for name, model, operation in (
         ("status", Empty, rpc_status), ("audit", Empty, rpc_audit), ("backfill", Backfill, rpc_backfill),
-        ("pause", Empty, rpc_pause), ("resume", Empty, rpc_resume),
+        ("pause", Control, rpc_pause), ("resume", Control, rpc_resume),
         ("query", RecallQuery, rpc_recall),
     ):
         await ctx.provide(RpcMethod.key("default-memory/" + name), RpcMethod(model, ctx.entrypoint(operation)))
@@ -100,21 +108,45 @@ async def apply(ctx: Context) -> None:
         value = await runtime.status()
         return CommandResult("success", json.dumps(value, ensure_ascii=False))
 
-    async def backfill_command(_invocation: CommandInvocation) -> CommandResult:
-        runtime.paused = False
-        value = await runtime.consume(retry=True)
+    async def backfill_command(invocation: CommandInvocation) -> CommandResult:
+        option = invocation.raw_input.strip()
+        if option not in {"", "retry"}:
+            return CommandResult("error", "用法：/default_memory_backfill [retry]")
+        value = await runtime.consume(retry=option == "retry")
+        if value["paused"]:
+            return CommandResult("error", "学习仍处于暂停状态；请先 /default_memory_resume，再执行补学。")
         return CommandResult("error" if value["failures"] else "success", json.dumps(value, ensure_ascii=False))
 
-    async def pause_command(_invocation: CommandInvocation) -> CommandResult:
-        runtime.paused = True
-        return CommandResult("success", "已暂停；当前模型调用完成后保存进度，原始对话保持不变。")
+    async def control_command(invocation: CommandInvocation, paused: bool) -> CommandResult:
+        request_id = ("command:" + invocation.name + ":" + invocation.message_id
+                      if invocation.message_id else None)
+        receipt = await runtime.set_paused(paused, request_id=request_id)
+        current = await runtime.status()
+        label = "暂停" if paused else "恢复"
+        state = "暂停" if current["paused"] else "运行"
+        return CommandResult("success", f"{label}请求已执行（回执版本 {receipt['version']}）；"
+                             f"当前学习状态：{state}（版本 {current['control_version']}）。"
+                             + ("已开始的轮次完成后停止，重启后保持暂停；已有记忆仍可召回。"
+                                if current["paused"] else
+                                "自动学习开启时会继续处理积压轮次；/default_memory_status 查看状态。"))
+
+    async def pause_command(invocation: CommandInvocation) -> CommandResult:
+        return await control_command(invocation, True)
+
+    async def resume_command(invocation: CommandInvocation) -> CommandResult:
+        return await control_command(invocation, False)
 
     for command, description, handler, readonly in (
-        ("default_memory_status", "查看 Default Memory 补学与召回状态", status_command, True),
-        ("default_memory_backfill", "补学全部符合学习条件的历史并重试失败项（调用模型）", backfill_command, False),
-        ("default_memory_pause", "暂停 Default Memory 学习", pause_command, False),
+        ("default_memory_status", "查看 Default Memory 学习、暂停与召回状态", status_command, True),
+        ("default_memory_backfill", "补学符合条件的历史；retry 显式重试失败项", backfill_command, False),
+        ("default_memory_pause", "持久暂停学习，保持已有记忆召回", pause_command, False),
+        ("default_memory_resume", "恢复学习并处理积压轮次", resume_command, False),
     ):
-        await ctx.require(COMMANDS).register(ctx, CommandDefinition(command, description, handler, read_only=readonly))
+        await ctx.require(COMMANDS).register(ctx, CommandDefinition(
+            command, description, handler, read_only=readonly,
+            recover=handler if command in {"default_memory_pause", "default_memory_resume"} else None,
+            input_hint="[retry]" if command == "default_memory_backfill" else None,
+        ))
 
     if config.mode == "active":
         await ctx.provide(EMBEDDING_MEMORY_PLUGIN, object())
@@ -135,13 +167,21 @@ async def apply(ctx: Context) -> None:
                                  parallel=action == "recall")
 
     async def follow() -> None:
-        async for _heads in ctx.require(MESSAGE_CATALOG).follow():
-            async with ctx.runtime_scope():
-                result = await runtime.consume()
-                if result["failures"]:
-                    health.degrade(f"Default Memory 有 {len(runtime.errors)} 个待重试轮次；/default_memory_status 查看")
-                else:
-                    health.recover()
+        async def notifications() -> None:
+            async for _heads in ctx.require(MESSAGE_CATALOG).follow():
+                runtime.changed.set()
+
+        async with asyncio.TaskGroup() as tasks:
+            tasks.create_task(notifications(), name="default-memory-catalog")
+            while True:
+                await runtime.changed.wait()
+                runtime.changed.clear()
+                async with ctx.runtime_scope():
+                    result = await runtime.consume()
+                    if result["failures"]:
+                        health.degrade(f"Default Memory 有 {len(runtime.errors)} 个待重试轮次；/default_memory_status 查看")
+                    else:
+                        health.recover()
 
     async def start(_event: object) -> None:
         nonlocal lock_handle, watcher
@@ -150,8 +190,8 @@ async def apply(ctx: Context) -> None:
         lock_handle = path.open("a+")
         try:
             fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            await asyncio.to_thread(store.initialize)
-            runtime.errors = await asyncio.to_thread(store.failures)
+            await run_io(store.initialize)
+            runtime.errors = await run_io(store.failures)
         except BaseException:
             lock_handle.close()
             lock_handle = None
