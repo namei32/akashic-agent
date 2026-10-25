@@ -64,6 +64,11 @@ async def apply(ctx: Context) -> None:
     class Backfill(Empty):
         limit: int | None = Field(default=None, ge=1)
         retry: bool = False
+    class RecallQuery(Empty):
+        request_id: str = Field(min_length=1, max_length=128)
+        session_id: str = Field(min_length=1)
+        query: str = Field(min_length=1, max_length=16000)
+        limit: int = Field(default=8, ge=1, le=40)
     async def rpc_status(_params: BaseModel):
         return await runtime.status()
     async def rpc_audit(_params: BaseModel):
@@ -71,8 +76,20 @@ async def apply(ctx: Context) -> None:
     async def rpc_backfill(params: BaseModel):
         request = Backfill.model_validate(params.model_dump())
         return await runtime.consume(limit=request.limit, retry=request.retry)
+    async def rpc_pause(_params: BaseModel):
+        runtime.paused = True
+        return await runtime.status()
+    async def rpc_resume(_params: BaseModel):
+        runtime.paused = False
+        return await runtime.status()
+    async def rpc_recall(params: BaseModel):
+        request = RecallQuery.model_validate(params.model_dump())
+        return await runtime.recall("operator:" + request.request_id, request.session_id,
+                                    request.query, limit=request.limit)
     for name, model, operation in (
         ("status", Empty, rpc_status), ("audit", Empty, rpc_audit), ("backfill", Backfill, rpc_backfill),
+        ("pause", Empty, rpc_pause), ("resume", Empty, rpc_resume),
+        ("query", RecallQuery, rpc_recall),
     ):
         await ctx.provide(RpcMethod.key("default-memory/" + name), RpcMethod(model, ctx.entrypoint(operation)))
     health = await ctx.health("learning", required=False)
