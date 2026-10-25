@@ -162,3 +162,5 @@
 | [0122](0122-web-ingress-guard-plugin.md) | proposed / implemented for review | Web 入口守卫是可选插件，本机进程可信；修订 0017 的认证 non-goal | SEC、PLG、WEBUI |
 | [0122](0122-interactive-terminal.md) | proposed / implemented for review | 工作台终端是用户自己的交互 shell，PTY 归执行主机 | WEBUI、PLG |
 | [0121](0121-plugin-install-settles-from-disk.md) | proposed / implemented for review | 中断的插件安装按指针结算，启动以磁盘修正外置输入 | PLG-013、STA |
+
+- [0128 · Codex 回合通知经本机 Gateway 写入独立会话](0128-codex-notifications-use-local-gateway.md)
