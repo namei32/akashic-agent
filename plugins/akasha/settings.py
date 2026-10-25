@@ -12,6 +12,7 @@ from agent.plugin_composition.plugin_config import PLUGIN_CONFIG
 from agent.plugin_composition.runtime_catalog import RUNTIME_CATALOG
 from plugins.ui.contract import Configuration
 from plugins.onboarding.contract import ONBOARDING, Ability, PreviewLine, Step
+from .contract import MEMORY_SCOPES
 
 SETTINGS = ServiceKey[Configuration]("akasha.settings.v1")
 
@@ -35,10 +36,23 @@ class Settings:
                 reason = "缺少前置能力：" + "、".join(missing)
             elif model is None or not model.default_embedding_model_id or model.model(model.default_embedding_model_id).availability != 'available':
                 reason = "请先在模型设置中选择向量模型"
+            dependents = sorted({
+                item["id"] for item in cast(list[dict[str, Any]], graph["plugins"])
+                if item["id"] != self.ctx.runtime.plugin_id
+                for consumer in item["composition"]["fibers"]
+                if consumer["state"] == "active"
+                and consumer["dependency_providers"].get(MEMORY_SCOPES.name) == self.ctx.runtime.plugin_id
+            })
+            disable_reason = ("正在为其他记忆模块提供项目策略；请先切换记忆提供者，再关闭这项支持服务。"
+                              if dependents else "")
+            notice = ("当前负责情景图学习与历史对话召回。" if config["memory_enabled"]
+                      else "当前提供项目记忆策略、兴趣评分和旧记录读取，学习与召回由已选记忆提供者负责。")
             enabled = config["enabled"]
             return {**self.ctx.require(PLUGIN_CONFIG).read(self.ctx), "enabled": enabled,
                 "ready": enabled is True and not reason and self.function.state.value == "active",
                 "can_enable": not reason, "blocked": blocked, "reason": reason or fiber["error"] or "",
+                "can_disable": not dependents, "disable_reason": disable_reason,
+                "support_notice": notice, "support_dependents": dependents,
                 "values": {}}
 
     async def save(self, request_id: str, expected_input: str, values: dict[str, object]) -> dict[str, object]:
@@ -49,6 +63,8 @@ class Settings:
             current = await self.read()
             if values["enabled"] and not current["can_enable"]:
                 raise ValueError(str(current["reason"]))
+            if not values["enabled"] and not current["can_disable"]:
+                raise ValueError(str(current["disable_reason"]))
             config = self.model.model_validate({**self.ctx.config, **values}).model_dump()
             return await self.ctx.require(PLUGIN_CONFIG).apply(self.ctx, request_id=request_id,
                 expected_input=expected_input, config=config)

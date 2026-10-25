@@ -65,8 +65,8 @@ RRF 融合、强化/时间衰减、逻辑遗忘及来源追踪。
 | memory_items | 提炼或显式 remember 增加；重复来源不重复强化；独立来源可强化 | forget/用户纠正只改 status；当前不得自动物理删除 | 原事实、origins、changes、学习回执 |
 | learning | 固定来源摘要、模型与草稿；只从 draft 进入 applied | 失败不推进；不自动删除 | source digest、原消息 ID、模型输出 |
 | origins / changes | 事务追加来源关联与逻辑撤回证据 | 当前不得自动减少 | 同库事务 |
-| receipts | 自动召回按最新真实 Input ID、工具按实际 CallRef 固定结果 | 后续学习与遗忘不改旧查询；不自动删除 | 固定查询结果与参数摘要 |
-| metadata | schema 与 embedding 空间首次固定 | 换模型或维度明确报错；无自动重建 | 数据库备份及原模型配置 |
+| receipts | 自动召回按最新真实 Input ID、工具按实际 CallRef 固定结果；操作员控制按 request_id 追加回执 | 后续操作不改旧回执；同 ID 不同内容拒绝；不自动删除 | 固定结果、控制版本与参数摘要 |
+| metadata | schema 与 embedding 空间首次固定；操作员暂停/恢复事务更新 learning_control 及递增版本 | 换模型或维度明确报错；无自动重建；控制状态不得自动清除 | 数据库备份、控制回执及原模型配置 |
 | 原始聊天及附件 | 继续由 Ledger 正常新增 | 本迁移没有更新或删除权 | SQLite 一致快照、逐列差异及附件摘要 |
 | Akasha 图与旧查询 | 保留 | 不清理 | 原文件、owner records、旧发布版本 |
 | Markdown 档案 | 继续沿原插件协议 | 本插件不写 | 原 Markdown owner 的恢复点 |
@@ -78,9 +78,46 @@ RRF 融合、强化/时间衰减、逻辑遗忘及来源追踪。
 SQLite 使用 WAL 和 FULL synchronous，读模型服务前不持有 SQL 写事务。
 
 取消保留已保存草稿；恢复先核对来源摘要，再复用草稿和已提交结果。
-失败项在状态接口中可见，自动消息唤醒不反复重试同一失败；显式 backfill 可以重试。
+失败项在状态接口中可见，自动消息唤醒不反复重试同一失败；显式 backfill 的 retry 参数才重试失败项。
 向量服务故障可带明确状态使用关键词召回；数据库、数据形状和空间不一致直接失败。
 自动召回只在最新真实用户 Input 上第一次准备，并持久复用结果。
+
+## 学习控制与提供者保护
+
+暂停只控制自动学习和历史补学的下一轮准入，已有记忆召回、显式 remember/forget 保持可用。
+已准入的轮次允许完成；暂停接口不等待模型返回。状态接口给出 paused、control_version、
+auto_learn 和 current_source，调用者可以区分“已要求暂停”和“当前轮次已结束”。
+
+暂停和恢复在同一个 SQLite 事务写入控制状态与回执。
+新库没有控制记录时默认为未暂停；已有记录损坏直接报错。
+读控制状态与新轮次准入共用短锁，模型调用不占用控制锁。
+重启、插件撤下再挂载、普通 backfill 都不会隐式恢复。
+恢复会唤醒自动学习任务；auto_learn=false 的人工补学模式仍需显式调用 backfill。
+
+RPC 支持 request_id 和 expected_version。相同请求重试返回原回执，但响应同时展示当前状态；
+相同 ID 的不同内容拒绝，过期版本拒绝。
+命令使用实际命令消息 ID 固定请求，recover 复用同一回执。
+兼容旧客户端不带 request_id 的调用，但这种调用不提供跨请求去重保证。
+取消确认响应会等待已开始的磁盘工作结算；提交成功后仍唤醒积压处理，不把取消当撤销。
+
+```text
+┌───────────────────┐   事务写入    ┌────────────────────────┐
+│ 暂停 / 恢复操作员 │ ────────────▶ │ learning_control + 回执 │
+└───────────────────┘              └────────────┬───────────┘
+                                              ▼ 准入前读取
+┌───────────────────┐              ┌────────────────────────┐
+│ 消息通知 / 恢复信号│ ────────────▶ │ 已完成轮次 → 提炼 → 提交 │
+└───────────────────┘              └────────────────────────┘
+```
+
+Akasha 设置读取实际组合图：若活跃消费者依赖其 MEMORY_SCOPES，页面禁用关闭开关，
+后端保存也在发布配置前拒绝。支持模式会说明项目策略、兴趣评分与旧记录读取的职责。
+Core 的显式停用/卸载协议仍按 PLG-010 执行，依赖者可进入等待。
+
+Context 增加可选 recall_source=(材料名, 实际插件 ID)，与既有 summary_source 的固定选择类似。
+迁移实例指定 Default Memory；普通聊天绑定时若提供者缺失或身份不符，直接报错，
+不会静默省略长期记忆。明确排除 recall 的辅助任务不受此项约束。
+默认空值保持未迁移实例的行为；主动切换提供者时必须同步修改此项配置。
 
 ## 迁移与回退
 
@@ -92,9 +129,12 @@ SQLite 使用 WAL 和 FULL synchronous，读模型服务前不持有 SQL 写事�
    然后启用在线学习，验证真实 Context 召回、显式工具和冷启动。
 6. 回退只恢复提供者选择与兼容代码，保留新旧记忆数据库和新增对话。
    不用旧 sessions.db 备份覆盖切换后新增消息。
+   若回退到不识别持久暂停的旧版本，先以 auto_learn=false 保持暂停意图，
+   并移除旧 Context 不支持的 recall_source 字段；不得只换代码而留下不兼容配置。
 
 发行版默认关闭 Default Memory；迁移时显式选择 staging，默认不自动调用模型。`/default_memory_backfill` 是明确的全历史模型调用入口，
-`/default_memory_status` 展示实际状态，`/default_memory_pause` 暂停后续轮次。
+`/default_memory_status` 展示实际状态，`/default_memory_pause` 持久暂停后续轮次，
+`/default_memory_resume` 显式恢复；暂停时 `/default_memory_backfill [retry]` 不改变暂停状态。
 Gateway 提供 `default-memory/status`、`default-memory/audit`、`default-memory/backfill` 同义入口，
 以及 pause/resume 和只读取记忆、保存查询回执的 query；query 不向对话追加测试消息。
 
@@ -107,3 +147,28 @@ Gateway 提供 `default-memory/status`、`default-memory/audit`、`default-memor
 - 对正式快照使用同一学习管线审计，再逐列比较所有 Message、Session 和附件关联；
   单独检查实际附件内容、Markdown 与切换后的新消息追加。
 - 静态检查包括类型、插件边界和 diff；不新增单元测试。
+
+## 新安装验证的分层标准
+
+代码检查只验证类型和边界；“服务启动成功”不能替代下面的行为验收。
+
+| 层次 | 入口与环境 | 独立判断成败的依据 |
+|---|---|---|
+| 功能链路 | WSL 临时新工作区，真实 PluginManager、Ledger、HTTP 模型 driver、SQLite | 合资格完整轮次有学习回执；事实有用户证据；新用户输入自动进入 Context；remember/forget 可追溯；消息逐列不变 |
+| 资格与隔离 | 同一真实工作区中的 eligible/excluded、open、off、isolated、recall=false | 禁止来源没有提炼调用和派生向量；私有记忆不进入其他范围；关闭召回时不泄漏 |
+| 生命周期与并发 | 正式 Git 安装的插件，受控 HTTP 响应和真实 SQLite 竞争锁 | 当前轮次结束后暂停；冷启动仍暂停；恢复不等新消息；旧请求、命令恢复、过期版本及取消确认不改变已确认意图 |
+| 提供者丢失 | 设置保存、正式插件管理停用/启用、真实 Context.bind | 设置拒绝误关且 selection 不变；显式停用后普通聊天明确失败；恢复后暂停意图与记忆仍在 |
+| 已部署实例 | 固定发行产物、实际配置和模型，只读审计及独立查询 ID | 所选插件均就绪；合资格历史与学习回执对应；已有消息 ID/列值/附件摘要不变；原 Akasha 图及 Markdown 保留；其他已部署功能保持 |
+| 回忆质量 | 与功能场景分开的人工标注问答集、真实模型、固定上下文预算 | 分别记录事实召回率、错误记忆率、跨范围泄漏、证据正确率，以及延迟和 token；不能从受控 HTTP 场景推算准确率 |
+
+可重复的行为入口：
+
+- `python scripts/default_memory_scenario.py`：完整学习、范围路由、Wake、新旧查询回执、失败显式重试、遗忘、procedure 和取消落盘。
+- `python scripts/default_memory_controls_scenario.py`：新装插件、在线暂停、冷启动、积压唤醒、控制重放、设置保护、实际停用恢复及自动 Context 召回。
+- `npm run typecheck`、`npm run build:web-plugins` 和插件边界检查作为静态/产物检查；安装后再打开真实设置页检查禁用理由和职责说明。
+
+质量集先对 20～30 个经人工确认的偏好、资料、流程、事件问题建立答案和证据，
+覆盖直接问法、同义改写、应拒绝的无记忆问题、纠正/遗忘和项目隔离。
+基线与候选使用同一模型、历史截点、查询预算和独立数据库副本，防止查询强化影响后续样本。
+对原始会话表做差异核对，并单独核对新增会话是否只追加。
+该质量评估是后续验收边界，功能场景通过不表示已达到 Akasha 的 InMind 指标。

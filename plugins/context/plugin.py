@@ -45,6 +45,7 @@ class Config(BaseModel):
     model_config = ConfigDict(extra="forbid")
     prompt_sources: dict[str, str] = Field(default_factory=dict)
     summary_source: tuple[str, str] | tuple[()] = ()
+    recall_source: tuple[str, str] | tuple[()] = ()
 
     @field_validator("prompt_sources")
     @classmethod
@@ -53,11 +54,11 @@ class Config(BaseModel):
             raise ValueError("Prompt 材料和插件名称不能为空")
         return value
 
-    @field_validator("summary_source")
+    @field_validator("summary_source", "recall_source")
     @classmethod
-    def check_summary_source(cls, value: tuple[str, str] | tuple[()]) -> tuple[str, str] | tuple[()]:
+    def check_selected_source(cls, value: tuple[str, str] | tuple[()]) -> tuple[str, str] | tuple[()]:
         if any(not item.strip() for item in value):
-            raise ValueError("摘要材料和插件名称不能为空")
+            raise ValueError("指定材料和插件名称不能为空")
         return value
 
 
@@ -239,5 +240,10 @@ async def apply(ctx: Context) -> None:
         return {"text": part.value}
 
     _ = await ctx.provide(CONTEXT_NOTICE_DISPLAY, display_notice)
-    materials = ContextMaterials(ctx, prompt_sources=config.prompt_sources, summary_source=config.summary_source or None)
+    materials = ContextMaterials(
+        ctx,
+        prompt_sources=config.prompt_sources,
+        summary_source=config.summary_source or None,
+        recall_source=config.recall_source or None,
+    )
     _ = await ctx.provide(MATERIALS_V4, materials, binding_contributors=materials.binding_contributors)
