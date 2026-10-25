@@ -1,0 +1,25 @@
+{
+  "generated": "2026-10-09T03:29:41.100999+00:00",
+  "sections": [
+    {
+      "id": "mockups",
+      "label": "Mockups",
+      "groups": [
+        {
+          "slug": "corgi-bike",
+          "files": [
+            {
+              "label": "index.html",
+              "path": "mockups/corgi-bike/index.html"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "design-systems",
+      "label": "Design Systems",
+      "groups": []
+    }
+  ]
+}
