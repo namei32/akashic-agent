@@ -27,7 +27,7 @@ async def discover(
     credential: CredentialHandle,
     client_version: str,
 ) -> tuple[DiscoveredModel, ...]:
-    """Load the complete visible Codex catalog for one connection."""
+    """Load the version-negotiated visible Codex catalog for one connection."""
 
     payload = await _catalog_request(descriptor, credential, client_version)
     raw_models = payload.get("models")
