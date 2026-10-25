@@ -96,7 +96,7 @@ async def reply_scenario(path):
                   f'return Result("success", (ContentPart("artifact_ref", Path({str(path / "tool-ref")!r}).read_text()),))'))
 
     async with application(path, replying=True, extra_sources=provider) as (log, host):
-        metadata = ArtifactStore(path / "sessions.db")
+        metadata = ArtifactStore(path / "workspace" / "sessions.db")
         store = ChannelAttachmentArtifactStore(workspace=path / "workspace", metadata_store=metadata)
         try:
             ref = await store.import_bytes(image_bytes(), kind=AttachmentKind.IMAGE,
@@ -157,7 +157,7 @@ async def summary_scenario(path):
         ))
     async with application(path, replying=True, compaction=True, output_tokens=128,
                            extra_sources=provider) as (log, host):
-        metadata = ArtifactStore(path / "sessions.db")
+        metadata = ArtifactStore(path / "workspace" / "sessions.db")
         store = ChannelAttachmentArtifactStore(workspace=path / "workspace", metadata_store=metadata)
         writer = log.writer("test:room", author="scheduler", source="scheduler", body_types=(Output,),
                             content={"text": check_text, "artifact_ref": check_artifact})
@@ -197,7 +197,7 @@ async def summary_scenario(path):
 
 async def main():
     with tempfile.TemporaryDirectory(prefix="akashic-image-view-") as directory:
-        path = Path(directory)
+        path = Path(directory).resolve()
         (path / "resources").mkdir()
         (path / "reply").mkdir()
         await resource_scenario(path / "resources")
