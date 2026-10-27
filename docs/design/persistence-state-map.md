@@ -11,6 +11,14 @@
 - 目标读者：维护者、coding agent、迁移与备份实现者、评审者
 - 关联条款：STA-001～STA-003、CTX-001、SES-001～SES-006、MEM-001～MEM-009、PLG-001～PLG-013、WSP-001～WSP-004、SCH-001～SCH-002、PRO-001～PRO-002、BAK-001
 
+## 2026-10-27：回复循环预算耗尽后续额
+
+[0129](../decisions/0129-exhausted-react-budget-renews-on-new-input.md) 只调整同来源日志的临时预算投影。
+新 Input、Output、ToolResult 和 failure 仍由原 owner 按既有追加协议增加；新输入在已耗尽且
+记录失败后重新取得循环额度。没有消息、工具或调用账的原位更新、逻辑失效和物理减少；
+Turn 与工具 CallRef 保持原边界。既有失败记录直接参与重建，无 schema 或数据迁移。
+代码回退保留全部消息和效果，旧版本可能再次拒绝这条未完成执行，不能把回退当作效果撤销。
+
 ## 2026-10-11：workspace 插件选择与配置（待评审）
 
 [0109](../decisions/0109-workspace-owns-plugin-choices.md) 取代下文旧全局清单的现状描述。
