@@ -79,7 +79,8 @@ replay。新 Summary 正常开启新上下文，旧搜索结果只是
 模型调用格式或名称不属于当前展示时，展示层抛出 `InvalidToolCall`；ReAct 将原 wire 请求和
 拒绝原因作为 `model.tool_rejection` 内容随同一个成功模型 Output 提交，不生成 binding、
 真实 ToolCall、ToolResult 或 effect。Model 投影重放原请求与“调用未执行”的协议反馈。
-Output 仍为 continue 并计入原步数上限，所以取消、重启或新输入不能重置纠错预算。混合响应
+Output 仍为 continue 并计入原步数上限，所以取消、重启或执行中的新输入不能重置纠错预算。
+耗尽并记录 failure 后，新输入按 [0129](../decisions/0129-exhausted-react-budget-renews-on-new-input.md) 续额，保留原纠错事实与工具结果。混合响应
 中的有效调用继续走唯一的 Tools 执行链。展示实现返回未获授 binding 等内部契约错误仍直接失败。
 
 ```text

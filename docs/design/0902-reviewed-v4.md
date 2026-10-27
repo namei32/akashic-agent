@@ -353,7 +353,7 @@ Models 聊天的调用读取、开始、首字与终结记账使用现有有界�
 完成记账期间取消也等待实际提交，成功回执保持可回放。这里没有诊断与前台的独立线程额度保证，
 同步 Settings、credential 与 key_recovery 等额外路径仍需独立核对。
 
-预算必须注明适用范围。单次请求内的纠正/传输重试计数可以在内存；默认来源的已完成循环步数从最后 complete/quiet 或 abandon 边界后的 Output 重建，不因 scope 替换归零。若配置跨重启的模型调用/费用硬上限，额度 owner 在发请求前耐久占额，Model owner 保存实际调用、binding、usage 或 unknown；未知费用不得算作零。调用方用来源与边界消息引用绑定额度，Model 只接收额度凭据，无需理解 Session/Turn。没有这套 provider/query 证据时，只能承诺本地调用次数限制，不能声称精确费用硬上限。
+预算必须注明适用范围。单次请求内的纠正/传输重试计数可以在内存；默认来源的已完成循环步数从最后 complete/quiet 或 abandon 边界后的 Output 重建，不因 scope 替换归零。按 [0129](../decisions/0129-exhausted-react-budget-renews-on-new-input.md)，达到上限并记录 failure 后，同来源新的用户 Input 可以重新取得循环额度；这不改变 Turn、工具回执和历史保留边界。若配置跨重启的模型调用/费用硬上限，额度 owner 在发请求前耐久占额，Model owner 保存实际调用、binding、usage 或 unknown；未知费用不得算作零。调用方用来源与边界消息引用绑定额度，Model 只接收额度凭据，无需理解 Session/Turn。没有这套 provider/query 证据时，只能承诺本地调用次数限制，不能声称精确费用硬上限。
 
 Tool Search 自己提供候选 schema 和选择状态。ReAct 只取得 tool view，不识别字符串 `tool_search`，更不写 `message_push._commit_role=passive`。工具发现不等于授权；Tool 执行边界始终验证真实权限。可见工具集、LRU/preload 属于发现插件，catalog 注册与 exact binding 属于能力 owner。
 

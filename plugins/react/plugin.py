@@ -85,8 +85,10 @@ class _Superseded(Exception):
 class _History:
     """按新消息推进本来源的执行视图；旧前缀变化时从事实重建。"""
 
-    def __init__(self, source: str) -> None:
+    def __init__(self, source: str, max_steps: int) -> None:
         self.source = source
+        self._max_steps = max_steps
+        self._exhausted = False
         self.messages: Sequence[Message] = ()
         self.head = -1
         self.reminder_input_id: str | None = None
@@ -109,7 +111,7 @@ class _History:
             )
         )
         if not compatible:
-            self.__init__(self.source)
+            self.__init__(self.source, self._max_steps)
             previous = ()
         for message in messages[len(previous):]:
             if message.source != self.source:
@@ -117,11 +119,16 @@ class _History:
             self.head = message.seq
             body = message.body
             if isinstance(body, Input):
+                # 只有已失败的满额执行能由新输入续额；工具与 Turn 边界保持原样。
+                if self._exhausted:
+                    self._outputs.clear()
+                    self._exhausted = False
                 self.reminder_input_id = message.message_id
             elif isinstance(body, Output):
                 if body.finish != "continue":
                     self._boundary = message.seq
                     self._outputs.clear()
+                    self._exhausted = False
                 elif any(isinstance(part, ContentPart) and part.kind == "model.facts"
                          for part in body.parts):
                     self._outputs.append(message.seq)
@@ -136,6 +143,12 @@ class _History:
                 self._boundary = max(self._boundary, body.through_seq)
                 self._abandoned_upto = max(self._abandoned_upto, body.through_seq)
                 self._outputs = [seq for seq in self._outputs if seq > body.through_seq]
+                self._exhausted = False
+            elif isinstance(body, Control) and body.action == "failure":
+                self._exhausted = (
+                    self._max_steps > 0 and self.steps >= self._max_steps
+                    and self._outputs[-1] <= body.through_seq
+                )
             elif isinstance(body, ToolResult):
                 self._results.add(body.call_ref)
                 self._calls.pop(body.call_ref, None)
@@ -478,7 +491,7 @@ async def react(
         raise ValueError("并行工具上限必须是正整数")
     if reader.session_id != writer.session_id:
         raise ValueError("ReAct reader 与 writer 必须属于同一 Session")
-    history = _History(writer.source)
+    history = _History(writer.source, max_steps)
     while True:
         operation_id = uuid4().hex
         mark = partial(log_timing, session_id=reader.session_id, source=writer.source, operation_id=operation_id)
@@ -556,7 +569,9 @@ async def react(
         except _Superseded:
             raise asyncio.CancelledError from None
         if max_steps > 0 and history.steps >= max_steps:
-            raise StepLimit(f"本来源未完成工作已达到 {max_steps} 个模型输出").exception()
+            raise StepLimit(
+                f"本来源未完成工作已达到 {max_steps} 个模型输出；请发送新消息继续，已完成的工具结果会保留"
+            ).exception()
 
         # 2. 重启和显式重试都用当前材料发新请求，不恢复旧请求身份。
         mark("preparation.begin")

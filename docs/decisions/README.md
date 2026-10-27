@@ -164,3 +164,5 @@
 | [0121](0121-plugin-install-settles-from-disk.md) | proposed / implemented for review | 中断的插件安装按指针结算，启动以磁盘修正外置输入 | PLG-013、STA |
 
 - [0128 · Codex 回合通知经本机 Gateway 写入独立会话](0128-codex-notifications-use-local-gateway.md)
+
+- [0129 · 回复循环耗尽后由新输入续额](0129-exhausted-react-budget-renews-on-new-input.md)：accepted；只续循环额度，保留 Turn、旧消息和工具结果；SES-013。
