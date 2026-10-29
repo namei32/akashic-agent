@@ -9,10 +9,11 @@ from plugins.drift.contract import DRIFT_DELIVERY_V2, DRIFT_WAKE_V2
 from core.common.file_io import run_file_io
 
 from .store import DriftStore
+from .controls import mount
 
 api_version = 3
 name = "drift"
-version = "3.0.0"
+version = "3.1.0"
 desc = "Durable Drift proposal state"
 author = "Akashic Core"
 inject = ()
@@ -62,5 +63,6 @@ async def apply(ctx: Context) -> None:
 
     store = DriftStore(ctx.data_root / "drift.sqlite3")
     await run_file_io(store.initialize)
+    await mount(ctx, store)
     _ = await ctx.provide(DRIFT_WAKE_V2, _AsyncWakeServices(store))
     _ = await ctx.provide(DRIFT_DELIVERY_V2, _AsyncDeliveryServices(store))

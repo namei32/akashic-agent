@@ -10,7 +10,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Generator, NotRequired, TypedDict
 
-_SCHEMA_VERSION = 2
+from .drift_migrations.helpers.initiative_control_v3 import (
+    CONTROL_SQL,
+    RECEIPTS_SQL,
+    create_control,
+)
+from .schema import ControlReceipt, ControlRequest
+
+_SCHEMA_VERSION = 3
 _TABLE_SQL_V1 = """
     CREATE TABLE proposals(
         proposal_id TEXT NOT NULL,
@@ -113,8 +120,20 @@ class DriftStore:
                     "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
                 )
             )
-            if tables != ("proposals",):
+            if tables != (
+                "initiative_control", "initiative_control_receipts", "proposals",
+            ):
                 raise RuntimeError("Drift owned table set 不匹配")
+            for name, expected in (
+                ("initiative_control", CONTROL_SQL),
+                ("initiative_control_receipts", RECEIPTS_SQL),
+            ):
+                row = connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (name,),
+                ).fetchone()
+                if row is None or _normalize_sql(row[0]) != _normalize_sql(expected):
+                    raise RuntimeError(f"Drift {name} schema identity 不匹配")
+            self._initiative_control(connection)
             table_sql = connection.execute(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'proposals'"
             ).fetchone()
@@ -133,6 +152,68 @@ class DriftStore:
             result = connection.execute("PRAGMA integrity_check").fetchone()
             if result is None or result[0] != "ok":
                 raise RuntimeError("Drift SQLite integrity check failed")
+
+    @staticmethod
+    def _initiative_control(connection: sqlite3.Connection) -> dict[str, object]:
+        row = connection.execute(
+            "SELECT paused, version FROM initiative_control WHERE singleton=1"
+        ).fetchone()
+        if (
+            row is None or type(row[0]) is not int or row[0] not in (0, 1)
+            or type(row[1]) is not int or row[1] < 0
+        ):
+            raise RuntimeError("Drift initiative control is missing or corrupt")
+        return {"paused": bool(row[0]), "control_version": row[1]}
+
+    def initiative_status(self) -> dict[str, object]:
+        with self._transaction(write=False) as db:
+            return {
+                **self._initiative_control(db),
+                "proposals": dict(db.execute(
+                    "SELECT status, count(*) FROM proposals GROUP BY status"
+                )),
+            }
+
+    def set_initiative_paused(
+        self, paused: bool, request_id: str, expected_version: int,
+    ) -> dict[str, object]:
+        if type(paused) is not bool:
+            raise ValueError("Drift paused must be a boolean")
+        request = ControlRequest(request_id=request_id, expected_version=expected_version)
+        with self._transaction(write=True) as db:
+            saved = db.execute(
+                "SELECT paused, expected_version, receipt "
+                "FROM initiative_control_receipts WHERE request_id=?",
+                (request.request_id,),
+            ).fetchone()
+            if saved is not None:
+                if (saved[0], saved[1]) != (int(paused), request.expected_version):
+                    raise ValueError("Drift control request ID reused for different arguments")
+                saved_receipt = ControlReceipt.model_validate_json(saved[2])
+                if (
+                    saved_receipt.request_id != request.request_id
+                    or saved_receipt.paused is not paused
+                    or saved_receipt.version != request.expected_version + 1
+                ):
+                    raise RuntimeError("Drift control receipt is corrupt")
+                return saved_receipt.model_dump(mode="json")
+            current = self._initiative_control(db)
+            if current["control_version"] != request.expected_version:
+                raise ValueError("Drift initiative state changed; refresh before retrying")
+            version = request.expected_version + 1
+            receipt: dict[str, object] = {
+                "request_id": request.request_id, "paused": paused, "version": version,
+            }
+            db.execute(
+                "UPDATE initiative_control SET paused=?, version=? WHERE singleton=1",
+                (int(paused), version),
+            )
+            db.execute(
+                "INSERT INTO initiative_control_receipts VALUES (?,?,?,?)",
+                (request.request_id, int(paused), request.expected_version,
+                 json.dumps(receipt, sort_keys=True)),
+            )
+            return receipt
 
     def propose(
         self,
@@ -512,6 +593,8 @@ class DriftStore:
     @staticmethod
     def _ensure_schema(connection: sqlite3.Connection) -> None:
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if version == 2:
+            raise RuntimeError("Drift v2 requires the initiative-control installation migration")
         if version not in (0, 1, _SCHEMA_VERSION):
             raise RuntimeError(f"不支持的 Drift schema version: {version}")
         if version == _SCHEMA_VERSION:
@@ -576,6 +659,7 @@ class DriftStore:
             connection.execute("DROP TABLE proposals_v1")
             for statement in _INDEX_SQL:
                 connection.execute(statement)
+        create_control(connection)
         connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
 
