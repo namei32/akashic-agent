@@ -25,6 +25,7 @@ from plugins.ledger.log import MessageLog
 
 BASE = "5766f1a5c48dc988ddbc916e8f4f40103274f7b5"
 MIGRATION = "20261028_01_initiative_control"
+TARGET_MIGRATION = "20261029_01_initiative_target"
 
 
 def proposals(path: Path) -> list[tuple]:
@@ -70,7 +71,7 @@ async def run(folder: Path) -> dict[str, object]:
         messages = db.execute("SELECT * FROM messages ORDER BY session_key, seq").fetchall()
     runner = MigrationRunner(repo_root=core, config_path=folder / "config.toml",
                              workspace=workspace, plugin_dirs=[sources], plugins_home=folder / "home")
-    assert runner.run().migrations == (MIGRATION,)
+    assert runner.run().migrations == (MIGRATION, TARGET_MIGRATION)
     assert proposals(path) == before
 
     async def mount(data_root: Path = data):
@@ -136,7 +137,7 @@ async def run(folder: Path) -> dict[str, object]:
     fresh = folder / "fresh-workspace"
     fresh_runner = MigrationRunner(repo_root=core, config_path=folder / "fresh.toml",
                                    workspace=fresh, plugin_dirs=[sources], plugins_home=folder / "fresh-home")
-    assert fresh_runner.run().migrations == (MIGRATION,)
+    assert fresh_runner.run().migrations == (MIGRATION, TARGET_MIGRATION)
     fresh_data = fresh / "plugin-data/drift-builtin"
     assert not (fresh_data / "drift.sqlite3").exists()
     root, rpc = await mount(fresh_data)
@@ -166,7 +167,7 @@ async def run(folder: Path) -> dict[str, object]:
     v1_before = proposals(v1_path)
     v1_runner = MigrationRunner(repo_root=core, config_path=folder / "v1.toml",
                                 workspace=v1_workspace, plugin_dirs=[sources], plugins_home=folder / "v1-home")
-    assert v1_runner.run().migrations == (MIGRATION,)
+    assert v1_runner.run().migrations == (MIGRATION, TARGET_MIGRATION)
     assert proposals(v1_path) == v1_before
     with sqlite3.connect(v1_path) as db:
         assert db.execute("PRAGMA user_version").fetchone() == (1,)
@@ -180,7 +181,7 @@ async def run(folder: Path) -> dict[str, object]:
     assert actual[1][:-1] == expected[1][:-1] and actual[1][3] == "invalidated"
     assert actual[1][6] == 5 and datetime.fromisoformat(actual[1][-1]) >= now
     with sqlite3.connect(v1_path) as db:
-        assert db.execute("PRAGMA user_version").fetchone() == (3,)
+        assert db.execute("PRAGMA user_version").fetchone() == (4,)
 
     broken = folder / "broken-workspace"
     broken_path = broken / "plugin-data/drift-builtin/drift.sqlite3"

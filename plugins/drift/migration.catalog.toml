@@ -9,3 +9,9 @@ id = "20261028_01_initiative_control"
 path = "20261028_01_initiative_control.py"
 depends = []
 transactional = false
+
+[[migrations]]
+id = "20261029_01_initiative_target"
+path = "20261029_01_initiative_target.py"
+depends = ["20261028_01_initiative_control"]
+transactional = false

@@ -147,7 +147,9 @@ class Runtime:
         self.state = WakeState(ctx.data_root / "wake.sqlite3")
         # apply/follow 拥有异步初始化；构造函数不在共享 loop 执行 SQL。
         self.source = Source(ctx, self.state, now=now)
-        self.duties = Duties(ctx.require(EVENTMAIL_WAKE), ctx.require(DRIFT_WAKE), self.state, ctx.require(SEMANTIC_INTEREST))
+        target = None if self.config.delivery is None else self.config.delivery.model_dump()
+        self.duties = Duties(ctx.require(EVENTMAIL_WAKE), ctx.require(DRIFT_WAKE), self.state,
+                             ctx.require(SEMANTIC_INTEREST), target)
         self.changed = asyncio.Event()
 
     @staticmethod

@@ -6,15 +6,16 @@ from core.common.file_io import run_file_io
 from plugins.gateway.contract import RpcMethod
 from .schema import ControlRequest, EmptyRequest
 from .store import DriftStore
+from .initiative import Initiative
 
 
-async def mount(ctx: Context, store: DriftStore) -> None:
+async def mount(ctx: Context, store: DriftStore, initiative: Initiative) -> None:
     async def status(_params: BaseModel) -> dict[str, object]:
         return await run_file_io(store.initiative_status)
 
     async def control(params: BaseModel, paused: bool) -> dict[str, object]:
         request = ControlRequest.model_validate(params.model_dump())
-        receipt = await run_file_io(
+        receipt = await initiative.write(
             lambda: store.set_initiative_paused(
                 paused, request.request_id, request.expected_version
             )
