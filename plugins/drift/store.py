@@ -268,13 +268,13 @@ class DriftStore:
                 if self._initiative_control(connection)["paused"] is True:
                     return {"inserted": False, "reason": "paused"}
                 outstanding = connection.execute(
-                    "SELECT 1 FROM initiative_proposals i JOIN proposals p "
+                    "SELECT p.payload_json FROM initiative_proposals i JOIN proposals p "
                     "ON p.proposal_id=i.proposal_id AND p.revision=i.revision "
                     "WHERE i.channel=? AND i.recipient=? AND i.session_id=? "
-                    "AND p.status IN ('pending', 'deferred', 'selected', 'ready_for_delivery') LIMIT 1",
+                    "AND p.status IN ('pending', 'deferred', 'selected', 'ready_for_delivery')",
                     target,
-                ).fetchone()
-                if outstanding is not None:
+                ).fetchall()
+                if any(not _initiative_expired(json.loads(row[0]), now) for row in outstanding):
                     return {"inserted": False, "reason": "outstanding"}
             connection.execute(
                 """
@@ -306,7 +306,7 @@ class DriftStore:
         with self._transaction(write=False) as connection:
             rows = connection.execute("""
                 SELECT p.proposal_id, p.revision, p.payload_json, p.due_at, p.next_due,
-                       p.state_version
+                       p.state_version, i.proposal_id AS initiative_id
                 FROM proposals p LEFT JOIN initiative_proposals i
                   ON p.proposal_id=i.proposal_id AND p.revision=i.revision
                 WHERE p.status IN ('pending', 'deferred') AND (
@@ -315,6 +315,8 @@ class DriftStore:
                 ORDER BY p.due_at, p.proposal_id, p.revision
                 """, (int(self._initiative_control(connection)["paused"] is True),
                       *(contact or ("", "", "")))).fetchall()
+            rows = [row for row in rows if row["initiative_id"] is None
+                    or not _initiative_expired(json.loads(row["payload_json"]), instant)]
             proposals: tuple[DriftProposal, ...] = tuple(
                 {
                     "ref": {
@@ -350,15 +352,19 @@ class DriftStore:
             raise ValueError("Drift state_version 必须是正整数")
         accepted = _accepted_turn(accepted_turn)
         contact = _contact_target(target)
+        instant = _aware_utc(now)
         token = "drift-selection:" + secrets.token_hex(16)
         with self._transaction(write=True) as connection:
             initiative = connection.execute(
-                "SELECT channel, recipient, session_id FROM initiative_proposals "
-                "WHERE proposal_id=? AND revision=?", (proposal, revision),
+                "SELECT i.channel, i.recipient, i.session_id, p.payload_json "
+                "FROM initiative_proposals i JOIN proposals p "
+                "ON p.proposal_id=i.proposal_id AND p.revision=i.revision "
+                "WHERE i.proposal_id=? AND i.revision=?", (proposal, revision),
             ).fetchone()
             if initiative is not None:
-                reason = ("paused" if self._initiative_control(connection)["paused"] is True else
-                          "target_mismatch" if contact != tuple(initiative) else None)
+                reason = ("target_mismatch" if contact != tuple(initiative)[:3] else
+                          "expired" if _initiative_expired(json.loads(initiative["payload_json"]), instant) else
+                          "paused" if self._initiative_control(connection)["paused"] is True else None)
                 if reason is not None:
                     return {"selected": False, "reason": reason,
                             "selection_token": None, "accepted_turn": None}
@@ -393,7 +399,7 @@ class DriftStore:
                     proposal,
                     revision,
                     state_version,
-                    _aware_utc(now),
+                    instant,
                 ),
             )
             return {
@@ -407,16 +413,19 @@ class DriftStore:
                               target: Mapping[str, object]) -> str | None:
         accepted, contact = _accepted_turn(accepted_turn), _contact_target(target)
         row = connection.execute(
-            "SELECT i.channel, i.recipient, i.session_id FROM proposals p "
+            "SELECT i.channel, i.recipient, i.session_id, p.payload_json, p.selection_token FROM proposals p "
             "JOIN initiative_proposals i ON p.proposal_id=i.proposal_id AND p.revision=i.revision "
             "WHERE p.selected_session_id=? AND p.selected_turn_id=?",
             (accepted["session_id"], accepted["turn_id"]),
         ).fetchone()
         if row is None:
             return None
-        if tuple(row) != contact:
+        if tuple(row)[:3] != contact:
             return "target_mismatch"
-        return "paused" if self._initiative_control(connection)["paused"] is True else None
+        token = _identity("selection_token", row["selection_token"])
+        if _initiative_expired(json.loads(row["payload_json"]), datetime.now(UTC).isoformat()):
+            return "expired:" + token
+        return "paused:" + token if self._initiative_control(connection)["paused"] is True else None
 
     def selected(self, limit: int = 100) -> tuple[DriftSelectionReceipt, ...]:
         """List stable selected receipts for startup reconciliation."""
@@ -468,22 +477,26 @@ class DriftStore:
             raise ValueError(f"未知 Drift transition: {action}")
         with self._transaction(write=True) as connection:
             row = connection.execute(
-                "SELECT status, next_due FROM proposals WHERE selection_token = ?",
+                "SELECT p.status, p.next_due, i.proposal_id AS initiative_id FROM proposals p "
+                "LEFT JOIN initiative_proposals i ON p.proposal_id=i.proposal_id AND p.revision=i.revision "
+                "WHERE p.selection_token = ?",
                 (selection,),
             ).fetchone()
             if row is None:
                 return {"changed": False, "reason": "selection_missing"}
-            if row["status"] != "selected" and not (action == "failed" and row["status"] == "ready_for_delivery"):
+            ready_invalidation = (action == "invalidated" and row["status"] == "ready_for_delivery"
+                                  and row["initiative_id"] is not None)
+            if row["status"] != "selected" and not ready_invalidation and not (action == "failed" and row["status"] == "ready_for_delivery"):
                 return {"changed": False, "reason": f"status:{row['status']}"}
             if action == "defer" and row["next_due"] is None:
                 raise RuntimeError("Drift defer 缺少 proposal owner 提供的 next_due")
             status = "deferred" if action == "defer" else action
             due_at = row["next_due"] if action == "defer" else None
-            if action == "failed":
+            if action == "failed" or ready_invalidation:
                 # 保留原领取身份，崩溃恢复能读到失败且不会再次选择同一 revision。
                 connection.execute(
-                    "UPDATE proposals SET status='failed', state_version=state_version+1, updated_at=? WHERE selection_token=?",
-                    (datetime.now(UTC).isoformat(), selection),
+                    "UPDATE proposals SET status=?, state_version=state_version+1, updated_at=? WHERE selection_token=?",
+                    (status, datetime.now(UTC).isoformat(), selection),
                 )
             elif action == "ready_for_delivery":
                 connection.execute(
@@ -824,6 +837,15 @@ def _contact_target(value: Mapping[str, object] | None) -> tuple[str, str, str] 
     return (_identity("target.channel", value.get("channel")),
             _identity("target.recipient", value.get("recipient")),
             _identity("target.session_id", value.get("session_id")))
+
+
+def _initiative_expired(payload: Mapping[str, object], now: str) -> bool:
+    deadline = payload.get("valid_until")
+    if deadline is None:
+        return False
+    if not isinstance(deadline, str):
+        raise ValueError("initiative valid_until 必须是带时区的时间")
+    return _aware_utc(datetime.fromisoformat(deadline)) <= now
 
 
 def _identity(field: str, value: object) -> str:

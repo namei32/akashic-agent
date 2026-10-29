@@ -1,11 +1,13 @@
 from functools import partial
 
-from agent.plugin_composition import Context
+from typing import Any
+from agent.plugin_composition import Context, ServiceKey
 from plugins.ledger.contract import BINDINGS
 from plugins.ledger.contract import MESSAGE_CATALOG, OWNER_STATE, OwnerStore
 from agent.plugin_composition.tasks import TASKS, TaskAdmission
 from plugins.delivery.contract import (
     DELIVERY_GUARDED_START,
+    DELIVERY_GUARDED_START_V2,
 )
 
 from .api import FINAL_OUTPUT_DELIVERY, FinalOutputDelivery
@@ -24,14 +26,15 @@ class DeliveryAdmission:
     """按实际消费者签发恢复范围，发送记录和 Task 仍由 Delivery 独占。"""
 
     def __init__(
-        self, ctx: Context, state: OwnerStore, tasks: TaskAdmission,
+        self, ctx: Context, state: OwnerStore, tasks: TaskAdmission, key: ServiceKey[Any],
     ):
         self._ctx = ctx
         self._state = state
         self._tasks = tasks
+        self._key = key
 
     def open(self, consumer: Context) -> Deliveries:
-        owner = consumer.require_runtime_identity(DELIVERY_GUARDED_START, self).plugin_id
+        owner = consumer.require_runtime_identity(self._key, self).plugin_id
         ctx = self._ctx
         bindings = ctx.require(BINDINGS)
         return Deliveries(
@@ -47,7 +50,8 @@ async def apply(ctx: Context) -> None:
     state = state_service.open(ctx)
     tasks = ctx.require(TASKS).open(ctx)
     _ = await ctx.provide(DELIVERY_SENDERS, Senders(ctx))
-    _ = await ctx.provide(DELIVERY_GUARDED_START, DeliveryAdmission(ctx, state, tasks))
+    _ = await ctx.provide(DELIVERY_GUARDED_START, DeliveryAdmission(ctx, state, tasks, DELIVERY_GUARDED_START))
+    _ = await ctx.provide(DELIVERY_GUARDED_START_V2, DeliveryAdmission(ctx, state, tasks, DELIVERY_GUARDED_START_V2))
     _ = await ctx.provide(FINAL_OUTPUT_DELIVERY, FinalOutputDelivery())
     _ = await ctx.provide(DELIVERY_READ, DeliveryHistory(
         lambda: state,

@@ -74,6 +74,14 @@ class Pointer(BaseModel):
     settled: bool = False
 
 
+class _InitiativeExpired(RuntimeError):
+    """The opportunity expired before its model stage could start."""
+
+
+class _InitiativePaused(RuntimeError):
+    """The original Wake request remains pending until resume."""
+
+
 class Source:
     """Wake 拥有选择、通知和领域确认；普通 Message/Task/程序拥有实际执行。"""
 
@@ -182,6 +190,10 @@ class Source:
         if not task.active:
             raise asyncio.CancelledError
         async with start_guard() if start_guard is not None else nullcontext(None) as reason:
+            if reason is not None and reason.startswith("expired:"):
+                raise _InitiativeExpired
+            if reason is not None and reason.startswith("paused:"):
+                raise _InitiativePaused
             if reason is not None:
                 raise RuntimeError(f"Wake Drift 阶段未获准入: {reason}")
             if phase_message is None:
@@ -328,7 +340,9 @@ class Source:
                 previous = await run_file_io(lambda: self.state.get_run(request.flow_id))
                 assert previous is not None
                 if previous["decision"] is None:
-                    await self._record(request, "defer", "原 Drift 职责领取被拒绝")
+                    expired = claim.get("reason") == "expired"
+                    await self._record(request, "skip" if expired else "defer",
+                                       "主动机会已过期" if expired else "原 Drift 职责领取被拒绝")
                 await self._settled(request, reader)
                 return "admission_rejected"
             selected = await domain.selection(request.accepted)
@@ -338,10 +352,20 @@ class Source:
             action = "defer" if selected.get("next_due") is not None else "await_change"
             await self._record(request, "skip", "来源明确拒绝本轮 Drift")
         else:
-            _ = await self._phase(
-                task, request, reader, "drift", {"duty": dict(proposal.payload)},
-                start_guard=lambda: domain.send_start(request.accepted, request.target.model_dump()),
-            )
+            try:
+                _ = await self._phase(
+                    task, request, reader, "drift", {"duty": dict(proposal.payload)},
+                    start_guard=lambda: domain.send_start(request.accepted, request.target.model_dump()),
+                )
+            except _InitiativePaused:
+                return "deferred"  # Keep the original pointer for resume.
+            except _InitiativeExpired:
+                result = await domain.transition(_string(selected.get("selection_token"), "Drift token"), "invalidated")
+                if result.get("changed") is not True:
+                    raise RuntimeError("过期 Drift 领取未能失效")
+                await self._record(request, "skip", "主动机会在模型阶段开始前已过期")
+                await self._settled(request, reader)
+                return "model_skip"
             value = decision(reader, request, "drift")
             if isinstance(value, Share) and not value.items:
                 action = "ready_for_delivery"
@@ -382,10 +406,22 @@ class Source:
             text = _message_with_source_links(text, {"source_refs": [payloads[name] for name in value.items]})
         guard = (lambda: self.ctx.require(DRIFT_WAKE).send_start(
             request.accepted, request.target.model_dump())) if request.owner == "drift" else None
-        if not await self._notify(task, request, text, start_guard=guard):
+        token = _string(selected.get("selection_token"), "selection_token")
+        paused_reason = "paused:" + token if request.owner == "drift" else None
+        expired_reason = "expired:" + token if request.owner == "drift" else None
+        sent = await self._notify(task, request, text, start_guard=guard, retry_reason=paused_reason)
+        if not sent:
+            receipt = self.ctx.require(DELIVERY).open(self.ctx).receipt(request.notification_id, request.sink["name"])
+            if request.owner == "drift" and receipt is not None and receipt.status == "rejected" and receipt.error == paused_reason:
+                return "deferred"  # Preserve the original message and sink for guarded retry.
+            if request.owner == "drift" and receipt is not None and receipt.status == "rejected" and receipt.error == expired_reason:
+                result = await self.ctx.require(DRIFT_WAKE).transition(token, "invalidated")
+                if result.get("changed") is not True:
+                    raise RuntimeError("过期 Drift 发送领取未能失效")
+                await self._settled(request, reader)
+                return "model_skip"
             await self._fail_notification(request, reader)
             return "failed"
-        token = _string(selected.get("selection_token"), "selection_token")
         result = (await self.ctx.require(EVENTMAIL_DELIVERY).settle(token, request.notification_id)
                   if request.owner == "content"
                   else await self.ctx.require(DRIFT_DELIVERY).settle(token, request.notification_id))
@@ -396,7 +432,7 @@ class Source:
 
     async def _notify(
         self, task: Task, request: Request, text: str, *,
-        start_guard: StartGuard | None = None,
+        start_guard: StartGuard | None = None, retry_reason: str | None = None,
     ) -> bool:
         """通知正文与原 Sink 一起提交；未知或拒绝回执不冒充领域已送达。"""
         target = request.target
@@ -417,7 +453,11 @@ class Source:
         selected = await delivery.prepare_async(reader, message, (sink,))
         if selected.sinks != (sink["name"],):
             raise ValueError("Wake 原通知目的地不一致")
-        receipt = await delivery.send(message.message_id, sink["name"], start_guard=start_guard)
+        previous = delivery.receipt(message.message_id, sink["name"])
+        if previous is not None and previous.status == "rejected" and previous.error == retry_reason and retry_reason is not None:
+            receipt = await delivery.retry(message.message_id, sink["name"], start_guard=start_guard)
+        else:
+            receipt = await delivery.send(message.message_id, sink["name"], start_guard=start_guard)
         return receipt.status == "delivered"
 
     async def _alert(self, task: Task, request: Request, reader: MessageReader) -> str:

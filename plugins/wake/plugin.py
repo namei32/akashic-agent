@@ -47,6 +47,7 @@ from .program import REPLY_EXECUTE, SOURCE_CHECK, run
 from .request import WAKE_PROGRAM, WAKE_TOOLS_VIEW, check_phase, check_request
 from .runtime import DashboardView, Runtime
 from .tools import SCHEMAS, DecisionTool
+from .contract import WAKE_CONTACT, WakeContact
 from plugins.drift.contract import DRIFT_CHANGED
 
 api_version = 3
@@ -99,6 +100,9 @@ async def start_function(ctx: Context) -> None:
     config = Config.model_validate(ctx.config)
     if config.enabled is not True or config.delivery is None:
         return
+    target = config.delivery
+    await ctx.provide(WAKE_CONTACT, ctx.entrypoint(lambda: WakeContact(
+        target.channel, target.recipient, target.session_id, config.timezone)))
     _ = await ctx.require(CONTENT).register(
         ctx,
         {

@@ -83,7 +83,7 @@ systemd unit 与 release 路径耦合需要独立复核；当前是评审风险�
 
 ## P1 · Drift 主动意图与工作执行
 
-按 [Drift 设计](design/drift-initiative.md) 接入真实提案生产者、Wake 变化通知、范围内显式记忆召回、Source/Reply 工作执行和设置。尚需验证主动搭话、授权工作产物、暂停准入、恢复与真实投递；首批控制和迁移场景不替代这些验收。
+按 [Drift 设计](design/drift-initiative.md) 接入范围内显式记忆召回、Source/Reply 工作执行和设置页面。尚需验证授权工作产物与正式渠道投递；隔离环境的定时交流和暂停场景不替代这些验收。
 
 ## P2 · PTY resize 既有规格差距
 
