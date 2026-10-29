@@ -5,6 +5,7 @@ import hashlib
 from pathlib import Path
 import sqlite3
 
+_V1_SQL_SHA256 = "f567a75791c021f38bc177999cafaf3a6af948e085a2541ab8471bff9e8ddaf7"
 _V2_SQL_SHA256 = "e03b92c42560ef1f779491f3cf14e5a2b47a472b7d598f5ec8aa53ae2497a225"
 
 CONTROL_SQL = """CREATE TABLE initiative_control (
@@ -36,18 +37,31 @@ def upgrade(path: Path) -> None:
             if version == 3:
                 db.rollback()
                 return
-            if version != 2:
+            if version not in (1, 2):
                 raise RuntimeError(
-                    f"Drift initiative migration expects v2, found {version}"
+                    f"Drift initiative migration expects v1 or v2, found {version}"
                 )
             tables = db.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
             ).fetchall()
             if tables != [("proposals",)]:
-                raise RuntimeError("Drift v2 table ownership mismatch")
+                raise RuntimeError(f"Drift v{version} table ownership mismatch")
             sql = db.execute("SELECT sql FROM sqlite_master WHERE name='proposals'").fetchone()[0]
-            if hashlib.sha256(" ".join(sql.split()).encode()).hexdigest() != _V2_SQL_SHA256:
-                raise RuntimeError("Drift v2 proposal schema mismatch")
+            expected = _V1_SQL_SHA256 if version == 1 else _V2_SQL_SHA256
+            if hashlib.sha256(" ".join(sql.split()).encode()).hexdigest() != expected:
+                raise RuntimeError(f"Drift v{version} proposal schema mismatch")
+            if version == 1:
+                indexes = db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' "
+                    "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+                ).fetchall()
+                if indexes != [("proposals_due_idx",), ("proposals_selected_turn_idx",)]:
+                    raise RuntimeError("Drift v1 index ownership mismatch")
+                if db.execute("PRAGMA integrity_check").fetchone() != ("ok",):
+                    raise RuntimeError("Drift migration integrity check failed")
+                # The runtime owner retains its v1 upgrade and orphan handling.
+                db.rollback()
+                return
             before = db.execute(
                 "SELECT * FROM proposals ORDER BY proposal_id, revision"
             ).fetchall()

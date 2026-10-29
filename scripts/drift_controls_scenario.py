@@ -145,6 +145,43 @@ async def run(folder: Path) -> dict[str, object]:
     finally:
         await root.dispose()
 
+    # The former owner accepted v1, including its deliberate orphan handling.
+    v1_workspace = folder / "v1-workspace"
+    v1_data = v1_workspace / "plugin-data/drift-builtin"
+    v1_data.mkdir(parents=True)
+    v1_path = v1_data / "drift.sqlite3"
+    reference = folder / "v1-reference.sqlite3"
+    with sqlite3.connect(v1_path) as db, sqlite3.connect(reference) as copy:
+        db.execute(legacy._TABLE_SQL_V1)
+        for index in legacy._INDEX_SQL[:2]:
+            db.execute(index)
+        for state in ("pending", "ready_for_delivery"):
+            db.execute("INSERT INTO proposals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                       (state, "one", '{"text":"original"}', state, now.isoformat(), None,
+                        4, None, None, None, now.isoformat(), now.isoformat()))
+        db.execute("PRAGMA user_version = 1")
+        db.commit()
+        db.backup(copy)
+    legacy.DriftStore(reference).initialize()
+    v1_before = proposals(v1_path)
+    v1_runner = MigrationRunner(repo_root=core, config_path=folder / "v1.toml",
+                                workspace=v1_workspace, plugin_dirs=[sources], plugins_home=folder / "v1-home")
+    assert v1_runner.run().migrations == (MIGRATION,)
+    assert proposals(v1_path) == v1_before
+    with sqlite3.connect(v1_path) as db:
+        assert db.execute("PRAGMA user_version").fetchone() == (1,)
+    root, rpc = await mount(v1_data)
+    try:
+        assert (await rpc("status"))["control_version"] == 0
+    finally:
+        await root.dispose()
+    actual, expected = proposals(v1_path), proposals(reference)
+    assert actual[0] == expected[0]
+    assert actual[1][:-1] == expected[1][:-1] and actual[1][3] == "invalidated"
+    assert actual[1][6] == 5 and datetime.fromisoformat(actual[1][-1]) >= now
+    with sqlite3.connect(v1_path) as db:
+        assert db.execute("PRAGMA user_version").fetchone() == (3,)
+
     broken = folder / "broken-workspace"
     broken_path = broken / "plugin-data/drift-builtin/drift.sqlite3"
     broken_store = legacy.DriftStore(broken_path)
@@ -179,7 +216,7 @@ async def run(folder: Path) -> dict[str, object]:
         assert db.execute("SELECT * FROM messages ORDER BY session_key, seq").fetchall() == messages
     return {"legacy_proposals_preserved": len(before), "control_version": 3,
             "replay_race_restart": "passed", "fresh_and_failed_migration": "passed",
-            "messages_preserved": len(messages)}
+            "v1_owner_upgrade": "passed", "messages_preserved": len(messages)}
 
 
 if __name__ == "__main__":
