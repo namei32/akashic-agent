@@ -119,13 +119,13 @@ async def run(folder: Path) -> None:
         release.set()
         await holder
         assert (await pause)["paused"] is True
-        entered.clear()
-        parked = asyncio.create_task(held_start())
-        await asyncio.sleep(0.1)
-        assert not entered.is_set()
+        async with a.runtime_scope():
+            async with wake.send_start(accepted, target) as reason:
+                assert reason is not None and reason.startswith("paused:drift-selection:")
         await rpc(b, "resume", request_id="resume-5", expected_version=5)
-        await asyncio.wait_for(entered.wait(), 4)  # Different generation; polling recovers a lost hint.
-        await parked
+        async with a.runtime_scope():
+            async with wake.send_start(accepted, target) as reason:
+                assert reason is None
         assert events_a and events_b
         assert rows(path, "proposals")[0] == before["proposals"][0]
     finally:

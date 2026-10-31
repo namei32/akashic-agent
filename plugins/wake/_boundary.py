@@ -17,7 +17,7 @@ from plugins.content.contract import (
     CONTENT as CONTENT,
 )
 from plugins.delivery.contract import (
-    DELIVERY_GUARDED_START as DELIVERY,
+    DELIVERY_GUARDED_START_V2 as DELIVERY,
     DELIVERY_READ as DELIVERY_READ,
     DELIVERY_SENDERS as DELIVERY_SENDERS,
     DeliveryHistory as DeliveryHistory,

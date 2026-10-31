@@ -235,8 +235,12 @@ class Runtime:
 
     async def _due(self) -> None:
         while True:
+            retry_pending = self.changed.is_set()
             self.changed.clear()
             async with self.ctx.runtime_scope():
+                if retry_pending:
+                    for flow_id in self.source.pending():
+                        _ = await self._run(flow_id)
                 now = self.now()
                 alert = await self.ctx.require(EVENTMAIL_WAKE).alert_deadline(now)
                 blocked = self._blocked(require_interest=alert is None or alert > now)

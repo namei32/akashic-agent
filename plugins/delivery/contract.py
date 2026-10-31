@@ -111,6 +111,15 @@ class GuardedDelivery(Protocol):
     def open(self, consumer: Context) -> GuardedDeliveries: ...
 
 
+class GuardedDeliveriesV2(GuardedDeliveries, Protocol):
+    async def retry(self, message_id: str, sink: str, *,
+                    start_guard: StartGuard | None = None) -> Receipt: ...
+
+
+class GuardedDeliveryV2(Protocol):
+    def open(self, consumer: Context) -> GuardedDeliveriesV2: ...
+
+
 class DeliveredMessage(Protocol):
     @property
     def message(self) -> Message: ...
@@ -150,6 +159,7 @@ class FinalOutputDelivery(FinalOutputWaiter, Protocol):
 
 
 DELIVERY_GUARDED_START = ServiceKey[GuardedDelivery]("delivery.guarded-start.v1")
+DELIVERY_GUARDED_START_V2 = ServiceKey[GuardedDeliveryV2]("delivery.guarded-start.v2")
 DELIVERY_SENDERS = ServiceKey[Senders]("delivery.senders.v1")
 DELIVERY_READ = ServiceKey[DeliveryHistory]("delivery.read.v1")
 FINAL_OUTPUT_DELIVERY = ServiceKey[FinalOutputDelivery]("delivery.final_output.v1")

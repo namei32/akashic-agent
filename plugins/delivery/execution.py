@@ -125,7 +125,7 @@ class Deliveries:
                 await _drain(task)
             raise
 
-    async def retry(self, message_id: str, sink: str) -> Receipt:
+    async def retry(self, message_id: str, sink: str, *, start_guard: StartGuard | None = None) -> Receipt:
         """显式重试被拒绝的原效果；不改消息、目的地、绑定或幂等键。"""
         async def rearm(slot: TaskSlot) -> Task | None:
             record, delivery = self._records.read(message_id, sink)
@@ -140,7 +140,7 @@ class Deliveries:
         while True:
             previous = await self._tasks.admit_async((self._task_key, message_id, sink), rearm)
             if previous is None:
-                return await self.send(message_id, sink)
+                return await self.send(message_id, sink, start_guard=start_guard)
             try:
                 _ = await previous.join()
             except asyncio.CancelledError:
