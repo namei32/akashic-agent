@@ -40,7 +40,11 @@ class PrivateTarget:
 
     @asynccontextmanager
     async def guard(self, recipient: str, session_id: str) -> AsyncGenerator[bool]:
-        # The provider cannot unload while the consumer performs its short commit.
+        # Retain the provider without replacing the consumer's caller identity.
         async with self.ctx.runtime_scope():
             catalog = self.ctx.require(MESSAGE_CATALOG)
+            lease = self.ctx.capture_runtime_scope()
+        try:
             yield await run_file_io(lambda: _matches(catalog, recipient, session_id))
+        finally:
+            await lease.close()
