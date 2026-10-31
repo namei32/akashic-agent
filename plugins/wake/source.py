@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
-from collections.abc import Callable, Mapping, Sequence
-from contextlib import nullcontext
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from contextlib import asynccontextmanager, nullcontext
 from datetime import UTC, datetime, timedelta
 
 from pydantic import BaseModel, ConfigDict
@@ -11,6 +12,7 @@ from pydantic import BaseModel, ConfigDict
 from core.common.file_io import run_file_io
 
 from agent.plugin_composition import Context
+from plugins.channels.contract import private_target_key
 from plugins.ledger.contract import BINDINGS
 from plugins.ledger.contract import (
     MESSAGE_CATALOG,
@@ -50,6 +52,7 @@ from .content import (
     _string,
 )
 from .messages import decision, finished, screened_candidates
+from .initiative_memory import INITIATIVE_MEMORY
 from .request import (
     WAKE_PROGRAM,
     Phase,
@@ -84,6 +87,30 @@ class _InitiativePaused(RuntimeError):
 
 class _InitiativeRevoked(RuntimeError):
     """The original target consent no longer authorizes this opportunity."""
+
+
+class _InitiativeInvalid(RuntimeError):
+    """The source, target or frozen memory is no longer valid."""
+
+
+class _InitiativeUnavailable(RuntimeError):
+    """A required provider may return; retain the original request."""
+
+
+def _check_initiative_guard(reason: str | None) -> None:
+    if reason is None:
+        return
+    if reason.startswith("paused:"):
+        raise _InitiativePaused
+    if reason.startswith("expired:"):
+        raise _InitiativeExpired
+    if reason.startswith("consent_changed:"):
+        raise _InitiativeRevoked
+    if reason in {"memory_changed", "memory_snapshot_missing", "source_unavailable", "target_unavailable"}:
+        raise _InitiativeInvalid(reason)
+    if reason in {"memory_provider_unavailable", "private_provider_unavailable"}:
+        raise _InitiativeUnavailable(reason)
+    raise RuntimeError(f"Wake Drift 阶段未获准入: {reason}")
 
 
 class Source:
@@ -194,14 +221,7 @@ class Source:
         if not task.active:
             raise asyncio.CancelledError
         async with start_guard() if start_guard is not None else nullcontext(None) as reason:
-            if reason is not None and reason.startswith("expired:"):
-                raise _InitiativeExpired
-            if reason is not None and reason.startswith("paused:"):
-                raise _InitiativePaused
-            if reason is not None and reason.startswith("consent_changed:"):
-                raise _InitiativeRevoked
-            if reason is not None:
-                raise RuntimeError(f"Wake Drift 阶段未获准入: {reason}")
+            _check_initiative_guard(reason)
             if phase_message is None:
                 writer = ctx.require(MESSAGE_WRITERS).bind(ctx, author="wake", source="wake", body_types=(Input,),
                     content={"wake.phase": check_phase, "model.selection": ctx.require(MODEL_SELECTION).check,
@@ -325,11 +345,90 @@ class Source:
         if result.get("changed") is not True:
             raise RuntimeError("原 Content 领取没有提交预期变化")
 
+    @staticmethod
+    def _memory_id(request: Request) -> str:
+        return "wake:" + request.flow_id
+
+    async def _memory_snapshot(self, request: Request) -> Mapping[str, object]:
+        ctx, target = self.ctx, request.target
+        with ctx.borrow(private_target_key(target.channel)) as proof:
+            if proof is None:
+                raise _InitiativeUnavailable("private_provider_unavailable")
+            target_guard = proof.guard(target.recipient, target.session_id)
+        async with target_guard as private:
+            if not private:
+                raise _InitiativeInvalid("target_unavailable")
+            # This local receipt contains a fingerprint, not the query. It precedes
+            # the Drift guard so the two SQLite writers are never acquired in the
+            # opposite order from the delivery guard. No embedding is called here.
+            with ctx.borrow(INITIATIVE_MEMORY) as memory:
+                if memory is None:
+                    raise _InitiativeUnavailable("memory_provider_unavailable")
+                await memory.admit(self._memory_id(request), target.session_id, request.memory_query,
+                                   timestamp=request.now.isoformat())
+            async with ctx.require(DRIFT_WAKE).send_start(request.accepted, target.model_dump()) as reason:
+                _check_initiative_guard(reason)
+                state = ctx.require(OWNER_STATE).open(ctx)
+                key = "memory-recall:" + request.flow_id
+                admitted: Mapping[str, object] = {
+                    "request_id": self._memory_id(request), "session_id": target.session_id,
+                    "query_sha256": hashlib.sha256(request.memory_query.encode()).hexdigest(),
+                    "source_seq": request.memory_source_seq, "timestamp": request.now.isoformat(),
+                }
+                def record(tx: OwnerTransaction) -> None:
+                    previous = tx.read(key)
+                    if previous is None:
+                        _ = tx.save(key, admitted, expected_version=None)
+                    elif dict(previous.value) != admitted:
+                        raise ValueError("主动召回接纳身份与既有材料不一致")
+                await state.transact_async(record)
+            # The accepted Drift guard is the model-admission point. Later revoke
+            # still invalidates the result at publication and first send.
+            with ctx.borrow(INITIATIVE_MEMORY) as memory:
+                if memory is None:
+                    raise _InitiativeUnavailable("memory_provider_unavailable")
+                result = await memory.prepare(self._memory_id(request), target.session_id, request.memory_query,
+                                              timestamp=request.now.isoformat())
+        text, references, status = result.get("text"), result.get("references"), result.get("status")
+        if (not isinstance(text, str) or not isinstance(references, list)
+                or any(not isinstance(item, str) for item in references)
+                or status not in {"ok", "empty", "degraded"}):
+            raise ValueError("主动记忆快照结构无效")
+        return {"text": text, "references": references, "status": status}
+
+    @asynccontextmanager
+    async def _memory_guard(self, request: Request) -> AsyncIterator[str | None]:
+        ctx, target = self.ctx, request.target
+        with ctx.borrow(private_target_key(target.channel)) as proof:
+            if proof is None:
+                yield "private_provider_unavailable"
+                return
+            target_guard = proof.guard(target.recipient, target.session_id)
+        # Each guard retains its own provider lease, without replacing Wake's
+        # caller identity while the guarded publication or sender runs.
+        async with target_guard as private:
+            if not private:
+                yield "target_unavailable"
+                return
+            with ctx.borrow(INITIATIVE_MEMORY) as memory:
+                if memory is None:
+                    yield "memory_provider_unavailable"
+                    return
+                memory_guard = memory.guard(self._memory_id(request), target.session_id)
+            async with memory_guard as reason:
+                if reason is not None:
+                    yield reason
+                    return
+                async with ctx.require(DRIFT_WAKE).send_start(request.accepted, target.model_dump()) as reason:
+                    yield reason
+
     async def _drift(self, task: Task, request: Request, reader: MessageReader) -> str:
         domain = self.ctx.require(DRIFT_WAKE)
         proposal = propose_drift(request.proposals)
         if proposal is None:
             raise ValueError("Wake 原 Drift 快照没有到期候选")
+        if request.memory_assisted != (proposal.payload.get("memory_assisted") is True):
+            raise ValueError("Wake 主动记忆标记与原提案不一致")
         screening = ({"payload": dict(proposal.payload)},)
         await run_file_io(lambda: self.state.record_screen(
             run_id=request.flow_id, owner="drift", candidates_seen=1,
@@ -359,17 +458,28 @@ class Source:
             await self._record(request, "skip", "来源明确拒绝本轮 Drift")
         else:
             try:
+                data: dict[str, object] = {"duty": dict(proposal.payload)}
+                if request.memory_assisted:
+                    if request.memory_blocked or not request.memory_query:
+                        await self._record(request, "skip", "主动记忆材料不可用：" + (request.memory_blocked or "no_user_input"))
+                        result = await domain.transition(_string(selected.get("selection_token"), "Drift token"), "await_change")
+                        if result.get("changed") is not True:
+                            raise RuntimeError("缺少主动记忆材料时未能结束机会")
+                        await self._settled(request, reader)
+                        return "model_skip"
+                    data["memory"] = await self._memory_snapshot(request)
                 _ = await self._phase(
-                    task, request, reader, "drift", {"duty": dict(proposal.payload)},
-                    start_guard=lambda: domain.send_start(request.accepted, request.target.model_dump()),
+                    task, request, reader, "drift", data,
+                    start_guard=(lambda: self._memory_guard(request)) if request.memory_assisted else
+                                (lambda: domain.send_start(request.accepted, request.target.model_dump())),
                 )
-            except _InitiativePaused:
+            except (_InitiativePaused, _InitiativeUnavailable):
                 return "deferred"  # Keep the original pointer for resume.
-            except (_InitiativeExpired, _InitiativeRevoked):
+            except (_InitiativeExpired, _InitiativeRevoked, _InitiativeInvalid, PermissionError):
                 result = await domain.transition(_string(selected.get("selection_token"), "Drift token"), "invalidated")
                 if result.get("changed") is not True:
                     raise RuntimeError("过期 Drift 领取未能失效")
-                await self._record(request, "skip", "主动机会在模型阶段开始前过期或授权改变")
+                await self._record(request, "skip", "主动机会、授权或记忆材料已失效")
                 await self._settled(request, reader)
                 return "model_skip"
             value = decision(reader, request, "drift")
@@ -410,29 +520,34 @@ class Source:
             payloads = {_candidate_id(_mapping(item["ref"], "Content ref")): _mapping(item["payload"], "Content payload")
                         for item in request.items}
             text = _message_with_source_links(text, {"source_refs": [payloads[name] for name in value.items]})
-        guard = (lambda: self.ctx.require(DRIFT_WAKE).send_start(
-            request.accepted, request.target.model_dump())) if request.owner == "drift" else None
+        guard = ((lambda: self._memory_guard(request)) if request.memory_assisted else
+                 (lambda: self.ctx.require(DRIFT_WAKE).send_start(request.accepted, request.target.model_dump()))
+                 if request.owner == "drift" else None)
         token = _string(selected.get("selection_token"), "selection_token")
         paused_reason = "paused:" + token if request.owner == "drift" else None
         expired_reason = "expired:" + token if request.owner == "drift" else None
         revoked_reason = "consent_changed:" + token if request.owner == "drift" else None
+        transient = {"memory_provider_unavailable", "private_provider_unavailable"}
+        invalid = {"memory_changed", "memory_snapshot_missing", "source_unavailable", "target_unavailable"}
         invalid_before_publish = False
         try:
             sent = await self._notify(
-                task, request, text, start_guard=guard, publish_guard=guard, retry_reason=paused_reason,
+                task, request, text, start_guard=guard, publish_guard=guard,
+                retry_reasons=frozenset({paused_reason} | transient) if paused_reason is not None else frozenset(),
             )
-        except _InitiativePaused:
+        except (_InitiativePaused, _InitiativeUnavailable):
             return "deferred"
-        except (_InitiativeExpired, _InitiativeRevoked):
+        except (_InitiativeExpired, _InitiativeRevoked, _InitiativeInvalid, PermissionError):
             sent, invalid_before_publish = False, True
         if not sent:
             receipt = (None if invalid_before_publish else
                        self.ctx.require(DELIVERY).open(self.ctx).receipt(request.notification_id, request.sink["name"]))
-            if request.owner == "drift" and receipt is not None and receipt.status == "rejected" and receipt.error == paused_reason:
+            if (request.owner == "drift" and receipt is not None and receipt.status == "rejected"
+                    and receipt.error in ({paused_reason} | transient)):
                 return "deferred"  # Preserve the original message and sink for guarded retry.
             if request.owner == "drift" and (invalid_before_publish or (
                     receipt is not None and receipt.status == "rejected"
-                    and receipt.error in {expired_reason, revoked_reason})):
+                    and receipt.error in ({expired_reason, revoked_reason} | invalid))):
                 result = await self.ctx.require(DRIFT_WAKE).transition(token, "invalidated")
                 if result.get("changed") is not True:
                     raise RuntimeError("过期或授权改变的 Drift 发送领取未能失效")
@@ -451,7 +566,7 @@ class Source:
     async def _notify(
         self, task: Task, request: Request, text: str, *,
         start_guard: StartGuard | None = None, publish_guard: StartGuard | None = None,
-        retry_reason: str | None = None,
+        retry_reasons: frozenset[str] = frozenset(),
     ) -> bool:
         """通知正文与原 Sink 一起提交；未知或拒绝回执不冒充领域已送达。"""
         target = request.target
@@ -468,14 +583,7 @@ class Source:
             try:
                 # Publishing is itself visible; serialize it with pause and expiry as well as send.
                 async with publish_guard() if publish_guard is not None else nullcontext(None) as reason:
-                    if reason is not None and reason.startswith("paused:"):
-                        raise _InitiativePaused
-                    if reason is not None and reason.startswith("expired:"):
-                        raise _InitiativeExpired
-                    if reason is not None and reason.startswith("consent_changed:"):
-                        raise _InitiativeRevoked
-                    if reason is not None:
-                        raise RuntimeError(f"Wake Drift 消息发布未获准入: {reason}")
+                    _check_initiative_guard(reason)
                     if not task.active:
                         raise asyncio.CancelledError
                     message, _ = await delivery.publish_async(
@@ -487,7 +595,7 @@ class Source:
         if selected.sinks != (sink["name"],):
             raise ValueError("Wake 原通知目的地不一致")
         previous = delivery.receipt(message.message_id, sink["name"])
-        if previous is not None and previous.status == "rejected" and previous.error == retry_reason and retry_reason is not None:
+        if previous is not None and previous.status == "rejected" and previous.error in retry_reasons:
             receipt = await delivery.retry(message.message_id, sink["name"], start_guard=start_guard)
         else:
             receipt = await delivery.send(message.message_id, sink["name"], start_guard=start_guard)

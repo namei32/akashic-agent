@@ -24,6 +24,8 @@ from plugins.timer.contract import TIMERS
 from plugins.ui.contract import UI
 from plugins.models.contract import MODEL_CONTENT, MODEL_SELECTION
 from plugins.models.contract import MODEL_CATALOG
+from plugins.channels.contract import private_target_key
+from plugins.delivery.contract import DELIVERY_SCOPED_READ
 
 from ._boundary import (
     ALL_TOOLS,
@@ -47,7 +49,8 @@ from .program import REPLY_EXECUTE, SOURCE_CHECK, run
 from .request import WAKE_PROGRAM, WAKE_TOOLS_VIEW, check_phase, check_request
 from .runtime import DashboardView, Runtime
 from .tools import SCHEMAS, DecisionTool
-from .contract import WAKE_CONTACT, WakeContact
+from .contract import WAKE_CONTACT, WAKE_MEMORY_READY, WakeContact
+from .initiative_memory import INITIATIVE_MEMORY
 from plugins.drift.contract import DRIFT_CHANGED
 
 api_version = 3
@@ -103,6 +106,11 @@ async def start_function(ctx: Context) -> None:
     target = config.delivery
     await ctx.provide(WAKE_CONTACT, ctx.entrypoint(lambda: WakeContact(
         target.channel, target.recipient, target.session_id, config.timezone)))
+    async def memory_ready(child: Context) -> None:
+        await child.provide(WAKE_MEMORY_READY, object())
+        child.emit(DRIFT_CHANGED, None)
+    await ctx.inject((INITIATIVE_MEMORY, DELIVERY_SCOPED_READ, private_target_key(target.channel)),
+                     memory_ready, name="memory-initiative")
     _ = await ctx.require(CONTENT).register(
         ctx,
         {

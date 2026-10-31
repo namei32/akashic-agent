@@ -68,7 +68,7 @@ async def run(ctx: Context, task: Task, reader: MessageReader, request: Request)
             ),
             exclude_material_kinds=(
                 frozenset({"recall", "profile"})
-                if phase.stage in {"investigate", "alert"}
+                if phase.stage in {"investigate", "alert"} or (phase.stage == "drift" and request.memory_assisted)
                 else frozenset()
             ),
             prompt_hints=(HINTS[phase.stage],),

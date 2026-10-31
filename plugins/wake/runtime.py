@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from plugins.models.contract import MODEL_CATALOG
+from plugins.delivery.contract import DELIVERY_SCOPED_READ
 
 import asyncio
 import hashlib
@@ -26,6 +27,7 @@ from plugins.models.contract import (
 
 from ._boundary import (
     ALL_TOOLS,
+    CONTENT,
     DELIVERY_READ,
     DELIVERY_SENDERS,
     SEMANTIC_INTEREST,
@@ -38,7 +40,9 @@ from .admission import Admission, Duties
 from .api import DRIFT_WAKE, EVENTMAIL_WAKE, Config, DeliveryTarget
 from .legacy_rules import read_archived_rules
 from .messages import recent_context
+from .initiative_memory import capture as capture_memory_context
 from .request import TOOLS as WAKE_TOOLS, WAKE_PROGRAM, Request
+from .selection import propose_drift
 from .source import Pointer, Source
 from .state import WakeState, WakeStateReader
 
@@ -187,6 +191,27 @@ class Runtime:
         )
         names = (*WAKE_TOOLS[owner], *(ref.name for ref in view.refs
                  if ref.name in allowed and ref.name not in WAKE_TOOLS[owner]))
+        events = tuple(dict(item) for item in (await ctx.require(EVENTMAIL_WAKE).active_context(now)))
+        proposal = propose_drift(admission.proposals) if owner == "drift" else None
+        memory_assisted = proposal is not None and proposal.payload.get("memory_assisted") is True
+        memory_query, memory_blocked, source_seq = "", "", None
+        if memory_assisted:
+            with ctx.borrow(DELIVERY_SCOPED_READ) as scoped:
+                if scoped is None:
+                    history, memory_blocked = "", "scoped_history_unavailable"
+                else:
+                    messages, content = ctx.require(MESSAGE_CATALOG), ctx.require(CONTENT)
+                    source_seq, memory_query, history, memory_blocked = await run_file_io(
+                        lambda: capture_memory_context(messages, content, scoped, session_id=target.session_id, now=now),
+                    )
+            if not memory_blocked and not memory_query:
+                memory_blocked = "no_user_input"
+            if events and not memory_blocked:
+                memory_blocked = "unscoped_context"
+            events = ()
+        else:
+            history = recent_context(ctx.require(MESSAGE_CATALOG), ctx.require(DELIVERY_READ),
+                                     target=target.session_id, now=now)
         return Request(
             flow_id=flow_id,
             owner=owner,
@@ -205,9 +230,8 @@ class Runtime:
             alert_ref=None if alert is None else cast(dict[str, str], dict(alert)),
             model_id=model.model_id, reasoning_effort=model.reasoning_effort,
             rules=read_archived_rules(ctx.data_root) or "",
-            history=recent_context(ctx.require(MESSAGE_CATALOG), ctx.require(DELIVERY_READ),
-                                   target=target.session_id, now=now),
-            events=tuple(dict(item) for item in (await ctx.require(EVENTMAIL_WAKE).active_context(now))))
+            history=history, events=events, memory_assisted=memory_assisted,
+            memory_query=memory_query, memory_source_seq=source_seq, memory_blocked=memory_blocked)
 
     async def follow(self) -> None:
         """先恢复原请求，再独立运行到期检查与五分钟池维护。"""
