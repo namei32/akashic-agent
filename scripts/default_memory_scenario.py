@@ -37,7 +37,7 @@ async def apply(ctx):
 '''
 
 
-async def run(folder: Path) -> dict[str, object]:
+async def run(folder: Path, extension=None) -> dict[str, object]:
     from agent.plugins.manager import PluginManager
     from agent.plugins.selection import PluginSelection
     from agent.plugin_composition import ServiceKey
@@ -272,9 +272,10 @@ async def run(folder: Path) -> dict[str, object]:
             facts = [json.loads(row[0]) for row in db.execute("SELECT fact FROM memory_items WHERE kind='procedure'")]
             assert len(facts) == 1 and facts[0]["steps"] == ["Inspect evidence", "Write report"], facts
         assert snapshot(workspace) == before_explicit
+        extra = {} if extension is None else await extension(host, append, workspace, requests)
         return {"real_plugin_composition": True, "http_driver": True, "eligible_only": True, "project_isolation": True, "wake_new_evidence": True,
                 "idempotent_learning": True, "frozen_recall": True, "forget_and_restart": True, "durable_failure_and_explicit_retry": True, "cancellation_drains_sqlite": True, "explicit_procedure_memory": True,
-                "original_rows_unchanged": True, "requests": requests}
+                "original_rows_unchanged": True, "requests": requests, **extra}
     finally:
         await host.terminate_all()
         server.close()

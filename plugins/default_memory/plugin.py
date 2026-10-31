@@ -18,14 +18,15 @@ from plugins.models.contract import CHAT_MODELS, EMBEDDINGS
 from plugins.tools.contract import TOOLS
 from plugins.turn_projection.contract import TURN_PROJECTION
 from .io import run_io
-from .contract import DEFAULT_MEMORY
+from .contract import DEFAULT_MEMORY, INITIATIVE_MEMORY
+from .initiative import Initiative
 from .runtime import Runtime
 from .store import Store
 from .tools import ForgetArgs, MemoryTool, RecallArgs, RememberArgs
 
 api_version = 3
 name = "default_memory"
-version = "1.0.0"
+version = "1.1.0"
 desc = "提炼结构化长期记忆，使用向量与关键词融合召回"
 workspace_files = ("memory/default-v2.db", "memory/default-v2.lock")
 inject = (CHAT_MODELS, EMBEDDINGS, MESSAGE_CATALOG, TURN_PROJECTION,
@@ -161,6 +162,12 @@ async def apply(ctx: Context) -> None:
 
     if config.mode == "active":
         await ctx.provide(EMBEDDING_MEMORY_PLUGIN, object())
+        initiative = Initiative(ctx, runtime)
+        class InitiativePort:
+            admit = staticmethod(ctx.entrypoint(initiative.admit))
+            prepare = staticmethod(ctx.entrypoint(initiative.prepare))
+            guard = staticmethod(initiative.guard)
+        await ctx.provide(INITIATIVE_MEMORY, InitiativePort())
         await ctx.require(MATERIALS_V4).register(ctx, name="default_memory", kind="recall",
                                                prepare=runtime.prepare, priority=400)
         tools = ctx.require(TOOLS)

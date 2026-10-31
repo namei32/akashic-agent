@@ -103,6 +103,13 @@ class Store:
                       tuple(json.loads(row["embedding"])), row["reinforcement"],
                       row["created_at"], row["updated_at"], row["status"], row["source_key"])
 
+    def initiative_retracted(self, db: sqlite3.Connection, graph: str) -> set[str]:
+        # This schema supersedes whole items; source-level retractions arrive in v2.
+        return set()
+
+    def initiative_project(self, db: sqlite3.Connection, row: sqlite3.Row, removed: set[str]) -> Memory:
+        return self.decode(row)
+
     def items(self, graph: str) -> tuple[Memory, ...]:
         with self.connection() as db:
             rows = db.execute("SELECT * FROM memory_items WHERE graph=? AND status='active' ORDER BY id", (graph,))
