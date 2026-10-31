@@ -49,13 +49,27 @@ class DeliveryHistory:
                excluded_sources: frozenset[str] = frozenset(),
                visibility: Literal["listed", "internal"] | None = None) -> tuple[DeliveredMessage, ...]:
         """按首次本地确认时间倒序返回 [since, until) 内的不同消息。"""
+        return self._query(since, until, limit, excluded_sources, visibility, None)
+
+    def recent_for_session(self, session_id: str, *, since: datetime, until: datetime, limit: int,
+                           excluded_sources: frozenset[str] = frozenset()) -> tuple[DeliveredMessage, ...]:
+        """Filter the durable confirmation index before reading bodies or applying the limit."""
+        if not isinstance(session_id, str) or not session_id or session_id.strip() != session_id:
+            raise ValueError("送达历史需要精确的非空会话 ID")
+        return self._query(since, until, limit, excluded_sources, None, session_id)
+
+    def _query(self, since: datetime, until: datetime, limit: int, excluded_sources: frozenset[str],
+               visibility: Literal["listed", "internal"] | None,
+               session_id: str | None) -> tuple[DeliveredMessage, ...]:
         start, stop = time_key(since), time_key(until)
         if start >= stop or type(limit) is not int or not 1 <= limit <= 1000:
             raise ValueError("送达查询需要递增时间范围和 1 到 1000 的 limit")
         if visibility not in {None, "listed", "internal"}:
             raise ValueError("送达查询的会话可见性无效")
         state = self._state()
-        return state.snapshot(lambda: self._recent(state, start, stop, limit, excluded_sources, visibility))
+        return state.snapshot(lambda: self._recent(
+            state, start, stop, limit, excluded_sources, visibility, session_id,
+        ))
 
     def status(self, message_id: str, sink: str) -> dict[str, object] | None:
         """Read one real delivery phase without acquiring send authority."""
@@ -83,7 +97,8 @@ class DeliveryHistory:
 
     def _recent(self, state: OwnerStore, start: str, stop: str, limit: int,
                 excluded_sources: frozenset[str],
-                visibility: Literal["listed", "internal"] | None) -> tuple[DeliveredMessage, ...]:
+                visibility: Literal["listed", "internal"] | None,
+                session_id: str | None) -> tuple[DeliveredMessage, ...]:
         """索引分页与正文读取共享同一个数据库快照。"""
         result: list[DeliveredMessage] = []
         # 1. 先按时间索引分页，过滤来源后再计数；被动消息不会挤掉更早的通知。
@@ -92,6 +107,8 @@ class DeliveryHistory:
                 fact = Confirmation.model_validate_json(json.dumps(json_value(row.value)))
                 if row.version != 0 or key != time_key(fact.confirmed_at) + fact.message_id:
                     raise ValueError("送达历史索引身份损坏")
+                if session_id is not None and fact.session_id != session_id:
+                    continue
                 message = self._catalog.reader(fact.session_id).get(fact.message_id)
                 if message is None:
                     raise ValueError("送达历史引用的原消息缺失")

@@ -140,6 +140,20 @@ class DeliveryHistory(Protocol):
     def status(self, message_id: str, sink: str) -> Mapping[str, object] | None: ...
 
 
+class ScopedDeliveryHistory(Protocol):
+    """Read confirmed deliveries for one exact Session before applying the limit."""
+
+    def recent_for_session(
+        self,
+        session_id: str,
+        *,
+        since: datetime,
+        until: datetime,
+        limit: int,
+        excluded_sources: frozenset[str] = frozenset(),
+    ) -> tuple[DeliveredMessage, ...]: ...
+
+
 class FinalOutputTurn(Protocol):
     @property
     def source(self) -> str: ...
@@ -162,6 +176,7 @@ DELIVERY_GUARDED_START = ServiceKey[GuardedDelivery]("delivery.guarded-start.v1"
 DELIVERY_GUARDED_START_V2 = ServiceKey[GuardedDeliveryV2]("delivery.guarded-start.v2")
 DELIVERY_SENDERS = ServiceKey[Senders]("delivery.senders.v1")
 DELIVERY_READ = ServiceKey[DeliveryHistory]("delivery.read.v1")
+DELIVERY_SCOPED_READ = ServiceKey[ScopedDeliveryHistory]("delivery.scoped-read.v1")
 FINAL_OUTPUT_DELIVERY = ServiceKey[FinalOutputDelivery]("delivery.final_output.v1")
 
 
