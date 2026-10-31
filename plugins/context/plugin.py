@@ -19,6 +19,7 @@ from plugins.context.contract import (
     CONTEXT as CONTEXT,
     CONTEXT_NOTICE_DISPLAY,
     MATERIALS_V4,
+    GLOBAL_PROMPT_MATERIALS,
     MaterialData,
 )
 
@@ -36,7 +37,7 @@ from .materials import ContextMaterials
 
 api_version = 3
 name = "context"
-version = "1.0.0"
+version = "1.1.0"
 desc = "用固定日志和已取得材料组成请求，不执行检索或摘要"
 inject = ()
 
@@ -247,3 +248,8 @@ async def apply(ctx: Context) -> None:
         recall_source=config.recall_source or None,
     )
     _ = await ctx.provide(MATERIALS_V4, materials, binding_contributors=materials.binding_contributors)
+    class GlobalPrompts:
+        def bind(self, *, exclude_kinds=frozenset()):
+            return materials.bind(exclude_kinds=exclude_kinds, global_prompt_only=True)
+    _ = await ctx.provide(GLOBAL_PROMPT_MATERIALS, GlobalPrompts(),
+                          binding_contributors=materials.global_prompt_contributors)
