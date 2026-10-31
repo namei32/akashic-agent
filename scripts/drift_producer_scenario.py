@@ -22,7 +22,7 @@ from agent.plugins.manager import PluginManager
 from plugins.content.plugin import check_text
 from plugins.eventmail.contract import EVENTMAIL_ALERT_SOURCE
 from plugins.gateway.contract import RpcMethod
-from plugins.drift.contract import DRIFT_WAKE_V3
+from plugins.drift.contract import DRIFT_CHANGED, DRIFT_WAKE_V3
 from plugins.drift.store import DriftStore
 from plugins.ledger.contract import ContentPart, Input, MESSAGE_CATALOG
 from tests.support.delivery_sources import sources as delivery_sources
@@ -129,6 +129,9 @@ async def run(folder: Path) -> None:
                     break
                 await asyncio.sleep(0.1)
         assert not sent.exists() or not sent.read_text().strip()
+        assert tuple(log.reader(target["session_id"]).snapshot()) == before, (
+            "A paused initiative must not publish a visible message before its send guard"
+        )
         alert = current.context.require(EVENTMAIL_ALERT_SOURCE).bind("scenario")
         try:
             await alert.report(event_id="alert", payload={"text": "需要注意的测试事件"}, observed_at=datetime.now(UTC))
@@ -165,8 +168,36 @@ async def run(folder: Path) -> None:
                     break
                 await asyncio.sleep(0.1)
         assert datetime.fromisoformat(json.loads(proposal[1])["valid_until"]) > datetime.now(UTC)
-        # A captured opportunity that expires before execution cannot be sent later.
+        # Expiry while the real Wake model is running must prevent visible publication.
         store = DriftStore(database)
+        (model_data / "wake-entered").unlink(missing_ok=True)
+        (model_data / "wake-release").unlink(missing_ok=True)
+        before_expiry = tuple(log.reader(target["session_id"]).snapshot())
+        now = datetime.now(UTC)
+        expiry = now + timedelta(seconds=10)
+        opportunity = store.propose(
+            "scenario:expire-during-model", "1",
+            {"kind": "conversation", "valid_until": expiry.isoformat()}, now, initiative_target=target,
+        )
+        assert opportunity["inserted"] is True
+        restored_root.context.emit(DRIFT_CHANGED, None)
+        async with asyncio.timeout(8):
+            while not (model_data / "wake-entered").exists():
+                await asyncio.sleep(0.05)
+        await asyncio.sleep(max(0, (expiry - datetime.now(UTC)).total_seconds()) + 0.1)
+        (model_data / "wake-release").touch()
+        async with asyncio.timeout(10):
+            while True:
+                with sqlite3.connect(database) as db:
+                    state = db.execute(
+                        "SELECT status FROM proposals WHERE proposal_id='scenario:expire-during-model'"
+                    ).fetchone()
+                if state == ("invalidated",):
+                    break
+                await asyncio.sleep(0.1)
+        assert tuple(log.reader(target["session_id"]).snapshot()) == before_expiry
+        assert len(sent.read_text().splitlines()) == 2
+        # A captured opportunity that expires before execution cannot be sent later.
         now = datetime.now(UTC)
         stale_due = now - timedelta(seconds=10)
         stale = store.propose("scenario:expired", "1", {"kind": "conversation",

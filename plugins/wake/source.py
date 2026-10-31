@@ -409,12 +409,22 @@ class Source:
         token = _string(selected.get("selection_token"), "selection_token")
         paused_reason = "paused:" + token if request.owner == "drift" else None
         expired_reason = "expired:" + token if request.owner == "drift" else None
-        sent = await self._notify(task, request, text, start_guard=guard, retry_reason=paused_reason)
+        expired_before_publish = False
+        try:
+            sent = await self._notify(
+                task, request, text, start_guard=guard, publish_guard=guard, retry_reason=paused_reason,
+            )
+        except _InitiativePaused:
+            return "deferred"
+        except _InitiativeExpired:
+            sent, expired_before_publish = False, True
         if not sent:
-            receipt = self.ctx.require(DELIVERY).open(self.ctx).receipt(request.notification_id, request.sink["name"])
+            receipt = (None if expired_before_publish else
+                       self.ctx.require(DELIVERY).open(self.ctx).receipt(request.notification_id, request.sink["name"]))
             if request.owner == "drift" and receipt is not None and receipt.status == "rejected" and receipt.error == paused_reason:
                 return "deferred"  # Preserve the original message and sink for guarded retry.
-            if request.owner == "drift" and receipt is not None and receipt.status == "rejected" and receipt.error == expired_reason:
+            if request.owner == "drift" and (expired_before_publish or (
+                    receipt is not None and receipt.status == "rejected" and receipt.error == expired_reason)):
                 result = await self.ctx.require(DRIFT_WAKE).transition(token, "invalidated")
                 if result.get("changed") is not True:
                     raise RuntimeError("过期 Drift 发送领取未能失效")
@@ -432,7 +442,8 @@ class Source:
 
     async def _notify(
         self, task: Task, request: Request, text: str, *,
-        start_guard: StartGuard | None = None, retry_reason: str | None = None,
+        start_guard: StartGuard | None = None, publish_guard: StartGuard | None = None,
+        retry_reason: str | None = None,
     ) -> bool:
         """通知正文与原 Sink 一起提交；未知或拒绝回执不冒充领域已送达。"""
         target = request.target
@@ -447,7 +458,19 @@ class Source:
             writer = ctx.require(MESSAGE_WRITERS).bind(ctx, author="wake", source="wake", body_types=(Output,),
                 content={"text": ctx.require(CONTENT).check_text})(target.session_id)
             try:
-                message, _ = await delivery.publish_async(writer, request.notification_id, Output((ContentPart("text", text),), "complete"), (sink,))
+                # Publishing is itself visible; serialize it with pause and expiry as well as send.
+                async with publish_guard() if publish_guard is not None else nullcontext(None) as reason:
+                    if reason is not None and reason.startswith("paused:"):
+                        raise _InitiativePaused
+                    if reason is not None and reason.startswith("expired:"):
+                        raise _InitiativeExpired
+                    if reason is not None:
+                        raise RuntimeError(f"Wake Drift 消息发布未获准入: {reason}")
+                    if not task.active:
+                        raise asyncio.CancelledError
+                    message, _ = await delivery.publish_async(
+                        writer, request.notification_id, Output((ContentPart("text", text),), "complete"), (sink,),
+                    )
             finally:
                 writer.expire()
         selected = await delivery.prepare_async(reader, message, (sink,))
