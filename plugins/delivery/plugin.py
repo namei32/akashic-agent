@@ -8,6 +8,7 @@ from agent.plugin_composition.tasks import TASKS, TaskAdmission
 from plugins.delivery.contract import (
     DELIVERY_GUARDED_START,
     DELIVERY_GUARDED_START_V2,
+    DELIVERY_SCOPED_READ,
 )
 
 from .api import FINAL_OUTPUT_DELIVERY, FinalOutputDelivery
@@ -53,7 +54,9 @@ async def apply(ctx: Context) -> None:
     _ = await ctx.provide(DELIVERY_GUARDED_START, DeliveryAdmission(ctx, state, tasks, DELIVERY_GUARDED_START))
     _ = await ctx.provide(DELIVERY_GUARDED_START_V2, DeliveryAdmission(ctx, state, tasks, DELIVERY_GUARDED_START_V2))
     _ = await ctx.provide(FINAL_OUTPUT_DELIVERY, FinalOutputDelivery())
-    _ = await ctx.provide(DELIVERY_READ, DeliveryHistory(
+    history = DeliveryHistory(
         lambda: state,
         ctx.require(MESSAGE_CATALOG),
-    ))
+    )
+    _ = await ctx.provide(DELIVERY_READ, history)
+    _ = await ctx.provide(DELIVERY_SCOPED_READ, history)

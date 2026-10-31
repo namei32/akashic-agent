@@ -106,6 +106,9 @@ global 路由可以读共享图，isolated 路由只读对应隔离图。off 表
 必须在 Delivery owner 查询时先按来源/目标会话过滤、再应用数量和字符预算；
 不能先截取跨会话列表再过滤，也不能把其他项目的通知正文混入本次提示词。
 其他 Wake 职责保持各自原合同，仍分别提供近期被动与已送达主动历史。
+Delivery 提供独立的 delivery.scoped-read.v1，只按精确 session_id 查询并先过滤索引、
+再读取消息正文和应用数量限制；原 delivery.read.v1 保持现有跨会话语义。
+这一接口的使用资格和目标会话有效性仍由调用者判断。
 
 同样需要检查所有进入该模型阶段的材料。当前 Wake 还会读取 EventMail 的
 active_context，现有查询没有来源会话过滤；其他 Context provider 也可能贡献材料。
@@ -139,12 +142,13 @@ empty 是查询成功但没有合适事实，可以让模型只依据真实会�
 模型服务可恢复故障产生的关键词结果标记 degraded，沿 MEM-006 处理。
 scope_denied、provider 缺失、数据库/模型空间损坏和取消不可冒充 empty。
 
-当前 DEFAULT_MEMORY.recall 会把结果固定到 receipt；重复同一 key 会返回旧结果，
-即使某项记忆后来变为 superseded。它返回的 memory_ids 是检索命中集合，
-references 则只对应真正呈现的子集。因此仅复用该 API 或把全部 memory_ids
-当成提示词引用都不足以实现本设计。新合同必须返回真正呈现的 ID/引用，
-并在使用前从当前权威事实检查有效性。查询指纹也须包含固定时间和预算；
-现有 recall 的指纹不包含 timestamp，不能直接声称满足这一要求。
+基础分支的内置 DEFAULT_MEMORY.recall 会把结果固定到 receipt；重复同一 key
+会返回旧结果，即使某项记忆后来变为 superseded。其 memory_ids 是检索命中集合，
+references 只对应真正呈现的子集。一些较新的 Default Memory 制品已经返回
+presented_ids 并对新回执检查查询时间；实际可用字段取决于选中的提供者。
+这些结果仍不构成覆盖效果提交的有效性保护。因此不能仅复用旧回执或把全部
+memory_ids 当成提示词引用。新合同必须返回真正呈现的 ID/引用，并在使用前从
+当前权威事实检查有效性；查询身份还须绑定固定时间和呈现预算。
 
 一个机会使用固定的 request_id 和不可变参数，重启后可重放原召回回执；
 每次新尝试使用新身份。再次使用旧结果仍须检查当前状态，回执只证明当时的结果，
