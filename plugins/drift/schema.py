@@ -1,6 +1,6 @@
 """Validated operator requests for the initiative producer's durable control."""
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class EmptyRequest(BaseModel):
@@ -15,6 +15,37 @@ class ControlRequest(EmptyRequest):
 class ControlReceipt(EmptyRequest):
     request_id: str = Field(min_length=1, max_length=128, pattern=r"^\S+$")
     paused: bool
+    version: int = Field(ge=1)
+
+
+class ContactTarget(EmptyRequest):
+    channel: str = Field(min_length=1, max_length=64)
+    recipient: str = Field(min_length=1, max_length=512)
+    session_id: str = Field(min_length=1, max_length=512)
+
+    @field_validator("channel", "recipient", "session_id")
+    @classmethod
+    def exact_identity(cls, value: str) -> str:
+        if value.strip() != value:
+            raise ValueError("目标身份不能有首尾空白")
+        return value
+
+
+class MemoryConsentRequest(ControlRequest):
+    enabled: bool
+    target: ContactTarget | None = None
+
+    @model_validator(mode="after")
+    def exact_target(self) -> "MemoryConsentRequest":
+        if self.enabled != (self.target is not None):
+            raise ValueError("开启记忆主动联系必须明确选择目标；关闭时不传目标")
+        return self
+
+
+class MemoryConsentReceipt(EmptyRequest):
+    request_id: str
+    enabled: bool
+    target: ContactTarget | None
     version: int = Field(ge=1)
 
 

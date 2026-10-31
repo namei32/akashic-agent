@@ -55,7 +55,9 @@ async def run(folder: Path) -> None:
     shutil.copytree(ROOT / "plugins/drift", sources / "drift", ignore=shutil.ignore_patterns("__pycache__"))
     runner = MigrationRunner(repo_root=core, config_path=folder / "config.toml",
                              workspace=workspace, plugin_dirs=[sources], plugins_home=folder / "home")
-    assert runner.run().migrations == ("20261028_01_initiative_control", "20261029_01_initiative_target")
+    assert runner.run().migrations == (
+        "20261028_01_initiative_control", "20261029_01_initiative_target", "20261031_01_memory_consent",
+    )
     assert {name: rows(path, name) for name in before} == before
 
     async def mount() -> tuple[CompositionRoot, Context, list[None]]:

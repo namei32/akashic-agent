@@ -15,3 +15,9 @@ id = "20261029_01_initiative_target"
 path = "20261029_01_initiative_target.py"
 depends = ["20261028_01_initiative_control"]
 transactional = false
+
+[[migrations]]
+id = "20261031_01_memory_consent"
+path = "20261031_01_memory_consent.py"
+depends = ["20261029_01_initiative_target"]
+transactional = false

@@ -32,6 +32,8 @@ Drift 发布以下 Gateway 扩展方法：
 - `drift/initiative/pause`、`drift/initiative/resume`：要求 `request_id` 和 `expected_version`。
 - `drift/initiative/config`：读取生产者配置和当前配置输入版本 `input_ref`。
 - `drift/initiative/configure`：用 `request_id` 和 `expected_input` 提交完整配置，交由插件配置 owner 校验、发布和换代。
+- `drift/initiative/memory-status`：读取记忆主动联系授权及其版本。
+- `drift/initiative/memory-consent`：显式授权当前 Wake 精确目标或撤销授权；开启须有渠道 owner 的私人目标证明。
 
 暂停状态与回执在同一个 SQLite 事务提交。相同 ID、相同参数重放原回执；相同 ID 的不同参数或过期控制版本明确拒绝。响应同时返回当前状态，旧暂停回执不能覆盖后来已经恢复的意图。重启保留控制状态，损坏记录报错，不重置为默认值。
 
@@ -55,10 +57,15 @@ Drift 发布以下 Gateway 扩展方法：
 | `initiative_control` | 新库或迁移建立一条未暂停、版本 0 的记录；明确控制操作更新 paused 并递增版本 | 不自动删除、重置或随重启恢复 | 同事务操作回执、数据库一致备份 |
 | `initiative_control_receipts` | 每个请求 ID 追加一次固定参数与结果 | 当前不得自动修改或减少 | 请求 ID、参数、原回执 |
 | `initiative_proposals` | 与新主动提案同事务保存固定目标；同目标最多一条未过期的未完成提案 | 不原位更改目标；提案状态沿原 owner 流转，过期条目不再被选择 | 当前不得自动减少；目标引用与原提案、控制记录在同库恢复 |
+| `initiative_memory_consent` / `initiative_memory_receipts` | 默认关闭；显式操作按请求 ID 和预期版本事务更新授权并追加回执 | 撤销后保留原目标和所有回执；当前不得自动物理删除 | 同库备份、控制版本和操作回执 |
 
 内置迁移 `20261028_01_initiative_control` 从当前 v2 原地增加控制表，事务内比较全部旧提案列值后才提交 schema v3。对仍为 v1 的库，迁移先验证并保留原状，Drift 启用时由原 owner 在同一事务内完成既有 v1 升级和控制表初始化；原有的孤立投递提案失效规则保持不变。缺库不建空业务库，由实际 owner 初始化；未知版本、额外表或完整性错误明确失败。迁移仅通过本 bundle 的 data_root 访问数据，不扫描其他插件目录。
 
-后续 `20261029_01_initiative_target` 从 v3 只增加目标表并核对旧提案、控制和回执的全部行；v1 延后由原 owner 一次升级到 v4。旧 v2/v3 代码不识别 v4；回退应使用保留 v4 读取能力、关闭新主动生产的兼容版本。不得用旧会话备份覆盖后续新增消息，也不自动清理新记录。
+后续 `20261029_01_initiative_target` 从 v3 只增加目标表并核对旧提案、控制和回执的全部行；v1 延后由原 owner 一次升级到当前版本。旧 v2/v3 代码不识别 v4；回退应使用保留当前库读取能力、关闭新主动生产的兼容版本。不得用旧会话备份覆盖后续新增消息，也不自动清理新记录。
+
+后续 `20261031_01_memory_consent` 从 v4 只增加默认关闭的授权和回执表，核对全部旧行；
+v1 仍由原 owner 升级到当前版本。旧版不识别 v5，回退须保留 v5 读取能力与授权意图。
+授权接口本层不启动记忆召回，也不改变旧定时机会行为。
 
 Wake 消费的 Drift 合同升级为 `drift.wake.v3`，以显式传递目标并保护阶段和发送准入；该合同变化需要重新启动使用它的插件组合。控制提交后的变化通知只唤醒重查，SQLite 仍是唯一事实来源。
 Wake 使用 `delivery.guarded-start.v2` 在恢复被暂停的发送时重新检查准入；其他消费者继续使用 v1。
