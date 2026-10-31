@@ -35,7 +35,7 @@ Drift 发布以下 Gateway 扩展方法：
 
 暂停状态与回执在同一个 SQLite 事务提交。相同 ID、相同参数重放原回执；相同 ID 的不同参数或过期控制版本明确拒绝。响应同时返回当前状态，旧暂停回执不能覆盖后来已经恢复的意图。重启保留控制状态，损坏记录报错，不重置为默认值。
 
-新主动提案绑定 channel、recipient 和 session；Wake 只能读取匹配当前目标的提案，领取时再核对目标和暂停状态。模型阶段的持久输入和 Delivery 的首次 started 提交与暂停写入按同一 SQLite 写锁排序：暂停提交后，新主动阶段或发送保留原请求并让出 Wake 循环；恢复通知或重启后读取同一请求继续，不阻塞其他告警。已经接纳的阶段或已经开始的发送按原回执结算。旧提案仍沿原合同处理。
+新主动提案绑定 channel、recipient 和 session；Wake 只能读取匹配当前目标的提案，领取时再核对目标和暂停状态。模型阶段的持久输入、目标会话消息发布及 Delivery 的首次 started 提交与暂停写入按同一 SQLite 写锁排序：暂停提交后，新主动阶段、可见消息发布或发送保留原请求并让出 Wake 循环；恢复通知或重启后读取同一请求继续，不阻塞其他告警。已经发布的消息和已经开始的发送按原回执结算。旧提案仍沿原合同处理。
 
 ## 定时交流机会
 
@@ -72,6 +72,6 @@ Wake 使用 `delivery.guarded-start.v2` 在恢复被暂停的发送时重新检�
 
 ## 验证
 
-`python scripts/drift_controls_scenario.py` 在临时 workspace 中使用实际旧版 owner 构造提案，经过真实 Yoyo runner、CompositionRoot、Gateway 方法和 SQLite 核对迁移、请求重放、控制竞争与重启。独立 Ledger 原消息逐列比较。`python scripts/drift_target_scenario.py` 检查目标隔离及跨代际暂停竞争和恢复。`python scripts/drift_producer_scenario.py` 以真实 Timer、Wake 和本地测试接收端验证机会、暂停、告警、恢复和过期，不连接正式渠道。
+`python scripts/drift_controls_scenario.py` 在临时 workspace 中使用实际旧版 owner 构造提案，经过真实 Yoyo runner、CompositionRoot、Gateway 方法和 SQLite 核对迁移、请求重放、控制竞争与重启。独立 Ledger 原消息逐列比较。`python scripts/drift_target_scenario.py` 检查目标隔离及跨代际暂停竞争和恢复。`python scripts/drift_producer_scenario.py` 以真实 Timer、Wake 和本地测试接收端验证机会、暂停期间没有目标会话消息或渠道发送、告警、恢复和过期，不连接正式渠道。
 
 静态检查包括 Python 类型、插件边界、迁移追加约束和 diff。隔离场景不代表后台工作、正式渠道发送或正式实例迁移已经完成。
