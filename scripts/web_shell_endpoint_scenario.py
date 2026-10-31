@@ -33,7 +33,8 @@ async def run(base: Path) -> dict[str, bool]:
     from bootstrap.tools import build_core_runtime
     from bootstrap.web_shell import create_web_shell_server
     from core.net.http import SharedHttpResources
-    from plugins.ledger.contract import Input
+    from plugins.channels.contract import private_target_key
+    from plugins.ledger.contract import ContentPart, ContentReferences, Input
 
     home, workspace, config = base / "home", base / "workspace", base / "config.toml"
     os.environ.update(HOME=str(home), AKASHIC_PLUGIN_HOME=str(home),
@@ -73,11 +74,28 @@ async def apply(ctx):
         log = core.plugin_manager.live_root.context.require(MESSAGE_CATALOG)._log
         log.writer("akashic:read-only", author="user", source="conversation",
                                 body_types=(Input,), content={}).append("saved-input", Input(()))
+        owner = log.writer("akashic:owner", author="user", source="conversation", body_types=(Input,),
+                           content={"channel.origin": lambda _: ContentReferences()})
+        owner.append("owner-input", Input((ContentPart("channel.origin",
+            {"channel": "akashic", "chat_id": "owner", "sender": "web"}),)))
+        owner.expire()
         with sqlite3.connect(workspace / "sessions.db") as database:
             original_rows = database.execute("SELECT * FROM messages ORDER BY rowid").fetchall()
-        assert len(original_rows) == 1
+        assert len(original_rows) == 2
         root = core.plugin_manager.live_root
         assert root is not None
+        assert root.context.get(private_target_key("telegram")) is None
+        target_proof = root.context.require(private_target_key("akashic"))
+        async with target_proof.guard("owner", "akashic:owner") as allowed:
+            assert allowed is True
+        async with target_proof.guard("owner", "akashic:read-only") as allowed:
+            assert allowed is False
+        async with target_proof.guard("read-only", "akashic:read-only") as allowed:
+            assert allowed is False  # A matching address alone does not establish origin.
+        log.set_session_deleted("akashic:owner", deleted=True)
+        async with target_proof.guard("owner", "akashic:owner") as allowed:
+            assert allowed is False
+        log.set_session_deleted("akashic:owner", deleted=False)
         observer_fiber = next(item for item in root.fibers() if item.name == "observer")
         observer_context = observer_fiber.context
         assert sorted(endpoint.name for endpoint in root.endpoints()) == ["client", "dashboard"]
@@ -125,6 +143,16 @@ async def apply(ctx):
                 await core.plugin_manager.wait_idle()
                 assert core.plugin_manager.read_update("client-assets-update").state == "active"
                 try:
+                    async with target_proof.guard("owner", "akashic:owner"):
+                        pass
+                except RuntimeError:
+                    pass
+                else:
+                    raise AssertionError("replaced client generation retained target proof")
+                new_proof = root.context.require(private_target_key("akashic"))
+                async with new_proof.guard("owner", "akashic:owner") as allowed:
+                    assert allowed is True
+                try:
                     async with asyncio.timeout(10):
                         while True:
                             # 已排入 socket 的状态通知可以先于重启关闭帧到达。
@@ -159,6 +187,7 @@ async def apply(ctx):
             await core.stop()
         await http.aclose()
     return {"actual_installed_listeners": True, "http_and_cache": True,
+            "private_target_origin_and_generation": True,
             "missing_reply_keeps_history_connected": True,
             "client_state_and_redirect": True, "websocket_update_drained": True,
             "observer_not_reapplied": True, "damaged_plan_explicit": True,

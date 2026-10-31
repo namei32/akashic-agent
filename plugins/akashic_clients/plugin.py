@@ -4,7 +4,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 
 from agent.plugin_composition import Context
-from plugins.channels.contract import CHANNELS, ChannelCapability, ChannelDefinition, InboundIdentity
+from plugins.channels.contract import CHANNELS, ChannelCapability, ChannelDefinition, InboundIdentity, private_target_key
 
 from .capabilities import CLIENT_CAPABILITIES, INSPECTION_RPC_KEYS, JOB_NOTICES, REPLY_STATUS, MCP_DETAIL, MCP_SERVERS
 from plugins.models.contract import MODEL_CALL_STATS
@@ -13,6 +13,7 @@ from plugins.channels.contract import CHANNEL_INPUT_V2 as CHANNEL_INPUT
 from .config import AkashicClientsConfig
 from .navigation import NavigationPreferences
 from .read_marks import ReadMarks
+from .private_target import PrivateTarget
 from plugins.ledger.contract import OWNER_STATE, OwnerStore
 
 api_version = 3
@@ -60,6 +61,7 @@ async def apply(ctx: Context) -> None:
             optional_services=frozenset((*INSPECTION_RPC_KEYS, MODEL_CALL_STATS, REPLY_STATUS, MCP_DETAIL, MCP_SERVERS, JOB_NOTICES)),
         ),
     )
+    await ctx.provide(private_target_key("akashic"), PrivateTarget(ctx))
 
 
 __all__ = [

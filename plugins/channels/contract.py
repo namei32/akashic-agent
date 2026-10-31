@@ -83,6 +83,19 @@ class ChannelCapability(StrEnum):
     TURN_STREAM = "turn_stream"
 
 
+class PrivateTargetVerifier(Protocol):
+    """The channel owner checks an exact destination and holds its provider lifetime."""
+
+    def guard(self, recipient: str, session_id: str) -> AbstractAsyncContextManager[bool]: ...
+
+
+def private_target_key(channel: str) -> ServiceKey[PrivateTargetVerifier]:
+    """Unknown channels have no proof; callers must not infer one from an address."""
+    if not isinstance(channel, str) or _NAME.fullmatch(channel) is None:
+        raise ValueError("channel name 无效")
+    return ServiceKey[PrivateTargetVerifier](f"channel.private-target.{channel}.v1")
+
+
 class InboundIdentity(StrEnum):
     PROVIDER_MESSAGE_ID = "provider_message_id"
 
