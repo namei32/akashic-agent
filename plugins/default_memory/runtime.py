@@ -226,6 +226,7 @@ class Runtime:
                 "text": rendered,
                 "references": list(dict.fromkeys(ref for hit in presented for ref in hit.memory.fact.evidence_ids)),
                 "memory_ids": [hit.memory.id for hit in hits],
+                "presented_ids": [hit.memory.id for hit in presented],
                 "scores": [{"id": hit.memory.id, "score": hit.score, "rrf": hit.fusion, "lane": hit.lane} for hit in hits],
                 "degraded": degraded,
             }
