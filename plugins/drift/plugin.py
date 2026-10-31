@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import AbstractAsyncContextManager
 from datetime import datetime
 
 from agent.plugin_composition import Context
-from plugins.drift.contract import DRIFT_DELIVERY_V2, DRIFT_WAKE_V2
+from plugins.drift.contract import DRIFT_CHANGED, DRIFT_DELIVERY_V2, DRIFT_WAKE_V3
 
 from core.common.file_io import run_file_io
 
 from .store import DriftStore
 from .controls import mount
+from .initiative import Initiative
 
 api_version = 3
 name = "drift"
@@ -22,19 +24,24 @@ workspace_files = ()
 
 
 class _AsyncWakeServices:
-    def __init__(self, store: DriftStore) -> None:
-        self._store = store
+    def __init__(self, store: DriftStore, initiative: Initiative) -> None:
+        self._store, self._initiative = store, initiative
 
-    async def snapshot(self, now: datetime) -> Mapping[str, object]:
-        return await run_file_io(lambda: self._store.snapshot(now))
+    async def snapshot(self, now: datetime, *, target: Mapping[str, object] | None = None) -> Mapping[str, object]:
+        return await run_file_io(lambda: self._store.snapshot(now, target=target))
 
     async def select(
         self,
         ref: Mapping[str, object],
         accepted_turn: Mapping[str, object],
         now: datetime,
+        *, target: Mapping[str, object] | None = None,
     ) -> Mapping[str, object]:
-        return await run_file_io(lambda: self._store.select(ref, accepted_turn, now))
+        return await run_file_io(lambda: self._store.select(ref, accepted_turn, now, target=target))
+
+    def send_start(self, accepted_turn: Mapping[str, object],
+                   target: Mapping[str, object]) -> AbstractAsyncContextManager[str | None]:
+        return self._initiative.start(accepted_turn, target)
 
     async def transition(self, token: str, action: str) -> Mapping[str, object]:
         return await run_file_io(lambda: self._store.transition(token, action))
@@ -63,6 +70,7 @@ async def apply(ctx: Context) -> None:
 
     store = DriftStore(ctx.data_root / "drift.sqlite3")
     await run_file_io(store.initialize)
-    await mount(ctx, store)
-    _ = await ctx.provide(DRIFT_WAKE_V2, _AsyncWakeServices(store))
+    initiative = Initiative(store, lambda: ctx.emit(DRIFT_CHANGED, None))
+    await mount(ctx, store, initiative)
+    _ = await ctx.provide(DRIFT_WAKE_V3, _AsyncWakeServices(store, initiative))
     _ = await ctx.provide(DRIFT_DELIVERY_V2, _AsyncDeliveryServices(store))

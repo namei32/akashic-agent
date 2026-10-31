@@ -43,8 +43,10 @@ class Duties:
     """维护 Content 原有评分与到期规则，只提出一份本轮固定的业务选择。"""
 
     def __init__(self, content: ContentWakeServices, drift: DriftWakeServices,
-                 state: WakeState, interest: SemanticInterest):
+                 state: WakeState, interest: SemanticInterest,
+                 target: Mapping[str, object] | None = None):
         self.content, self.drift, self.state, self.interest = content, drift, state, interest
+        self.target = target
         self._maintenance = asyncio.Lock()
 
     async def deadline(self, now: datetime) -> datetime | None:
@@ -52,7 +54,7 @@ class Duties:
         items = _sequence(content.get("items"), "Content items")
         unseen = await run_file_io(lambda: self.state.unseen_deadline(items))
         values = [unseen, await self.content.alert_deadline(now)]
-        drift = (await self.drift.snapshot(now)).get("next_due")
+        drift = (await self._drift_snapshot(now)).get("next_due")
         if drift is not None:
             values.append(_datetime(drift))
         return min((value for value in values if value is not None), default=None)
@@ -79,10 +81,15 @@ class Duties:
             detail = _pool_detail(pool.detail, count, result)
             if result.should_wake:
                 return Admission("content", detail, pool)
-        proposals = _sequence((await self.drift.snapshot(now)).get("proposals"), "Drift proposals")
+        proposals = _sequence((await self._drift_snapshot(now)).get("proposals"), "Drift proposals")
         if any(item.get("due") is True for item in proposals):
             return Admission("drift", detail + "；Drift 已到期", pool, tuple(proposals))
         return Admission(None, detail + "；没有到期职责或新 Content 不足", pool)
+
+    async def _drift_snapshot(self, now: datetime) -> Mapping[str, object]:
+        if self.target is None:
+            return await self.drift.snapshot(now)
+        return await self.drift.snapshot(now, target=self.target)
 
     async def maintain(self, now: datetime) -> Pool:
         """沿原规则只评分一次，低质量 Content 满最短停留期后由 EventMail 过期。"""

@@ -15,9 +15,10 @@ from .drift_migrations.helpers.initiative_control_v3 import (
     RECEIPTS_SQL,
     create_control,
 )
+from .drift_migrations.helpers.initiative_target_v4 import TARGET_SQL, create_targets
 from .schema import ControlReceipt, ControlRequest
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 _TABLE_SQL_V1 = """
     CREATE TABLE proposals(
         proposal_id TEXT NOT NULL,
@@ -121,12 +122,13 @@ class DriftStore:
                 )
             )
             if tables != (
-                "initiative_control", "initiative_control_receipts", "proposals",
+                "initiative_control", "initiative_control_receipts", "initiative_proposals", "proposals",
             ):
                 raise RuntimeError("Drift owned table set 不匹配")
             for name, expected in (
                 ("initiative_control", CONTROL_SQL),
                 ("initiative_control_receipts", RECEIPTS_SQL),
+                ("initiative_proposals", TARGET_SQL),
             ):
                 row = connection.execute(
                     "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (name,),
@@ -152,6 +154,8 @@ class DriftStore:
             result = connection.execute("PRAGMA integrity_check").fetchone()
             if result is None or result[0] != "ok":
                 raise RuntimeError("Drift SQLite integrity check failed")
+            if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise RuntimeError("Drift initiative proposal target references missing proposal")
 
     @staticmethod
     def _initiative_control(connection: sqlite3.Connection) -> dict[str, object]:
@@ -223,6 +227,7 @@ class DriftStore:
         due_at: datetime,
         *,
         next_due: datetime | None = None,
+        initiative_target: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         """Append one idempotent proposal revision for its owning producer."""
 
@@ -231,6 +236,7 @@ class DriftStore:
         payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         due = _aware_utc(due_at)
         retry = _aware_utc(next_due) if next_due is not None else None
+        target = _contact_target(initiative_target)
         now = datetime.now(UTC).isoformat()
         with self._transaction(write=True) as connection:
             existing = connection.execute(
@@ -243,6 +249,13 @@ class DriftStore:
                     raise RuntimeError(
                         f"Drift proposal identity conflict: {proposal}/{proposal_revision}"
                     )
+                if target is not None:
+                    saved = connection.execute(
+                        "SELECT channel, recipient, session_id FROM initiative_proposals "
+                        "WHERE proposal_id=? AND revision=?", (proposal, proposal_revision),
+                    ).fetchone()
+                    if saved is None or tuple(saved) != target:
+                        raise RuntimeError("Drift initiative target identity conflict")
                 return {
                     "inserted": False,
                     "ref": {
@@ -251,6 +264,18 @@ class DriftStore:
                         "state_version": 1,
                     },
                 }
+            if target is not None:
+                if self._initiative_control(connection)["paused"] is True:
+                    return {"inserted": False, "reason": "paused"}
+                outstanding = connection.execute(
+                    "SELECT 1 FROM initiative_proposals i JOIN proposals p "
+                    "ON p.proposal_id=i.proposal_id AND p.revision=i.revision "
+                    "WHERE i.channel=? AND i.recipient=? AND i.session_id=? "
+                    "AND p.status IN ('pending', 'deferred', 'selected', 'ready_for_delivery') LIMIT 1",
+                    target,
+                ).fetchone()
+                if outstanding is not None:
+                    return {"inserted": False, "reason": "outstanding"}
             connection.execute(
                 """
                 INSERT INTO proposals(
@@ -261,6 +286,9 @@ class DriftStore:
                 """,
                 (proposal, proposal_revision, payload_json, due, retry, now, now),
             )
+            if target is not None:
+                connection.execute("INSERT INTO initiative_proposals VALUES (?, ?, ?, ?, ?)",
+                                   (proposal, proposal_revision, *target))
             return {
                 "inserted": True,
                 "ref": {
@@ -270,18 +298,23 @@ class DriftStore:
                 },
             }
 
-    def snapshot(self, now: datetime) -> DriftSnapshot:
+    def snapshot(self, now: datetime, *, target: Mapping[str, object] | None = None) -> DriftSnapshot:
         """Return the next durable deadline and frozen due proposals."""
 
         instant = _aware_utc(now)
+        contact = _contact_target(target)
         with self._transaction(write=False) as connection:
             rows = connection.execute("""
-                SELECT proposal_id, revision, payload_json, due_at, next_due,
-                       state_version
-                FROM proposals
-                WHERE status IN ('pending', 'deferred')
-                ORDER BY due_at, proposal_id, revision
-                """).fetchall()
+                SELECT p.proposal_id, p.revision, p.payload_json, p.due_at, p.next_due,
+                       p.state_version
+                FROM proposals p LEFT JOIN initiative_proposals i
+                  ON p.proposal_id=i.proposal_id AND p.revision=i.revision
+                WHERE p.status IN ('pending', 'deferred') AND (
+                    i.proposal_id IS NULL OR (
+                      ? = 0 AND i.channel=? AND i.recipient=? AND i.session_id=?))
+                ORDER BY p.due_at, p.proposal_id, p.revision
+                """, (int(self._initiative_control(connection)["paused"] is True),
+                      *(contact or ("", "", "")))).fetchall()
             proposals: tuple[DriftProposal, ...] = tuple(
                 {
                     "ref": {
@@ -306,6 +339,7 @@ class DriftStore:
         ref: Mapping[str, object],
         accepted_turn: Mapping[str, object],
         now: datetime,
+        *, target: Mapping[str, object] | None = None,
     ) -> DriftSelectResult:
         """CAS one due proposal into a Turn-bound selection."""
 
@@ -315,8 +349,19 @@ class DriftStore:
         if type(state_version) is not int or state_version <= 0:
             raise ValueError("Drift state_version 必须是正整数")
         accepted = _accepted_turn(accepted_turn)
+        contact = _contact_target(target)
         token = "drift-selection:" + secrets.token_hex(16)
         with self._transaction(write=True) as connection:
+            initiative = connection.execute(
+                "SELECT channel, recipient, session_id FROM initiative_proposals "
+                "WHERE proposal_id=? AND revision=?", (proposal, revision),
+            ).fetchone()
+            if initiative is not None:
+                reason = ("paused" if self._initiative_control(connection)["paused"] is True else
+                          "target_mismatch" if contact != tuple(initiative) else None)
+                if reason is not None:
+                    return {"selected": False, "reason": reason,
+                            "selection_token": None, "accepted_turn": None}
             existing_turn = connection.execute(
                 """
                 SELECT 1 FROM proposals
@@ -356,6 +401,22 @@ class DriftStore:
                 "selection_token": token if changed.rowcount == 1 else None,
                 "accepted_turn": accepted if changed.rowcount == 1 else None,
             }
+
+    def initiative_send_state(self, connection: sqlite3.Connection,
+                              accepted_turn: Mapping[str, object],
+                              target: Mapping[str, object]) -> str | None:
+        accepted, contact = _accepted_turn(accepted_turn), _contact_target(target)
+        row = connection.execute(
+            "SELECT i.channel, i.recipient, i.session_id FROM proposals p "
+            "JOIN initiative_proposals i ON p.proposal_id=i.proposal_id AND p.revision=i.revision "
+            "WHERE p.selected_session_id=? AND p.selected_turn_id=?",
+            (accepted["session_id"], accepted["turn_id"]),
+        ).fetchone()
+        if row is None:
+            return None
+        if tuple(row) != contact:
+            return "target_mismatch"
+        return "paused" if self._initiative_control(connection)["paused"] is True else None
 
     def selected(self, limit: int = 100) -> tuple[DriftSelectionReceipt, ...]:
         """List stable selected receipts for startup reconciliation."""
@@ -572,6 +633,7 @@ class DriftStore:
             )
         connection.row_factory = sqlite3.Row
         try:
+            connection.execute("PRAGMA foreign_keys = ON")
             if write:
                 connection.execute("PRAGMA journal_mode = WAL")
                 connection.execute("BEGIN IMMEDIATE")
@@ -593,8 +655,8 @@ class DriftStore:
     @staticmethod
     def _ensure_schema(connection: sqlite3.Connection) -> None:
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-        if version == 2:
-            raise RuntimeError("Drift v2 requires the initiative-control installation migration")
+        if version in (2, 3):
+            raise RuntimeError("Drift v2/v3 requires the initiative installation migrations")
         if version not in (0, 1, _SCHEMA_VERSION):
             raise RuntimeError(f"不支持的 Drift schema version: {version}")
         if version == _SCHEMA_VERSION:
@@ -660,6 +722,7 @@ class DriftStore:
             for statement in _INDEX_SQL:
                 connection.execute(statement)
         create_control(connection)
+        create_targets(connection)
         connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
 
@@ -753,6 +816,14 @@ def _accepted_turn(value: Mapping[str, object]) -> dict[str, str]:
         "session_id": _identity("accepted_turn.session_id", value.get("session_id")),
         "turn_id": _identity("accepted_turn.turn_id", value.get("turn_id")),
     }
+
+
+def _contact_target(value: Mapping[str, object] | None) -> tuple[str, str, str] | None:
+    if value is None:
+        return None
+    return (_identity("target.channel", value.get("channel")),
+            _identity("target.recipient", value.get("recipient")),
+            _identity("target.session_id", value.get("session_id")))
 
 
 def _identity(field: str, value: object) -> str:

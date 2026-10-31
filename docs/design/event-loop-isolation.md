@@ -147,7 +147,7 @@ EventMail 快照与写入仍是同步 API；Drift 的 Wake 消费路径使用下
 
 ## Drift 的 Wake 存储调用（#879）
 
-Wake 使用 `drift.wake.v2` 和 `drift.delivery.v2` 等待快照、领取、状态流转和送达结算。
+Wake 使用 `drift.wake.v3` 和 `drift.delivery.v2` 等待快照、领取、状态流转和送达结算。
 Drift provider 把完整同步操作交给已有四名额 `run_file_io`；连接、事务与关闭在同一
 worker 完成，调用方取消仍等待物理退出。Context、Task、程序执行、Message、通知与
 最终 flow pointer 继续由 Wake 在原 Task 操作。没有新增队列、表、状态副本或 executor。

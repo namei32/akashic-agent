@@ -47,6 +47,7 @@ from .program import REPLY_EXECUTE, SOURCE_CHECK, run
 from .request import WAKE_PROGRAM, WAKE_TOOLS_VIEW, check_phase, check_request
 from .runtime import DashboardView, Runtime
 from .tools import SCHEMAS, DecisionTool
+from plugins.drift.contract import DRIFT_CHANGED
 
 api_version = 3
 name = "wake"
@@ -157,6 +158,7 @@ async def start_function(ctx: Context) -> None:
     _ = await ctx.on(RUNTIME_STARTED, start)
     _ = await ctx.on(RUNTIME_STOPPING, stop)
     _ = await ctx.on(EVENTMAIL_CHANGED, changed)
+    _ = await ctx.on(DRIFT_CHANGED, changed)
 
 
 

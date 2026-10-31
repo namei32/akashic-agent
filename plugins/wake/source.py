@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 
 from pydantic import BaseModel, ConfigDict
@@ -167,7 +168,8 @@ class Source:
         await self._settled(request, reader)
 
     async def _phase(self, task: Task, request: Request, reader: MessageReader,
-                     stage: Stage, data: Mapping[str, object]) -> Message:
+                     stage: Stage, data: Mapping[str, object], *,
+                     start_guard: StartGuard | None = None) -> Message:
         """每阶段先保存实际 Input；终态存在便不再打开模型或工具。"""
         phase_message = reader.get(request.phase_id(stage))
         terminal = finished(reader, request, stage)
@@ -179,23 +181,26 @@ class Source:
         await ctx.require(DELIVERY).open(ctx).wait_idle(request.sink["name"], request.sink["address"])
         if not task.active:
             raise asyncio.CancelledError
-        if phase_message is None:
-            writer = ctx.require(MESSAGE_WRITERS).bind(ctx, author="wake", source="wake", body_types=(Input,),
-                content={"wake.phase": check_phase, "model.selection": ctx.require(MODEL_SELECTION).check,
-                         "text": ctx.require(CONTENT).check_text})(request.session_id)
-            task.on_close(writer.expire)
-            try:
-                phase = Phase(input_id=request.input_id, stage=stage)
-                phase_message = await writer.append_async(
-                    request.phase_id(stage),
-                    Input((ContentPart("wake.phase", phase.model_dump(mode="json")),
-                          ContentPart("text", json.dumps({"stage": stage, "data": dict(data)}, ensure_ascii=False)),
-                          ContentPart("model.selection", {"model_id": request.model_id, "reasoning_effort": request.reasoning_effort}))),
-                )
-            finally:
-                writer.expire()
-        elif phase_message.source != "wake" or not isinstance(phase_message.body, Input):
-            raise ValueError("Wake 阶段引用不是同来源的 Input")
+        async with start_guard() if start_guard is not None else nullcontext(None) as reason:
+            if reason is not None:
+                raise RuntimeError(f"Wake Drift 阶段未获准入: {reason}")
+            if phase_message is None:
+                writer = ctx.require(MESSAGE_WRITERS).bind(ctx, author="wake", source="wake", body_types=(Input,),
+                    content={"wake.phase": check_phase, "model.selection": ctx.require(MODEL_SELECTION).check,
+                             "text": ctx.require(CONTENT).check_text})(request.session_id)
+                task.on_close(writer.expire)
+                try:
+                    phase = Phase(input_id=request.input_id, stage=stage)
+                    phase_message = await writer.append_async(
+                        request.phase_id(stage),
+                        Input((ContentPart("wake.phase", phase.model_dump(mode="json")),
+                              ContentPart("text", json.dumps({"stage": stage, "data": dict(data)}, ensure_ascii=False)),
+                              ContentPart("model.selection", {"model_id": request.model_id, "reasoning_effort": request.reasoning_effort}))),
+                    )
+                finally:
+                    writer.expire()
+            elif phase_message.source != "wake" or not isinstance(phase_message.body, Input):
+                raise ValueError("Wake 阶段引用不是同来源的 Input")
 
         # A flow may run several phases in one Task. Each phase grants only its
         # actual Input, never a newer head observed after an asynchronous wait.
@@ -316,7 +321,8 @@ class Source:
             return await self._finish_domain(task, request, reader, "drift")
         selected = await domain.selection(request.accepted)
         if selected is None:
-            claim = await domain.select(proposal.ref, request.accepted, request.now)
+            claim = await domain.select(proposal.ref, request.accepted, request.now,
+                                        target=request.target.model_dump())
             if claim.get("selected") is not True:
                 # 原 state_version 已消耗时不能再领取；已有决定保留其真实原因。
                 previous = await run_file_io(lambda: self.state.get_run(request.flow_id))
@@ -333,7 +339,8 @@ class Source:
             await self._record(request, "skip", "来源明确拒绝本轮 Drift")
         else:
             _ = await self._phase(
-                task, request, reader, "drift", {"duty": dict(proposal.payload)}
+                task, request, reader, "drift", {"duty": dict(proposal.payload)},
+                start_guard=lambda: domain.send_start(request.accepted, request.target.model_dump()),
             )
             value = decision(reader, request, "drift")
             if isinstance(value, Share) and not value.items:
@@ -373,7 +380,9 @@ class Source:
             payloads = {_candidate_id(_mapping(item["ref"], "Content ref")): _mapping(item["payload"], "Content payload")
                         for item in request.items}
             text = _message_with_source_links(text, {"source_refs": [payloads[name] for name in value.items]})
-        if not await self._notify(task, request, text):
+        guard = (lambda: self.ctx.require(DRIFT_WAKE).send_start(
+            request.accepted, request.target.model_dump())) if request.owner == "drift" else None
+        if not await self._notify(task, request, text, start_guard=guard):
             await self._fail_notification(request, reader)
             return "failed"
         token = _string(selected.get("selection_token"), "selection_token")
