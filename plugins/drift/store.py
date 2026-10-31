@@ -16,9 +16,10 @@ from .drift_migrations.helpers.initiative_control_v3 import (
     create_control,
 )
 from .drift_migrations.helpers.initiative_target_v4 import TARGET_SQL, create_targets
-from .schema import ControlReceipt, ControlRequest
+from .drift_migrations.helpers.memory_consent_v5 import CONSENT_RECEIPTS_SQL, CONSENT_SQL, create_consent
+from .schema import ContactTarget, ControlReceipt, ControlRequest, MemoryConsentReceipt, MemoryConsentRequest
 
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 _TABLE_SQL_V1 = """
     CREATE TABLE proposals(
         proposal_id TEXT NOT NULL,
@@ -122,12 +123,15 @@ class DriftStore:
                 )
             )
             if tables != (
-                "initiative_control", "initiative_control_receipts", "initiative_proposals", "proposals",
+                "initiative_control", "initiative_control_receipts", "initiative_memory_consent",
+                "initiative_memory_receipts", "initiative_proposals", "proposals",
             ):
                 raise RuntimeError("Drift owned table set 不匹配")
             for name, expected in (
                 ("initiative_control", CONTROL_SQL),
                 ("initiative_control_receipts", RECEIPTS_SQL),
+                ("initiative_memory_consent", CONSENT_SQL),
+                ("initiative_memory_receipts", CONSENT_RECEIPTS_SQL),
                 ("initiative_proposals", TARGET_SQL),
             ):
                 row = connection.execute(
@@ -136,6 +140,7 @@ class DriftStore:
                 if row is None or _normalize_sql(row[0]) != _normalize_sql(expected):
                     raise RuntimeError(f"Drift {name} schema identity 不匹配")
             self._initiative_control(connection)
+            self._memory_consent(connection)
             table_sql = connection.execute(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'proposals'"
             ).fetchone()
@@ -217,6 +222,68 @@ class DriftStore:
                 (request.request_id, int(paused), request.expected_version,
                  json.dumps(receipt, sort_keys=True)),
             )
+            return receipt
+
+    @staticmethod
+    def _memory_consent(connection: sqlite3.Connection) -> dict[str, object]:
+        row = connection.execute(
+            "SELECT enabled,target_json,version FROM initiative_memory_consent WHERE singleton=1"
+        ).fetchone()
+        if (row is None or type(row[0]) is not int or row[0] not in (0, 1)
+                or type(row[2]) is not int or row[2] < 0):
+            raise RuntimeError("Drift memory consent is missing or corrupt")
+        try:
+            target = None if row[1] is None else ContactTarget.model_validate_json(row[1]).model_dump()
+        except (ValueError, TypeError) as error:
+            raise RuntimeError("Drift memory consent target is corrupt") from error
+        if row[0] == 1 and target is None:
+            raise RuntimeError("Enabled Drift memory consent has no target")
+        return {"enabled": bool(row[0]), "target": target, "consent_version": row[2]}
+
+    @staticmethod
+    def _consent_fingerprint(request: MemoryConsentRequest) -> str:
+        value = request.model_dump(mode="json", exclude={"request_id"})
+        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    @classmethod
+    def _consent_receipt(cls, db: sqlite3.Connection, request: MemoryConsentRequest) -> dict[str, object] | None:
+        saved = db.execute(
+            "SELECT fingerprint,receipt FROM initiative_memory_receipts WHERE request_id=?", (request.request_id,)
+        ).fetchone()
+        if saved is None:
+            return None
+        if saved[0] != cls._consent_fingerprint(request):
+            raise ValueError("Drift memory consent request ID reused for different arguments")
+        receipt = MemoryConsentReceipt.model_validate_json(saved[1])
+        if (receipt.request_id != request.request_id or receipt.enabled is not request.enabled
+                or receipt.version != request.expected_version + 1
+                or (request.enabled and receipt.target != request.target)):
+            raise RuntimeError("Drift memory consent receipt is corrupt")
+        return receipt.model_dump(mode="json")
+
+    def memory_consent(self) -> dict[str, object]:
+        with self._transaction(write=False) as db:
+            return self._memory_consent(db)
+
+    def memory_consent_receipt(self, request: MemoryConsentRequest) -> dict[str, object] | None:
+        with self._transaction(write=False) as db:
+            return self._consent_receipt(db, request)
+
+    def set_memory_consent(self, request: MemoryConsentRequest) -> dict[str, object]:
+        with self._transaction(write=True) as db:
+            saved = self._consent_receipt(db, request)
+            if saved is not None:
+                return saved
+            current = self._memory_consent(db)
+            if current["consent_version"] != request.expected_version:
+                raise ValueError("Drift memory consent changed; refresh before retrying")
+            target = request.target.model_dump(mode="json") if request.target is not None else current["target"]
+            version = request.expected_version + 1
+            receipt = {"request_id": request.request_id, "enabled": request.enabled, "target": target, "version": version}
+            db.execute("UPDATE initiative_memory_consent SET enabled=?,target_json=?,version=? WHERE singleton=1",
+                       (int(request.enabled), None if target is None else json.dumps(target, sort_keys=True), version))
+            db.execute("INSERT INTO initiative_memory_receipts VALUES (?,?,?)",
+                       (request.request_id, self._consent_fingerprint(request), json.dumps(receipt, sort_keys=True)))
             return receipt
 
     def propose(
@@ -668,8 +735,8 @@ class DriftStore:
     @staticmethod
     def _ensure_schema(connection: sqlite3.Connection) -> None:
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-        if version in (2, 3):
-            raise RuntimeError("Drift v2/v3 requires the initiative installation migrations")
+        if version in (2, 3, 4):
+            raise RuntimeError("Drift v2/v3/v4 requires the initiative installation migrations")
         if version not in (0, 1, _SCHEMA_VERSION):
             raise RuntimeError(f"不支持的 Drift schema version: {version}")
         if version == _SCHEMA_VERSION:
@@ -736,6 +803,7 @@ class DriftStore:
                 connection.execute(statement)
         create_control(connection)
         create_targets(connection)
+        create_consent(connection)
         connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
 

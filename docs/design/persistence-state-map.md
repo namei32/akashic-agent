@@ -312,6 +312,7 @@ Visuals 生成的自包含 HTML（旧版为 `akashic.visual.v1` JSON）是下表
 |---|---|---|---|
 | Drift `data_root/drift.sqlite3` 的 `initiative_control` / `initiative_control_receipts` | v3 新建控制单行；操作员按请求 ID 追加固定回执 | 暂停/恢复同事务递增控制版本；重放不改当前状态；原 proposals 沿既有合同 | 当前不得自动减少；回执与同库状态属于恢复证据；本批不迁移旧 `drift/drift.db` |
 | Drift `initiative_proposals` | v4 为新主动提案同事务增加固定联系目标 | 不更改已绑定目标；提案按原状态机更新 | 当前不得自动减少；原提案、目标和控制记录通过同一数据库备份恢复 |
+| Drift `initiative_memory_consent` / `initiative_memory_receipts` | v5 新建默认关闭状态；用户明确授权精确目标并追加幂等回执 | 撤销关闭授权并保留目标，控制版本单调递增 | 当前不得自动减少；以 Drift 同库备份、原目标和操作回执恢复 |
 | `proactive.db` | H3 后当前 runtime 不再写；H2 historical decoder 只读旧 tick、step、delivery 与 continuity | 只有名称明确的 owner handoff 可以推进连续性；当前无写 owner | 不随代码升级清理；delivery dedupe、cooldown 和连续性状态在交接前阻止 activation |
 | `wake_proactive.db` | H3 后当前 runtime 不再写；H2 historical decoder 只读 runs、observations、hazard monitor，inventory 读取 active continuity | reservoir/ACK 只由目标 source adapter 交接；其余 continuity 当前无写 owner | 不随代码升级清理；未交接 ACK、tombstone、quarantine、消费、hazard/context/timer 状态阻止 activation |
 | `drift/drift.db` | run、step、journal 持续追加 | continuum、cursor、global note 和 self state 原位更新 | 日志可以另定 retention；cursor、journal 和下一轮选择所需状态必须恢复，不能按临时 trace 清空 |
