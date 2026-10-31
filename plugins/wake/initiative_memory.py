@@ -14,6 +14,13 @@ from plugins.ledger.contract import ContentPart, Input, MessageCatalog, Output
 
 from .messages import _preview
 
+try:
+    import plugins.default_memory.contract as _memory_contract
+except ModuleNotFoundError as error:
+    if error.name not in {"plugins.default_memory", "plugins.default_memory.contract"}:
+        raise
+    _memory_contract = None
+
 
 class InitiativeMemory(Protocol):
     async def admit(self, request_id: str, session_id: str, query: str, *,
@@ -23,8 +30,10 @@ class InitiativeMemory(Protocol):
     def guard(self, request_id: str, session_id: str) -> AbstractAsyncContextManager[str | None]: ...
 
 
-# An unavailable or older provider leaves this optional capability absent.
-INITIATIVE_MEMORY = ServiceKey[InitiativeMemory]("default-memory.initiative.v1")
+# Older or uninstalled providers leave the optional capability absent. Its
+# identity is always declared by Default Memory's public contract, never here.
+INITIATIVE_MEMORY = cast(ServiceKey[InitiativeMemory] | None,
+                         getattr(_memory_contract, "INITIATIVE_MEMORY", None))
 
 
 def capture(catalog: MessageCatalog, content: Content, history: ScopedDeliveryHistory, *,

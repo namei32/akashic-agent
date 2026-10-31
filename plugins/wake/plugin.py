@@ -109,8 +109,9 @@ async def start_function(ctx: Context) -> None:
     async def memory_ready(child: Context) -> None:
         await child.provide(WAKE_MEMORY_READY, object())
         child.emit(DRIFT_CHANGED, None)
-    await ctx.inject((INITIATIVE_MEMORY, DELIVERY_SCOPED_READ, private_target_key(target.channel)),
-                     memory_ready, name="memory-initiative")
+    if INITIATIVE_MEMORY is not None:
+        await ctx.inject((INITIATIVE_MEMORY, DELIVERY_SCOPED_READ, private_target_key(target.channel)),
+                         memory_ready, name="memory-initiative")
     _ = await ctx.require(CONTENT).register(
         ctx,
         {
