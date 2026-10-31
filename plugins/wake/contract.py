@@ -17,3 +17,5 @@ class WakeContact:
 
 
 WAKE_CONTACT = ServiceKey[Callable[[], WakeContact]]("wake.contact.v1")
+# Published only when Wake can safely consume memory-assisted opportunities.
+WAKE_MEMORY_READY = ServiceKey[object]("wake.memory-initiative.v1")

@@ -286,6 +286,22 @@ class DriftStore:
                        (request.request_id, self._consent_fingerprint(request), json.dumps(receipt, sort_keys=True)))
             return receipt
 
+    @classmethod
+    def _memory_authorized(cls, db: sqlite3.Connection, target: tuple[str, str, str] | None,
+                           payload: Mapping[str, object]) -> bool:
+        enabled = payload.get("memory_assisted", False)
+        if type(enabled) is not bool:
+            raise ValueError("Drift memory_assisted must be a boolean")
+        if not enabled:
+            return True
+        version = payload.get("consent_version")
+        if type(version) is not int or version < 0 or target is None:
+            raise ValueError("Memory-assisted initiative requires an exact consent version and target")
+        current = cls._memory_consent(db)
+        saved_target = current["target"]
+        return (current["enabled"] is True and current["consent_version"] == version
+                and isinstance(saved_target, Mapping) and _contact_target(saved_target) == target)
+
     def propose(
         self,
         proposal_id: str,
@@ -334,6 +350,8 @@ class DriftStore:
             if target is not None:
                 if self._initiative_control(connection)["paused"] is True:
                     return {"inserted": False, "reason": "paused"}
+                if not self._memory_authorized(connection, target, payload):
+                    return {"inserted": False, "reason": "consent_changed"}
                 outstanding = connection.execute(
                     "SELECT p.payload_json FROM initiative_proposals i JOIN proposals p "
                     "ON p.proposal_id=i.proposal_id AND p.revision=i.revision "
@@ -341,7 +359,8 @@ class DriftStore:
                     "AND p.status IN ('pending', 'deferred', 'selected', 'ready_for_delivery')",
                     target,
                 ).fetchall()
-                if any(not _initiative_expired(json.loads(row[0]), now) for row in outstanding):
+                if any(not _initiative_expired(json.loads(row[0]), now)
+                       and self._memory_authorized(connection, target, json.loads(row[0])) for row in outstanding):
                     return {"inserted": False, "reason": "outstanding"}
             connection.execute(
                 """
@@ -382,8 +401,9 @@ class DriftStore:
                 ORDER BY p.due_at, p.proposal_id, p.revision
                 """, (int(self._initiative_control(connection)["paused"] is True),
                       *(contact or ("", "", "")))).fetchall()
-            rows = [row for row in rows if row["initiative_id"] is None
-                    or not _initiative_expired(json.loads(row["payload_json"]), instant)]
+            rows = [row for row in rows if row["initiative_id"] is None or (
+                not _initiative_expired(json.loads(row["payload_json"]), instant)
+                and self._memory_authorized(connection, contact, json.loads(row["payload_json"])))]
             proposals: tuple[DriftProposal, ...] = tuple(
                 {
                     "ref": {
@@ -429,8 +449,10 @@ class DriftStore:
                 "WHERE i.proposal_id=? AND i.revision=?", (proposal, revision),
             ).fetchone()
             if initiative is not None:
+                payload = json.loads(initiative["payload_json"])
                 reason = ("target_mismatch" if contact != tuple(initiative)[:3] else
-                          "expired" if _initiative_expired(json.loads(initiative["payload_json"]), instant) else
+                          "expired" if _initiative_expired(payload, instant) else
+                          "consent_changed" if not self._memory_authorized(connection, contact, payload) else
                           "paused" if self._initiative_control(connection)["paused"] is True else None)
                 if reason is not None:
                     return {"selected": False, "reason": reason,
@@ -490,8 +512,11 @@ class DriftStore:
         if tuple(row)[:3] != contact:
             return "target_mismatch"
         token = _identity("selection_token", row["selection_token"])
-        if _initiative_expired(json.loads(row["payload_json"]), datetime.now(UTC).isoformat()):
+        payload = json.loads(row["payload_json"])
+        if _initiative_expired(payload, datetime.now(UTC).isoformat()):
             return "expired:" + token
+        if not self._memory_authorized(connection, contact, payload):
+            return "consent_changed:" + token
         return "paused:" + token if self._initiative_control(connection)["paused"] is True else None
 
     def selected(self, limit: int = 100) -> tuple[DriftSelectionReceipt, ...]:

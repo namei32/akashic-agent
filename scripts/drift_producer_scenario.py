@@ -224,11 +224,28 @@ async def run(folder: Path) -> None:
             attributes = [json.loads(row[0]) for row in db.execute(
                 "SELECT attributes FROM sessions WHERE key LIKE 'wake:%'")]
         assert attributes and all(value == {"learning": "excluded", "visibility": "internal"} for value in attributes)
+        # An opted-in producer cannot silently fall back when Wake lacks the memory capability.
+        config = await call("config")
+        await call("configure", request_id="memory-without-wake", expected_input=config["input_ref"],
+                   auto_propose=True, memory_assisted=True, interval_seconds=60, start_hour=0, end_hour=24)
+        await host.wait_idle()
+        current = host.live_root
+        assert current is not None
+        catalog = build_runtime_catalog(current, host._active_generations)
+        drift_plugin = next(item for item in cast(list[dict[str, Any]], catalog["plugins"]) if item["id"] == "drift")
+        producer = next(fiber for fiber in drift_plugin["composition"]["fibers"] if fiber["name"] == "drift/producer")
+        assert producer["state"] != "active" and "wake.memory-initiative.v1" in producer["missing_services"]
+        config = await call("config")
+        await call("configure", request_id="legacy-config", expected_input=config["input_ref"],
+                   auto_propose=False, interval_seconds=60, start_hour=0, end_hour=24)
+        await host.wait_idle()
+        assert (await call("config"))["producer"]["memory_assisted"] is True
         print(json.dumps({"explicit_opt_in": True, "real_timer_seconds": 60, "wake_settled": True,
                           "pause_blocks_send": True, "alert_while_paused": True,
                           "restart_resume_original_send": True, "expired_opportunity_blocked": True,
                           "local_delivery_count": len(entries),
-                          "original_messages_preserved": True}, ensure_ascii=False))
+                          "original_messages_preserved": True,
+                          "memory_dependency_blocks_fallback": True, "legacy_config_preserves_memory": True}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

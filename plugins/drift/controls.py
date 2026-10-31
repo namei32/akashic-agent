@@ -78,7 +78,7 @@ async def mount_configuration(ctx: Context) -> None:
 
     async def configure(params: BaseModel) -> dict[str, object]:
         request = ProducerRequest.model_validate(params.model_dump())
-        config = request.model_dump(exclude={"request_id", "expected_input"})
+        config = request.model_dump(exclude={"request_id", "expected_input"}, exclude_none=True)
         return await ctx.require(PLUGIN_CONFIG).apply(
             ctx, request_id=request.request_id, expected_input=request.expected_input,
             config={**ctx.config, **config})

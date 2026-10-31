@@ -7,6 +7,7 @@ import json
 from zoneinfo import ZoneInfo
 
 from agent.plugin_composition import Context
+from core.common.file_io import run_file_io
 from plugins.timer.contract import TIMERS, TimerStatus
 from plugins.wake.contract import WAKE_CONTACT
 
@@ -37,7 +38,10 @@ async def follow(ctx: Context, config: ProducerConfig, initiative: Initiative) -
             proposal_id = "initiative:" + hashlib.sha256(identity.encode()).hexdigest()
             window_end = datetime.combine(local.date(), time.min, tzinfo=zone) + timedelta(hours=config.end_hour)
             valid_until = min(now + timedelta(hours=1), window_end.astimezone(UTC))
-            payload = {"kind": "conversation", "purpose": "结合真实近期对话，考虑是否自然地与用户搭话",
-                       "valid_until": valid_until.isoformat()}
+            payload: dict[str, object] = {"kind": "conversation", "purpose": "结合真实近期对话，考虑是否自然地与用户搭话",
+                                          "valid_until": valid_until.isoformat()}
+            if config.memory_assisted:
+                consent = await run_file_io(initiative.store.memory_consent)
+                payload.update(memory_assisted=True, consent_version=consent["consent_version"])
             await initiative.write(lambda: initiative.store.propose(
                 proposal_id, "1", payload, now, initiative_target=target))
