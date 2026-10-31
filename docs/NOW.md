@@ -81,6 +81,10 @@ systemd unit 与 release 路径耦合需要独立复核；当前是评审风险�
 - 由维护者继续确认 [`design/persistence-state-map.md`](design/persistence-state-map.md) 的 INT-009、INT-010、INT-012～INT-014，以及旧消息编辑和 turns retention；INT-001～INT-008、INT-011 已提升为 projectneed 条款。
 - 把已确认的持久化状态地图转成机器可读备份 manifest，补齐目录快照、global companion state 和隔离恢复演练；确认 snapshot 能启动只读 runtime，并读取会话、记忆、调度、插件数据和主动流程连续性。
 
+## P1 · Drift 主动意图与工作执行
+
+按 [Drift 设计](design/drift-initiative.md) 接入真实提案生产者、Wake 变化通知、范围内显式记忆召回、Source/Reply 工作执行和设置。尚需验证主动搭话、授权工作产物、暂停准入、恢复与真实投递；首批控制和迁移场景不替代这些验收。
+
 ## P2 · PTY resize 既有规格差距
 
 SH-003 写有 resize，但当前 ShellProcessManager 和 Host Bridge 尚无 resize 入口。

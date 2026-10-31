@@ -1,0 +1,11 @@
+schema_version = 2
+bundle_id = "drift"
+version = "1.0.0"
+migration_root = "drift_migrations"
+package_name = "drift_migrations"
+
+[[migrations]]
+id = "20261028_01_initiative_control"
+path = "20261028_01_initiative_control.py"
+depends = []
+transactional = false
