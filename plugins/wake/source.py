@@ -82,6 +82,10 @@ class _InitiativePaused(RuntimeError):
     """The original Wake request remains pending until resume."""
 
 
+class _InitiativeRevoked(RuntimeError):
+    """The original target consent no longer authorizes this opportunity."""
+
+
 class Source:
     """Wake 拥有选择、通知和领域确认；普通 Message/Task/程序拥有实际执行。"""
 
@@ -194,6 +198,8 @@ class Source:
                 raise _InitiativeExpired
             if reason is not None and reason.startswith("paused:"):
                 raise _InitiativePaused
+            if reason is not None and reason.startswith("consent_changed:"):
+                raise _InitiativeRevoked
             if reason is not None:
                 raise RuntimeError(f"Wake Drift 阶段未获准入: {reason}")
             if phase_message is None:
@@ -340,9 +346,9 @@ class Source:
                 previous = await run_file_io(lambda: self.state.get_run(request.flow_id))
                 assert previous is not None
                 if previous["decision"] is None:
-                    expired = claim.get("reason") == "expired"
-                    await self._record(request, "skip" if expired else "defer",
-                                       "主动机会已过期" if expired else "原 Drift 职责领取被拒绝")
+                    invalid = claim.get("reason") in {"expired", "consent_changed"}
+                    await self._record(request, "skip" if invalid else "defer",
+                                       "主动机会已过期或授权已改变" if invalid else "原 Drift 职责领取被拒绝")
                 await self._settled(request, reader)
                 return "admission_rejected"
             selected = await domain.selection(request.accepted)
@@ -359,11 +365,11 @@ class Source:
                 )
             except _InitiativePaused:
                 return "deferred"  # Keep the original pointer for resume.
-            except _InitiativeExpired:
+            except (_InitiativeExpired, _InitiativeRevoked):
                 result = await domain.transition(_string(selected.get("selection_token"), "Drift token"), "invalidated")
                 if result.get("changed") is not True:
                     raise RuntimeError("过期 Drift 领取未能失效")
-                await self._record(request, "skip", "主动机会在模型阶段开始前已过期")
+                await self._record(request, "skip", "主动机会在模型阶段开始前过期或授权改变")
                 await self._settled(request, reader)
                 return "model_skip"
             value = decision(reader, request, "drift")
@@ -409,25 +415,27 @@ class Source:
         token = _string(selected.get("selection_token"), "selection_token")
         paused_reason = "paused:" + token if request.owner == "drift" else None
         expired_reason = "expired:" + token if request.owner == "drift" else None
-        expired_before_publish = False
+        revoked_reason = "consent_changed:" + token if request.owner == "drift" else None
+        invalid_before_publish = False
         try:
             sent = await self._notify(
                 task, request, text, start_guard=guard, publish_guard=guard, retry_reason=paused_reason,
             )
         except _InitiativePaused:
             return "deferred"
-        except _InitiativeExpired:
-            sent, expired_before_publish = False, True
+        except (_InitiativeExpired, _InitiativeRevoked):
+            sent, invalid_before_publish = False, True
         if not sent:
-            receipt = (None if expired_before_publish else
+            receipt = (None if invalid_before_publish else
                        self.ctx.require(DELIVERY).open(self.ctx).receipt(request.notification_id, request.sink["name"]))
             if request.owner == "drift" and receipt is not None and receipt.status == "rejected" and receipt.error == paused_reason:
                 return "deferred"  # Preserve the original message and sink for guarded retry.
-            if request.owner == "drift" and (expired_before_publish or (
-                    receipt is not None and receipt.status == "rejected" and receipt.error == expired_reason)):
+            if request.owner == "drift" and (invalid_before_publish or (
+                    receipt is not None and receipt.status == "rejected"
+                    and receipt.error in {expired_reason, revoked_reason})):
                 result = await self.ctx.require(DRIFT_WAKE).transition(token, "invalidated")
                 if result.get("changed") is not True:
-                    raise RuntimeError("过期 Drift 发送领取未能失效")
+                    raise RuntimeError("过期或授权改变的 Drift 发送领取未能失效")
                 await self._settled(request, reader)
                 return "model_skip"
             await self._fail_notification(request, reader)
@@ -464,6 +472,8 @@ class Source:
                         raise _InitiativePaused
                     if reason is not None and reason.startswith("expired:"):
                         raise _InitiativeExpired
+                    if reason is not None and reason.startswith("consent_changed:"):
+                        raise _InitiativeRevoked
                     if reason is not None:
                         raise RuntimeError(f"Wake Drift 消息发布未获准入: {reason}")
                     if not task.active:

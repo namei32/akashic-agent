@@ -24,6 +24,7 @@ from plugins.akashic_clients.private_target import PrivateTarget
 from plugins.channels.contract import private_target_key
 from plugins.drift import plugin
 from plugins.drift.contract import DRIFT_CHANGED, DRIFT_WAKE_V3
+from plugins.drift.store import DriftStore
 from plugins.gateway.contract import RpcMethod
 from plugins.ledger.contract import ContentPart, ContentReferences, Input, MESSAGE_CATALOG
 from plugins.ledger.log import MessageLog
@@ -154,7 +155,19 @@ async def run(folder: Path) -> None:
         accepted = {"session_id": "wake:consent", "turn_id": "wake-input:consent"}
         async with operator.runtime_scope():
             wake = operator.require(DRIFT_WAKE_V3)
-            assert (await wake.select(ref, accepted, now, target=target))["selected"] is True
+            old_selection = await wake.select(ref, accepted, now, target=target)
+            assert old_selection["selected"] is True
+            assert (await wake.transition(str(old_selection["selection_token"]), "await_change"))["changed"] is True
+        store = DriftStore(path)
+        memory = store.propose("memory-opportunity", "one",
+            {"kind": "conversation", "memory_assisted": True, "consent_version": 1},
+            now, initiative_target=target)
+        assert memory["inserted"] is True
+        accepted = {"session_id": "wake:memory", "turn_id": "wake-input:memory"}
+        async with operator.runtime_scope():
+            selected = await wake.select(cast(dict[str, object], memory["ref"]), accepted, now, target=target)
+            assert selected["selected"] is True
+        token = str(selected["selection_token"])
         entered, release = asyncio.Event(), asyncio.Event()
         async def hold() -> None:
             async with operator.runtime_scope():
@@ -170,9 +183,23 @@ async def run(folder: Path) -> None:
         release.set()
         await holder
         assert (await revoke)["enabled"] is False
+        async with operator.runtime_scope():
+            async with wake.send_start(accepted, target) as reason:
+                assert reason == "consent_changed:" + token
+        restored = await rpc(operator, "memory-consent", enabled=True, target=target,
+                             request_id="grant-again", expected_version=2)
+        assert restored["consent_version"] == 3
+        async with operator.runtime_scope():
+            async with wake.send_start(accepted, target) as reason:
+                assert reason == "consent_changed:" + token  # A later grant cannot revive an old request.
+        fresh = store.propose("new-memory-opportunity", "one",
+            {"kind": "conversation", "memory_assisted": True, "consent_version": 3},
+            now, initiative_target=target)
+        assert fresh["inserted"] is True
+        await rpc(operator, "memory-consent", enabled=False, request_id="revoke-again", expected_version=3)
         await proof_owner.dispose()
         replay = await rpc(operator, "memory-consent", enabled=True, target=target, request_id="grant", expected_version=0)
-        assert replay["enabled"] is False and replay["consent_version"] == 2
+        assert replay["enabled"] is False and replay["consent_version"] == 4
         assert cast(dict, replay["control_receipt"])["enabled"] is True
         assert events
     finally:
@@ -181,9 +208,9 @@ async def run(folder: Path) -> None:
     root, operator, _, _ = await mount()
     try:
         status = await rpc(operator, "memory-status")
-        assert status == {"enabled": False, "target": target, "consent_version": 2}
+        assert status == {"enabled": False, "target": target, "consent_version": 4}
         assert log.reader("akashic:owner").snapshot() == saved_messages
-        assert rows(path, "initiative_proposals") == before["initiative_proposals"]
+        assert rows(path, "initiative_proposals")[0] == before["initiative_proposals"][0]
         assert rows(path, "proposals")[0] == before["proposals"][0]
     finally:
         await root.dispose()

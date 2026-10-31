@@ -8,7 +8,7 @@ from agent.plugin_composition import Context
 from agent.plugin_composition.plugin_config import PLUGIN_CONFIG
 from plugins.drift.contract import DRIFT_CHANGED, DRIFT_DELIVERY_V2, DRIFT_WAKE_V3
 from plugins.timer.contract import TIMERS
-from plugins.wake.contract import WAKE_CONTACT
+from plugins.wake.contract import WAKE_CONTACT, WAKE_MEMORY_READY
 
 from core.common.file_io import run_file_io
 
@@ -84,4 +84,5 @@ async def apply(ctx: Context) -> None:
     if config.auto_propose:
         async def producer(child: Context) -> None:
             await child.spawn(follow(child, config, initiative), name="drift-producer")
-        await ctx.inject((TIMERS, WAKE_CONTACT), producer, name="producer")
+        dependencies = (TIMERS, WAKE_CONTACT, WAKE_MEMORY_READY) if config.memory_assisted else (TIMERS, WAKE_CONTACT)
+        await ctx.inject(dependencies, producer, name="producer")

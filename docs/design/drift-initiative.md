@@ -43,6 +43,8 @@ Drift 发布以下 Gateway 扩展方法：
 
 `auto_propose` 默认为 `false`。显式设置为 `true` 后，Drift 的子能力只在 Timer 和已启用 Wake 的联系目标可用时启动；每次等待默认 1800 秒，范围为 60 秒至 7 天。默认只在 Wake 时区的 09:00（含）至 22:00（不含）产生机会，可配置 `start_hour`、`end_hour`。重启后重新等待一个间隔，不补发停机期间的次数。
 
+独立的 `memory_assisted` 默认关闭。开启时生产者还等待 Wake 的记忆能力，并把当前授权版本固定到机会；没有该能力或当前目标未获授权时不回退为普通机会。旧配置请求省略这一字段时保留原值。撤销或重新授权使旧版本机会不能领取、发布或首次发送；已开始的效果仍按原回执结算。
+
 一个目标最多保留一条未过期的未完成机会。每个机会最晚在一个小时或当日窗口结束时过期，快照、领取和发送前都会检查；过期行保留作为记录，不阻塞新机会。Wake 用目标范围内最近的真实对话和已送达主动历史决定分享或跳过，并要求不编造用户事实或工作结果。模型决定和 Delivery 回执是不同事实，只有真实送达后才结算提案。
 
 例如，先调用 `drift/initiative/config` 取得 `input_ref`，再向 `drift/initiative/configure` 提交 `request_id`、`expected_input`（该 `input_ref`）以及 `auto_propose`、`interval_seconds`、`start_hour`、`end_hour`。配置更新采用插件配置 owner 的回执；当前没有单独的 Drift 设置页面。Wake 仍依赖其现有模型、发送渠道、EventMail 和 Akasha 兴趣能力。

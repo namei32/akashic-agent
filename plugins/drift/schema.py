@@ -53,6 +53,7 @@ class ProducerConfig(BaseModel):
     model_config = ConfigDict(extra="ignore", strict=True)
 
     auto_propose: bool = False
+    memory_assisted: bool = False
     interval_seconds: int = Field(default=1800, ge=60, le=604800)
     start_hour: int = Field(default=9, ge=0, le=23)
     end_hour: int = Field(default=22, ge=1, le=24)
@@ -66,6 +67,7 @@ class ProducerConfig(BaseModel):
 
 class ProducerRequest(EmptyRequest):
     auto_propose: bool
+    memory_assisted: bool | None = None
     interval_seconds: int = Field(ge=60, le=604800)
     start_hour: int = Field(ge=0, le=23)
     end_hour: int = Field(ge=1, le=24)
@@ -74,5 +76,5 @@ class ProducerRequest(EmptyRequest):
 
     @model_validator(mode="after")
     def validate_hours(self) -> "ProducerRequest":
-        ProducerConfig.model_validate(self.model_dump(exclude={"request_id", "expected_input"}))
+        ProducerConfig.model_validate(self.model_dump(exclude={"request_id", "expected_input"}, exclude_none=True))
         return self
