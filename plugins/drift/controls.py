@@ -7,7 +7,7 @@ from core.common.file_io import run_file_io
 from plugins.channels.contract import private_target_key
 from plugins.gateway.contract import RpcMethod
 from plugins.wake.contract import WAKE_CONTACT
-from .schema import ControlRequest, EmptyRequest, MemoryConsentRequest, ProducerConfig, ProducerRequest
+from .schema import ControlRequest, EmptyRequest, MemoryConsentRequest, ProducerConfig, ProducerRequest, ReceiptRequest
 from .store import DriftStore
 from .initiative import Initiative
 
@@ -83,7 +83,12 @@ async def mount_configuration(ctx: Context) -> None:
             ctx, request_id=request.request_id, expected_input=request.expected_input,
             config={**ctx.config, **config})
 
+    async def receipt(params: BaseModel) -> dict[str, object]:
+        request = ReceiptRequest.model_validate(params.model_dump())
+        return ctx.require(PLUGIN_CONFIG).receipt(ctx, request.request_id)
+
     for name, model, handler in (("config", EmptyRequest, read),
-                                 ("configure", ProducerRequest, configure)):
+                                 ("configure", ProducerRequest, configure),
+                                 ("config-receipt", ReceiptRequest, receipt)):
         await ctx.provide(RpcMethod.key("drift/initiative/" + name),
                           RpcMethod(model, ctx.entrypoint(handler)))
