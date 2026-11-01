@@ -11,6 +11,22 @@
 - 目标读者：维护者、coding agent、迁移与备份实现者、评审者
 - 关联条款：STA-001～STA-003、CTX-001、SES-001～SES-006、MEM-001～MEM-009、PLG-001～PLG-013、WSP-001～WSP-004、SCH-001～SCH-002、PRO-001～PRO-002、BAK-001
 
+## 2026-11-01：Windows Codex 控制（待评审）
+
+[0131](../decisions/0131-codex-control-uses-shared-desktop-backend.md) 新增普通可选控制插件。
+
+| 对象与 owner | 正常增加/更新 | 失效、减少与恢复 |
+|---|---|---|
+| `codex_control` 的 `owner_records/target:<session>` | 用户明确新建或选择后更新目标，按调用 seq 拒绝迟到旧选择 | 改选只替换指针；无自动删除，原消息及选择证据保留 |
+| 同分区 `command:<effect-key>` | 新建、发送前保存 started；收到回执后保存真实结果或 unknown | 同调用只回读，不重发；原记录保留，无自动删除 |
+| 当前 WS 连接、审批项、完成窗口 | 连接时取得；上限分别为 16 个审批、128 个完成状态 | 断连/卸载只清空观察副本，不撤销 Windows 指令；重连读取真实会话 |
+| Windows `AkashicCodexControl/backend.json` 与启动日志 | 启动器更新当前 PID/创建时间/CLI/HOME/端口指针，新增日志 | 原进程身份失配即拒绝复用，不杀未知进程；日志无自动清理 |
+| Windows `Akashic Codex Control` 计划任务 / 安装器 | 显式安装时登记当前普通用户登录触发、有限重试与稳定脚本路径 | 只替换同 marker 任务，其他同名任务拒绝覆盖；停用不撤销远端效果 |
+
+图片仍由 Ledger 保存原始附件；控制插件只持有有界读租约，不改源文件或正文。
+Windows CLI 新增的消息和文件效果由 Codex 拥有；中断、断连或代码回退不证明它们已回滚。
+无业务 schema 迁移。已有状态的恢复沿原 owner 协议；正式激活仍需计划任务与 CLI 联通验收。
+
 ## 2026-10-27：回复循环预算耗尽后续额
 
 [0129](../decisions/0129-exhausted-react-budget-renews-on-new-input.md) 只调整同来源日志的临时预算投影。

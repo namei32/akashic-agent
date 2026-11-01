@@ -1,4 +1,4 @@
-"""One connection to the Codex backend shared with the Windows desktop."""
+"""One connection to the Windows native Codex CLI app-server."""
 from __future__ import annotations
 
 import asyncio
@@ -45,7 +45,7 @@ class Client:
                 self.socket = await connect(self.url, open_timeout=5, max_size=16 * 1024 * 1024,
                                             max_queue=16, proxy=None, logger=self.logger)
             except (OSError, TimeoutError, InvalidHandshake) as error:
-                raise CodexError("无法连接 Windows Codex，请使用共享控制入口启动桌面应用") from error
+                raise CodexError("无法连接 Windows Codex，请检查原生 CLI 控制后端是否正在运行") from error
             self.reader = asyncio.create_task(self._read(), name="codex-control-reader")
             try:
                 identity = await self._request("initialize", {"clientInfo": {"name": "akashic_control", "version": "1.0.0"},
