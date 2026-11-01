@@ -19,8 +19,13 @@ from plugins.delivery.contract import (
 )
 from plugins.akasha.contract import SEMANTIC_INTEREST
 from plugins.ledger.contract import Input
+from plugins.gateway.contract import RpcMethod
 
 SETTINGS = ServiceKey[Configuration]("wake.settings.v1")
+
+
+class InitiativeUnavailable(Exception):
+    """Drift's optional control service is not available in this composition."""
 
 
 class Settings:
@@ -106,6 +111,17 @@ class Settings:
 
     def receipt(self, request_id: str) -> dict[str, object]:
         return self.ctx.entrypoint(lambda: self.ctx.require(PLUGIN_CONFIG).receipt(self.ctx, request_id))()
+
+    async def initiative(self, action: str, params: Mapping[str, object]) -> dict[str, object]:
+        """Use Drift's own versioned operator actions without making it a Wake dependency."""
+        if action not in {"status", "memory-status", "config", "config-receipt",
+                          "pause", "resume", "memory-consent", "configure"}:
+            raise ValueError("未知主动联系操作")
+        async with self.ctx.runtime_scope():
+            with self.ctx.borrow(RpcMethod.key("drift/initiative/" + action)) as method:
+                if method is None:
+                    raise InitiativeUnavailable("Drift 主动联系能力不可用")
+                return cast(dict[str, object], await method.call(method.params.model_validate(params)))
 
 
 async def mount(ctx: Context, model: type[BaseModel], function: FiberHandle) -> None:

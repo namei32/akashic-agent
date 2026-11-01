@@ -12,6 +12,10 @@ class ControlRequest(EmptyRequest):
     expected_version: int = Field(ge=0)
 
 
+class ReceiptRequest(EmptyRequest):
+    request_id: str = Field(min_length=1, max_length=128, pattern=r"^\S+$")
+
+
 class ControlReceipt(EmptyRequest):
     request_id: str = Field(min_length=1, max_length=128, pattern=r"^\S+$")
     paused: bool
