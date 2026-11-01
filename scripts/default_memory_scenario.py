@@ -37,7 +37,8 @@ async def apply(ctx):
 '''
 
 
-async def run(folder: Path, extension=None) -> dict[str, object]:
+async def run(folder: Path, extension=None, *, configure=None, chat_handler=None,
+              memory_source: Path | None = None, setup_only: bool = False) -> dict[str, object]:
     from agent.plugins.manager import PluginManager
     from agent.plugins.selection import PluginSelection
     from agent.plugin_composition import ServiceKey
@@ -47,7 +48,7 @@ async def run(folder: Path, extension=None) -> dict[str, object]:
     from plugins.akasha.contract import SEMANTIC_INTEREST, EMBEDDING_MEMORY_PLUGIN
     from plugins.ledger.contract import MESSAGE_CATALOG, BINDINGS, Output, ToolCall, CallRef
     from plugins.tools.contract import ALL_TOOLS, TOOLS, CallSource
-    from plugins.default_memory.contract import DEFAULT_MEMORY
+    DEFAULT_MEMORY = ServiceKey("default-memory.runtime.v1")
 
     requests = {"chat": 0, "embedding": 0}
     bad_reply = True
@@ -74,6 +75,8 @@ async def run(folder: Path, extension=None) -> dict[str, object]:
                     return [0., 0., 1., 0.]
                 result = {"data": [{"index": i, "embedding": vector(value)}
                                    for i, value in enumerate(values)], "usage": {"prompt_tokens": 1, "total_tokens": 1}}
+            elif "/chat/completions" in first and chat_handler is not None and (custom := await chat_handler(payload)) is not None:
+                result = custom
             elif "/chat/completions" in first:
                 prompt = payload["messages"][-1]["content"]
                 if "原始资料：" in prompt:
@@ -108,11 +111,14 @@ async def run(folder: Path, extension=None) -> dict[str, object]:
     sources = folder / "sources"
     for name in ("ledger", "commands", "content", "context", "tools", "turn_projection",
                  "models", "openai_compatible", "akasha", "default_memory"):
-        shutil.copytree(ROOT / "plugins" / name, sources / name, ignore=shutil.ignore_patterns("__pycache__"))
+        source = memory_source if name == "default_memory" and memory_source is not None else ROOT / "plugins" / name
+        shutil.copytree(source, sources / name, ignore=shutil.ignore_patterns("__pycache__"))
     (sources / "memory_probe").mkdir()
     (sources / "memory_probe/plugin.py").write_text(PROBE)
     save_config(workspace / "plugin-data/akasha-builtin", {"enabled": True, "memory_enabled": False})
     save_config(workspace / "plugin-data/default_memory-builtin", {"mode": "active", "auto_learn": False})
+    if configure is not None:
+        configure(sources, workspace)
     os.environ.update(HOME=str(folder / "home"), AKASHIC_PLUGIN_HOME=str(folder / "home"), AKASHIC_PLUGIN_DISTRIBUTION="")
     host = PluginManager([sources], workspace=workspace, installed_cache_root=folder / "home/cache")
     try:
@@ -138,6 +144,9 @@ async def run(folder: Path, extension=None) -> dict[str, object]:
                       capability_sources={"embedding_dimensions": "user", "embedding_normalization": "user"},
                       make_default_embedding=True)
         append = root.context.require(ServiceKey("scenario.append"))
+        if setup_only:
+            assert extension is not None
+            return await extension(host, append, workspace, requests)
         await append("scenario:global", "coffee", "I always prefer black coffee.")
         await append("scenario:excluded", "excluded", "Never learn this.", learning="excluded")
         await append("scenario:open", "unfinished", "This turn is not finished.", finish=False)
