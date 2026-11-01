@@ -14,6 +14,7 @@ import struct
 import subprocess
 import threading
 import time
+import tempfile
 from typing import Any
 import zlib
 
@@ -72,7 +73,7 @@ def port() -> int:
         return listener.getsockname()[1]
 
 
-async def run(cli: str, directory: Path, ws_port: int) -> dict[str, object]:
+async def run(cli: str, directory: Path, ws_port: int, *, with_plugin: bool = False) -> dict[str, object]:
     directory.mkdir(parents=True, exist_ok=True)
     home, workspace = directory / "codex-home", directory / "repo"
     home.mkdir()
@@ -158,6 +159,18 @@ async def run(cli: str, directory: Path, ws_port: int) -> dict[str, object]:
                 "active_turn_steer": True, "interrupt_observed": True, "isolated_home": True,
                 "stale_interrupt_rejected": True,
                 "thread_id": thread, "directory": str(directory)}
+        if with_plugin:
+            from codex_control_plugin_scenario import exercise
+            Responses.hold.set()
+            plugin_png = image((200, 70, 40))
+            with tempfile.TemporaryDirectory(prefix="akashic-codex-plugin-") as temporary:
+                checks.update(await exercise(Path(temporary) / "fixture", client.url, thread, plugin_png, client))
+            payloads = [request for request in Responses.requests if "PLUGIN_LAYER_TEXT" in json.dumps(request)]
+            assert any(base64.b64decode(content["image_url"].split(",", 1)[1]) == plugin_png
+                       for request in payloads for item in request.get("input", []) if isinstance(item, dict)
+                       for content in item.get("content", []) if content.get("type") == "input_image")
+            alive = await client.call("thread/read", {"threadId": thread, "includeTurns": False})
+            checks["plugin_shutdown_does_not_stop_codex"] = alive["thread"]["id"] == thread
         return checks
     finally:
         Responses.hold.set()
@@ -179,5 +192,6 @@ if __name__ == "__main__":
     parser.add_argument("--codex-cli", required=True)
     parser.add_argument("--directory", required=True, type=Path, help="New disposable directory; Windows CLI needs a Windows-mounted path")
     parser.add_argument("--port", type=int, default=0)
+    parser.add_argument("--with-plugin", action="store_true", help="Also install and invoke the real Akashic plugin")
     args = parser.parse_args()
-    print(json.dumps(asyncio.run(run(args.codex_cli, args.directory, args.port or port())), ensure_ascii=False))
+    print(json.dumps(asyncio.run(run(args.codex_cli, args.directory, args.port or port(), with_plugin=args.with_plugin)), ensure_ascii=False))
