@@ -107,8 +107,15 @@ class ContextMaterialsV4(Protocol):
         reduce: SummaryReducer | None = None,
     ) -> Effect: ...
     def bind(
-        self, *, exclude_kinds: frozenset[MaterialKind] = frozenset()
+        self, *, exclude_kinds: frozenset[MaterialKind] = frozenset(),
     ) -> AbstractAsyncContextManager[MaterialView]: ...
+
+
+class GlobalPromptMaterials(Protocol):
+    """Only globally authorized system prompts; no recall, reminders or summary."""
+
+    def bind(self, *, exclude_kinds: frozenset[MaterialKind] = frozenset()
+             ) -> AbstractAsyncContextManager[MaterialView]: ...
 
 
 # 参考 Pi 的 reserveTokens：context_window 是输入上限，容量判断只为本次回复留有限余量，
@@ -122,5 +129,6 @@ def output_reserve(max_output_tokens: int, context_window: int) -> int:
 
 CONTEXT = ServiceKey[ContextBuilder]("context.v2")
 MATERIALS_V4 = ServiceKey[ContextMaterialsV4]("context.materials.v4")
+GLOBAL_PROMPT_MATERIALS = ServiceKey[GlobalPromptMaterials]("context.global-prompt-materials.v1")
 # UI.message_display 按 Message 内容 kind 拼接 message.display:<kind> 后借用 renderer。
 CONTEXT_NOTICE_DISPLAY = ServiceKey[Callable[[ContentPart], Mapping[str, object]]]("message.display:context.notice")
