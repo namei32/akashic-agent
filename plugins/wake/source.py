@@ -113,6 +113,15 @@ def _check_initiative_guard(reason: str | None) -> None:
     raise RuntimeError(f"Wake Drift 阶段未获准入: {reason}")
 
 
+def _drift_unshared(status: str, recorded_decision: object, terminal: Message | None) -> str:
+    """Only a real skip is reported as none; invalid model output stays distinct."""
+    if status == "failed" or (status == "invalidated" and retryable(terminal) is False):
+        return "failed"
+    if status == "await_change" and recorded_decision == "skip":
+        return "model_skip"
+    return "deferred"
+
+
 class Source:
     """Wake 拥有选择、通知和领域确认；普通 Message/Task/程序拥有实际执行。"""
 
@@ -462,6 +471,7 @@ class Source:
                 raise ValueError("Drift 领取成功却缺少领域回执")
         if proposal.decision == "decline":
             action = "defer" if selected.get("next_due") is not None else "await_change"
+            recorded_decision = "skip"
             await self._record(request, "skip", "来源明确拒绝本轮 Drift")
         else:
             try:
@@ -495,20 +505,23 @@ class Source:
             value = decision(reader, request, "drift")
             if isinstance(value, Share) and not value.items:
                 action = "ready_for_delivery"
+                recorded_decision = "share"
                 await self._record(request, "share", value.message)
             elif isinstance(value, Skip):
                 action = "await_change"
+                recorded_decision = "skip"
                 await self._record(request, "skip", value.reason)
             else:
                 action = ("invalidated" if retryable(finished(reader, request, "drift")) is False else
                           "defer" if selected.get("next_due") is not None else "await_change")
+                recorded_decision = "defer"
                 await self._record(request, "defer", "Drift 没有提交唯一有效决定")
         result = await domain.transition(_string(selected.get("selection_token"), "Drift token"), action)
         if result.get("changed") is not True:
             raise RuntimeError("原 Drift 领取没有提交预期变化")
         if action != "ready_for_delivery":
             await self._settled(request, reader)
-            return "deferred" if action == "defer" else "model_skip"
+            return _drift_unshared(action, recorded_decision, finished(reader, request, "drift"))
         return await self._finish_domain(task, request, reader, "drift")
 
     async def _finish_domain(
@@ -521,6 +534,10 @@ class Source:
             raise ValueError("Wake 完成缺少原领域领取")
         if selected.get("status") not in {"ready_for_delivery", "delivered", "settled"}:
             await self._settled(request, reader)
+            if request.owner == "drift":
+                run = await run_file_io(lambda: self.state.get_run(request.flow_id))
+                return _drift_unshared(str(selected.get("status")), None if run is None else run["decision"],
+                                       finished(reader, request, "drift"))
             return "failed" if selected.get("status") == "failed" else "deferred" if selected.get("status") == "deferred" else "model_skip"
         value = decision(reader, request, stage)
         if not isinstance(value, Share):

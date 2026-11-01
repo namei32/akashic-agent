@@ -61,6 +61,7 @@ async def run(folder: Path, extension=None, *, configure=None, chat_handler=None
             size = next((int(line.split(":", 1)[1]) for line in headers.split("\r\n")
                          if line.lower().startswith("content-length:")), 0)
             payload = json.loads(await reader.readexactly(size)) if size else {}
+            status = 200
             if "/embeddings" in first:
                 requests["embedding"] += 1
                 values = payload["input"]
@@ -76,7 +77,10 @@ async def run(folder: Path, extension=None, *, configure=None, chat_handler=None
                 result = {"data": [{"index": i, "embedding": vector(value)}
                                    for i, value in enumerate(values)], "usage": {"prompt_tokens": 1, "total_tokens": 1}}
             elif "/chat/completions" in first and chat_handler is not None and (custom := await chat_handler(payload)) is not None:
-                result = custom
+                if isinstance(custom, tuple):
+                    status, result = custom
+                else:
+                    result = custom
             elif "/chat/completions" in first:
                 prompt = payload["messages"][-1]["content"]
                 if "原始资料：" in prompt:
@@ -96,7 +100,8 @@ async def run(folder: Path, extension=None, *, configure=None, chat_handler=None
                 result["choices"][0]["message"]["content"] = "not a memory JSON object"
                 bad_reply = False
             body = json.dumps(result).encode()
-            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: " +
+            writer.write(f"HTTP/1.1 {status} {'OK' if status == 200 else 'Error'}\r\n".encode() +
+                         b"Content-Type: application/json\r\nConnection: close\r\nContent-Length: " +
                          str(len(body)).encode() + b"\r\n\r\n" + body)
             await writer.drain()
         finally:

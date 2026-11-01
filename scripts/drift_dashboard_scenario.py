@@ -12,7 +12,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from default_memory_scenario import run
-from drift_memory_wake_scenario import TARGET, configure as configure_wake
+from drift_memory_wake_scenario import TARGET, configure as configure_wake, wait_for_tool_clock
 
 
 def configure(sources: Path, workspace: Path) -> None:
@@ -77,6 +77,7 @@ async def exercise(host, append, workspace: Path, requests: dict) -> dict[str, o
         current = await request("GET")
         assert current["config"]["producer"]["memory_assisted"] is True
         assert current["config"]["producer"]["auto_propose"] is False
+        await wait_for_tool_clock()
         now = datetime.now(UTC)
         store = DriftStore(workspace / "plugin-data/drift-builtin/drift.sqlite3")
         assert store.propose("dashboard-delivery", "1", {"kind": "conversation", "memory_assisted": True,

@@ -20,6 +20,18 @@ from tests.support.delivery_sources import sources as delivery_sources
 
 TARGET = {"channel": "test", "recipient": "room", "session_id": "scenario:initiative"}
 
+
+async def wait_for_tool_clock() -> None:
+    # ADR-0100 deliberately treats timestamps before process startup as unknown.
+    # Some WSL hosts temporarily move wall time backwards by several seconds;
+    # wait past that startup boundary instead of changing recovery semantics.
+    from plugins.tools.contract import PROCESS_STARTED_AT
+    await asyncio.sleep(5)
+    async with asyncio.timeout(15):
+        while datetime.now(UTC) < PROCESS_STARTED_AT + timedelta(seconds=5):
+            await asyncio.sleep(.05)
+
+
 PROOF = '''
 from contextlib import asynccontextmanager
 from functools import partial
@@ -86,6 +98,13 @@ async def scenario(memory_source: Path | None) -> dict[str, object]:
         model_requests.append(payload)
         entered.set()
         await release.wait()
+        if decision[0] == "failure":
+            return 400, {"error": {"message": "content_filter: fixture rejection"}}
+        if decision[0] == "invalid":
+            return {"id": "wake-fixture", "object": "chat.completion", "model": "memory-fixture",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "No decision"},
+                                 "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20}}
         name = "share_content" if decision[0] == "share" else "skip_content"
         arguments = ({"message": "最近咖啡喝得怎么样？", "items": []} if decision[0] == "share"
                      else {"reason": "现在没有合适的话题"})
@@ -156,6 +175,7 @@ async def scenario(memory_source: Path | None) -> dict[str, object]:
         catalog = root.context.require(MESSAGE_CATALOG)
         before = catalog.reader(TARGET["session_id"]).snapshot()
         unrelated = catalog.reader("scenario:unrelated").snapshot()
+        await wait_for_tool_clock()
         prompt = await propose("revoke-during-model", 1)
         assert "coffee without sugar" in prompt
         await rpc("memory-consent", enabled=False, request_id="revoke", expected_version=1)
@@ -205,6 +225,39 @@ async def scenario(memory_source: Path | None) -> dict[str, object]:
         await wait_state("skip-opportunity", "await_change")
         assert catalog.reader(TARGET["session_id"]).snapshot() == after
         assert len(sent.read_text().splitlines()) == 1
+        decision[0] = "invalid"
+        await propose("invalid-decision", 3)
+        release.set()
+        await wait_state("invalid-decision", "await_change")
+        attempts = workspace / "plugin-data/wake-builtin/wake.sqlite3"
+        async with asyncio.timeout(10):
+            while True:
+                with sqlite3.connect(attempts) as db:
+                    invalid = db.execute("SELECT a.outcome FROM wake_attempts a JOIN wake_runs r ON a.attempt_id=r.run_id "
+                                         "WHERE r.decision_detail=? AND a.outcome!='checking'",
+                                         ("Drift 没有提交唯一有效决定",)).fetchone()
+                if invalid:
+                    break
+                await asyncio.sleep(.05)
+        assert invalid == ("deferred",), invalid
+        assert catalog.reader(TARGET["session_id"]).snapshot() == after
+        assert len(sent.read_text().splitlines()) == 1
+        decision[0] = "failure"
+        await propose("model-failure", 3)
+        release.set()
+        await wait_state("model-failure", "invalidated")
+        async with asyncio.timeout(10):
+            while True:
+                with sqlite3.connect(attempts) as db:
+                    failed = db.execute("SELECT a.outcome FROM wake_attempts a JOIN wake_runs r ON a.attempt_id=r.run_id "
+                                        "WHERE r.decision_detail=? AND a.outcome='failed'",
+                                        ("Drift 没有提交唯一有效决定",)).fetchone()
+                if failed:
+                    break
+                await asyncio.sleep(.05)
+        assert failed == ("failed",), failed
+        assert catalog.reader(TARGET["session_id"]).snapshot() == after
+        assert len(sent.read_text().splitlines()) == 1
         # An active EventMail context has no scope proof; it must defer this
         # opportunity instead of entering the model or pretending to skip.
         event_source = root.context.require(EVENTMAIL_CONTEXT_SOURCE).bind("scenario")
@@ -220,7 +273,7 @@ async def scenario(memory_source: Path | None) -> dict[str, object]:
             await wait_state("unscoped-context", "invalidated")
         finally:
             event_source.close()
-        assert len(model_requests) == count_before_resume + 1
+        assert len(model_requests) == count_before_resume + 3
         assert catalog.reader(TARGET["session_id"]).snapshot() == after
         with sqlite3.connect(workspace / "plugin-data/wake-builtin/wake.sqlite3") as db:
             reasons = db.execute("SELECT decision,decision_detail FROM wake_runs WHERE decision_detail LIKE ?",
@@ -229,10 +282,11 @@ async def scenario(memory_source: Path | None) -> dict[str, object]:
         with sqlite3.connect(workspace / "sessions.db") as db:
             admissions = db.execute("SELECT count(*) FROM owner_records WHERE owner=? AND key LIKE ?",
                                     ("plugin:wake", "memory-recall:%")).fetchone()[0]
-        assert admissions == 4, admissions
+        assert admissions == 6, admissions
         return {"scoped_prompt": True, "revoked_and_forgotten_do_not_publish": True,
                 "pause_resume_reuses_decision": True, "fresh_opportunity_delivered_once": True,
-                "skip_does_not_publish": True, "unscoped_event_defers": True,
+                "skip_does_not_publish": True, "invalid_decision_is_deferred": True,
+                "nonretryable_model_failure_reported": True, "unscoped_event_defers": True,
                 "durable_recall_admissions": admissions,
                 "original_rows_preserved": True}
 
