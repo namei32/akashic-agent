@@ -145,10 +145,10 @@ Default Memory owner 以 `default-memory.initiative.v1` 发布范围召回与短
 | 范围内召回 | request_id、真实 source_session_id、query、固定时间、条数与呈现预算 | 状态、实际呈现文本、按呈现顺序排列的 memory ID、每条内容指纹、来源引用和不可变召回引用 |
 | 有效性保护 | 召回引用、原来源、阶段/效果身份 | 检查原范围仍可读，所有实际呈现事实仍 active 且内容指纹一致；提供覆盖短提交边界的 owner 保护 |
 
-召回状态至少区分 ok、empty、degraded、scope_denied、unavailable 和 error。
-empty 是查询成功但没有合适事实，可以让模型只依据真实会话材料判断；
-模型服务可恢复故障产生的关键词结果标记 degraded，沿 MEM-006 处理。
-scope_denied、provider 缺失、数据库/模型空间损坏和取消不可冒充 empty。
+成功快照返回 ok、empty 或 degraded。empty 表示查询成功但没有合适事实，可以让
+模型只依据真实会话材料判断；模型服务可恢复故障产生的关键词结果标记 degraded。
+范围拒绝使用 PermissionError，provider 缺失和数据库、模型空间损坏分别作为不可用
+或错误处理，不冒充 empty；取消也不产生空结果。
 
 基础分支的内置 DEFAULT_MEMORY.recall 会把结果固定到 receipt；重复同一 key
 会返回旧结果，即使某项记忆后来变为 superseded。其 memory_ids 是检索命中集合，
