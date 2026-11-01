@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import partial
+from contextlib import nullcontext
 
 import asyncio
 from collections.abc import Mapping
@@ -22,6 +23,7 @@ from plugins.reply_program.contract import (
 )
 
 from .messages import HINTS, render
+from .initiative_memory import GLOBAL_PROMPT_REPLY, PromptUnavailable
 from .request import STAGE_TOOLS, Request, WakeFailure, read_phase
 
 
@@ -39,40 +41,49 @@ async def run(ctx: Context, task: Task, reader: MessageReader, request: Request)
         return {"source": "wake", "session_id": request.session_id}
 
     try:
-        return await ctx.require(REPLY_EXECUTE)(
-            ctx,
-            task,
-            reader,
-            "wake",
-            render_content=lambda part: render(
-                part,
-                fallback=lambda item: ctx.require(MODEL_CONTENT).render(item, artifacts={}),
-            ),
-            check_admission=partial(ctx.require(SOURCE_CHECK), task, reader, "wake", task.boundary_hint),
-            authorize=authorize,
-            tool_view=None,
-            fixed_bindings=fixed,
-            # 推理也占用输出预算，阶段不另设会截断工具决定的小上限。
-            max_output_tokens=0,
-            max_steps=(
-                3
-                if phase.stage == "screen"
-                else 1
-                if phase.stage == "alert"
-                else 20
-                if phase.stage == "investigate"
-                else 40
-            ),
-            terminal_tools=frozenset(
-                name for name in names if name in STAGE_TOOLS[phase.stage]
-            ),
-            exclude_material_kinds=(
-                frozenset({"recall", "profile"})
-                if phase.stage in {"investigate", "alert"}
-                else frozenset()
-            ),
-            prompt_hints=(HINTS[phase.stage],),
-        )
+        if phase.stage == "drift" and request.memory_assisted:
+            if GLOBAL_PROMPT_REPLY is None:
+                raise PromptUnavailable("范围受限的模型执行不可用")
+            selected = ctx.borrow(GLOBAL_PROMPT_REPLY)
+        else:
+            selected = nullcontext(ctx.require(REPLY_EXECUTE))
+        with selected as execute:
+            if execute is None:
+                raise PromptUnavailable("范围受限的模型执行不可用")
+            return await execute(
+                ctx,
+                task,
+                reader,
+                "wake",
+                render_content=lambda part: render(
+                    part,
+                    fallback=lambda item: ctx.require(MODEL_CONTENT).render(item, artifacts={}),
+                ),
+                check_admission=partial(ctx.require(SOURCE_CHECK), task, reader, "wake", task.boundary_hint),
+                authorize=authorize,
+                tool_view=None,
+                fixed_bindings=fixed,
+                # 推理也占用输出预算，阶段不另设会截断工具决定的小上限。
+                max_output_tokens=0,
+                max_steps=(
+                    3
+                    if phase.stage == "screen"
+                    else 1
+                    if phase.stage == "alert"
+                    else 20
+                    if phase.stage == "investigate"
+                    else 40
+                ),
+                terminal_tools=frozenset(
+                    name for name in names if name in STAGE_TOOLS[phase.stage]
+                ),
+                exclude_material_kinds=(
+                    frozenset({"recall", "profile"})
+                    if phase.stage in {"investigate", "alert"} or (phase.stage == "drift" and request.memory_assisted)
+                    else frozenset()
+                ),
+                prompt_hints=(HINTS[phase.stage],),
+            )
     except (RuntimeError, TimeoutError) as error:
         failure = ModelError.read(error)
         if failure is None:

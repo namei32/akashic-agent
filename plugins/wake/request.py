@@ -60,9 +60,17 @@ class Request(BaseModel):
     rules: str
     history: str
     events: tuple[dict[str, object], ...] = ()
+    memory_assisted: bool = False
+    memory_query: str = Field(default="", max_length=800)
+    memory_source_seq: int | None = Field(default=None, ge=-1)
+    memory_blocked: str = ""
 
     @model_validator(mode="after")
     def check_choices(self) -> Self:
+        if self.memory_assisted and self.owner != "drift":
+            raise ValueError("只有 Drift 职责可以使用主动记忆")
+        if not self.memory_assisted and (self.memory_query or self.memory_source_seq is not None or self.memory_blocked):
+            raise ValueError("普通 Wake 请求不能携带主动记忆材料")
         if (not set(TOOLS[self.owner]) <= set(self.tools)
                 or (self.owner != "content" and set(self.tools) != set(TOOLS[self.owner]))
                 or any(not name or not value for name, value in self.tools.items())):
