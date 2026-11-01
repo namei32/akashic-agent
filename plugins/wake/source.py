@@ -52,7 +52,7 @@ from .content import (
     _string,
 )
 from .messages import decision, finished, screened_candidates
-from .initiative_memory import INITIATIVE_MEMORY
+from .initiative_memory import INITIATIVE_MEMORY, PromptUnavailable
 from .request import (
     WAKE_PROGRAM,
     Phase,
@@ -468,27 +468,30 @@ class Source:
                 data: dict[str, object] = {"duty": dict(proposal.payload)}
                 if request.memory_assisted:
                     if request.memory_blocked or not request.memory_query:
-                        await self._record(request, "skip", "主动记忆材料不可用：" + (request.memory_blocked or "no_user_input"))
-                        result = await domain.transition(_string(selected.get("selection_token"), "Drift token"), "await_change")
+                        missing_input = request.memory_blocked == "no_user_input" or not request.memory_query and not request.memory_blocked
+                        await self._record(request, "skip" if missing_input else "defer",
+                                           "主动记忆材料不可用：" + (request.memory_blocked or "no_user_input"))
+                        result = await domain.transition(_string(selected.get("selection_token"), "Drift token"),
+                                                         "await_change" if missing_input else "invalidated")
                         if result.get("changed") is not True:
                             raise RuntimeError("缺少主动记忆材料时未能结束机会")
                         await self._settled(request, reader)
-                        return "model_skip"
+                        return "model_skip" if missing_input else "deferred"
                     data["memory"] = await self._memory_snapshot(request)
                 _ = await self._phase(
                     task, request, reader, "drift", data,
                     start_guard=(lambda: self._memory_guard(request)) if request.memory_assisted else
                                 (lambda: domain.send_start(request.accepted, request.target.model_dump())),
                 )
-            except (_InitiativePaused, _InitiativeUnavailable):
+            except (_InitiativePaused, _InitiativeUnavailable, PromptUnavailable):
                 return "deferred"  # Keep the original pointer for resume.
             except (_InitiativeExpired, _InitiativeRevoked, _InitiativeInvalid, PermissionError):
                 result = await domain.transition(_string(selected.get("selection_token"), "Drift token"), "invalidated")
                 if result.get("changed") is not True:
                     raise RuntimeError("过期 Drift 领取未能失效")
-                await self._record(request, "skip", "主动机会、授权或记忆材料已失效")
+                await self._record(request, "defer", "主动机会、授权或记忆材料已失效")
                 await self._settled(request, reader)
-                return "model_skip"
+                return "deferred"
             value = decision(reader, request, "drift")
             if isinstance(value, Share) and not value.items:
                 action = "ready_for_delivery"
@@ -559,7 +562,7 @@ class Source:
                 if result.get("changed") is not True:
                     raise RuntimeError("过期或授权改变的 Drift 发送领取未能失效")
                 await self._settled(request, reader)
-                return "model_skip"
+                return "deferred"
             await self._fail_notification(request, reader)
             return "failed"
         result = (await self.ctx.require(EVENTMAIL_DELIVERY).settle(token, request.notification_id)

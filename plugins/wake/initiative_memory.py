@@ -21,6 +21,9 @@ except ModuleNotFoundError as error:
         raise
     _memory_contract = None
 
+import plugins.reply_program.contract as _reply_contract
+from plugins.reply_program.contract import ReplyExecuteV4
+
 
 class InitiativeMemory(Protocol):
     async def admit(self, request_id: str, session_id: str, query: str, *,
@@ -34,6 +37,12 @@ class InitiativeMemory(Protocol):
 # identity is always declared by Default Memory's public contract, never here.
 INITIATIVE_MEMORY = cast(ServiceKey[InitiativeMemory] | None,
                          getattr(_memory_contract, "INITIATIVE_MEMORY", None))
+GLOBAL_PROMPT_REPLY = cast(ServiceKey[ReplyExecuteV4] | None,
+                           getattr(_reply_contract, "REPLY_EXECUTE_GLOBAL_PROMPT", None))
+
+
+class PromptUnavailable(Exception):
+    """The scope-safe model execution provider is not currently available."""
 
 
 def capture(catalog: MessageCatalog, content: Content, history: ScopedDeliveryHistory, *,

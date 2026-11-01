@@ -26,15 +26,24 @@ from functools import partial
 from agent.plugin_composition import ServiceKey
 from agent.plugin_composition.tasks import TASKS
 from plugins.channels.contract import private_target_key
+from plugins.context.contract import MATERIALS_V4
 from plugins.ledger.contract import BINDINGS, MESSAGE_CATALOG
 from plugins.standard_tools.shell import ShellOwners, shell_cleanup
 api_version = 3
 name = "scenario_private_target"
 version = "1.0.0"
-inject = (MESSAGE_CATALOG, BINDINGS, TASKS)
+inject = (MESSAGE_CATALOG, BINDINGS, TASKS, MATERIALS_V4)
 async def apply(ctx):
     await ctx.provide(ServiceKey("tools.cleanup.v1"), partial(
         shell_cleanup, ctx, ShellOwners(ctx), ctx.require(TASKS).open(ctx)))
+    async def global_prompt(snapshot, source):
+        return {"system_prompt": "TRUSTED_GLOBAL_POLICY", "reminders": (
+            {"name": "private", "text": "TRUSTED_OWNER_PRIVATE_DATA", "priority": 1},)}
+    async def unscoped(snapshot, source):
+        return {"reminders": ({"name": "other", "text": "UNSCOPED_CONTEXT_SECRET", "priority": 1},)}
+    materials = ctx.require(MATERIALS_V4)
+    await materials.register(ctx, name="trusted-global", kind="context", prepare=global_prompt, prompt=True)
+    await materials.register(ctx, name="unscoped-data", kind="context", prepare=unscoped)
     class Proof:
         @asynccontextmanager
         async def guard(self, recipient, session_id):
@@ -62,6 +71,8 @@ def configure(sources: Path, workspace: Path) -> None:
     (sources / "scenario_private_target/plugin.py").write_text(PROOF)
     save_config(workspace / "plugin-data/wake-builtin", {"enabled": True, "delivery": TARGET, "timezone": "UTC"})
     save_config(workspace / "plugin-data/drift-builtin", {"auto_propose": False})
+    save_config(workspace / "plugin-data/context-builtin", {
+        "prompt_sources": {"trusted-global": "scenario_private_target"}})
 
 
 async def scenario(memory_source: Path | None) -> dict[str, object]:
@@ -128,6 +139,8 @@ async def scenario(memory_source: Path | None) -> dict[str, object]:
             await asyncio.wait_for(entered.wait(), 20)
             prompt = json.dumps(model_requests[-1], ensure_ascii=False)
             assert "Unrelated secret watermelon" not in prompt
+            assert "TRUSTED_GLOBAL_POLICY" in prompt
+            assert "TRUSTED_OWNER_PRIVATE_DATA" not in prompt and "UNSCOPED_CONTEXT_SECRET" not in prompt
             return prompt
 
         async def wait_state(identity: str, expected: str):
