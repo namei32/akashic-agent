@@ -20,6 +20,7 @@ from plugins.delivery.contract import (
 from plugins.akasha.contract import SEMANTIC_INTEREST
 from plugins.ledger.contract import Input
 from plugins.gateway.contract import RpcMethod
+from .contract import WAKE_MEMORY_READY
 
 SETTINGS = ServiceKey[Configuration]("wake.settings.v1")
 
@@ -122,6 +123,11 @@ class Settings:
                 if method is None:
                     raise InitiativeUnavailable("Drift 主动联系能力不可用")
                 return cast(dict[str, object], await method.call(method.params.model_validate(params)))
+
+    async def memory_initiative_ready(self) -> bool:
+        async with self.ctx.runtime_scope():
+            with self.ctx.borrow(WAKE_MEMORY_READY) as ready:
+                return ready is not None
 
 
 async def mount(ctx: Context, model: type[BaseModel], function: FiberHandle) -> None:

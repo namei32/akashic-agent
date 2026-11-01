@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import json
 from typing import Literal, cast
 
 from fastapi import FastAPI, HTTPException, Query
@@ -27,6 +28,51 @@ def _view(context: DashboardContext) -> DashboardView:
     return view
 
 
+def _latest_initiative(view: DashboardView) -> dict[str, object] | None:
+    attempt = next((item for item in view.list_attempts(50) if item.get("owner") == "drift"), None)
+    if attempt is None:
+        return None
+    identity = attempt.get("attempt_id")
+    latest = {key: attempt.get(key) for key in ("outcome", "fired_at", "completed_at")}
+    latest.update(memory_status=None, delivery_status=None, reason=None)
+    if not isinstance(identity, str):
+        return latest
+    run = next((item for item in view.list_runs(50) if item.get("run_id") == identity), None)
+    detail = run.get("decision_detail") if run else None
+    if isinstance(detail, str):
+        if detail == "主动机会、授权或记忆材料已失效":
+            latest["reason"] = "invalidated"
+        elif detail.startswith("主动记忆材料不可用："):
+            code = detail.removeprefix("主动记忆材料不可用：")
+            if code in {"no_user_input", "unscoped_context", "source_unavailable", "scoped_history_unavailable"}:
+                latest["reason"] = code
+    try:
+        flow = view.flow(identity)
+    except RuntimeError:
+        latest["delivery_status"] = "unavailable"
+        return latest
+    if flow is None:
+        return latest
+    delivery = flow.get("delivery")
+    if isinstance(delivery, Mapping) and isinstance(delivery.get("status"), str):
+        latest["delivery_status"] = delivery["status"]
+    messages = flow.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if not isinstance(message, Mapping) or not isinstance(message.get("text"), str):
+                continue
+            try:
+                phase = json.loads(message["text"])
+            except ValueError:
+                continue
+            data = phase.get("data") if isinstance(phase, dict) and phase.get("stage") == "drift" else None
+            memory = data.get("memory") if isinstance(data, dict) else None
+            status = memory.get("status") if isinstance(memory, dict) else None
+            if isinstance(status, str) and status in {"ok", "empty", "degraded"}:
+                latest["memory_status"] = status
+    return latest
+
+
 def register(app: FastAPI, context: DashboardContext) -> None:
     """Register read-only routes owned by the live Wake runtime."""
     context.require(UI).register_configuration(app, context, SETTINGS, "/api/dashboard/wake/config")
@@ -46,10 +92,9 @@ def register(app: FastAPI, context: DashboardContext) -> None:
     async def initiative_status() -> dict[str, object]:
         settings = cast(Settings, context.require(SETTINGS))
         wake = await settings.read()
-        attempts = _view(context).list_attempts(1)
-        latest = None if not attempts else {key: attempts[0].get(key) for key in ("owner", "outcome", "fired_at", "completed_at")}
         return {"control": await initiative("status", {}), "consent": await initiative("memory-status", {}),
-                "config": await initiative("config", {}), "wake": wake, "latest": latest}
+                "config": await initiative("config", {}), "wake": wake,
+                "memory_ready": await settings.memory_initiative_ready(), "latest": _latest_initiative(_view(context))}
 
     @app.post("/api/dashboard/wake/initiative/{action}")
     async def initiative_control(action: Literal["pause", "resume", "memory-consent", "configure"],

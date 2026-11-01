@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
 import shutil
@@ -32,6 +33,8 @@ async def headers(host):
 
 async def exercise(host, append, workspace: Path, requests: dict) -> dict[str, object]:
     import httpx
+    from plugins.drift.contract import DRIFT_CHANGED
+    from plugins.drift.store import DriftStore
     from plugins.ledger.contract import MESSAGE_CATALOG
 
     await append(TARGET["session_id"], "dashboard-original", "I enjoy landscape photography.")
@@ -74,11 +77,26 @@ async def exercise(host, append, workspace: Path, requests: dict) -> dict[str, o
         current = await request("GET")
         assert current["config"]["producer"]["memory_assisted"] is True
         assert current["config"]["producer"]["auto_propose"] is False
+        now = datetime.now(UTC)
+        store = DriftStore(workspace / "plugin-data/drift-builtin/drift.sqlite3")
+        assert store.propose("dashboard-delivery", "1", {"kind": "conversation", "memory_assisted": True,
+            "consent_version": 1, "valid_until": (now + timedelta(minutes=5)).isoformat()},
+            now, initiative_target=TARGET)["inserted"] is True
+        host.live_root.context.emit(DRIFT_CHANGED, None)
+        async with asyncio.timeout(15):
+            while True:
+                latest = (await request("GET"))["latest"]
+                if latest is not None and latest["outcome"] == "shared":
+                    break
+                await asyncio.sleep(.05)
+        assert latest["memory_status"] == "empty" and latest["delivery_status"] == "delivered", latest
+        assert "landscape photography" not in json.dumps(latest), latest
         await request("POST", "/memory-consent", {"enabled": False, "request_id": "revoke", "expected_version": 1})
         assert (await request("GET"))["consent"]["enabled"] is False
-    assert catalog.reader(TARGET["session_id"]).snapshot() == before
+    assert all(message in catalog.reader(TARGET["session_id"]).snapshot() for message in before)
     return {"dashboard_requires_web_identity": True, "target_checked": True, "version_and_replay": True,
-            "pause_resume": True, "config_receipt": True, "revoke": True, "original_messages_preserved": True}
+            "pause_resume": True, "config_receipt": True, "redacted_delivery_diagnostics": True,
+            "revoke": True, "original_messages_preserved": True}
 
 
 def configure_without_drift(sources: Path, workspace: Path) -> None:
@@ -102,7 +120,16 @@ async def scenario(folder: Path) -> dict[str, object]:
     present, absent = folder / "present", folder / "absent"
     present.mkdir()
     absent.mkdir()
-    results = await run(present, extension=exercise, configure=configure, setup_only=True)
+    async def chat(payload):
+        if "share_content" not in json.dumps(payload.get("tools", [])):
+            return None
+        return {"id": "wake-fixture", "object": "chat.completion", "model": "memory-fixture",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": None,
+                    "tool_calls": [{"id": "dashboard-share", "type": "function", "function": {
+                        "name": "share_content", "arguments": json.dumps({"message": "最近拍照了吗？", "items": []})}}]},
+                    "finish_reason": "tool_calls"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20}}
+    results = await run(present, extension=exercise, configure=configure, chat_handler=chat, setup_only=True)
     return {**results, **await run(absent, extension=missing_drift, configure=configure_without_drift, setup_only=True)}
 
 
