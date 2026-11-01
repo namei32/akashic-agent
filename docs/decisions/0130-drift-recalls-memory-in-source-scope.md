@@ -1,6 +1,6 @@
 # 0130 · Drift 在来源会话范围内召回长期记忆
 
-- 状态：accepted / implementing；2026-10-31 用户授权实现、验证和部署。
+- 状态：accepted
 - 日期：2026-10-29
 - 关联：PRO-001～PRO-003、MEM-006、SES-005、SES-010、STA-001～STA-003。
 - 依据：[0040](0040-wake-duty-gate-lives-in-scoped-react.md)、

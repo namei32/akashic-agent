@@ -1,6 +1,6 @@
 # Drift 主动意图与工作执行
 
-状态：逐步实施。已接入默认关闭的定时交流机会、Wake 判断与真实送达链路；自主规划工作和执行工作尚未接入。
+状态：逐步实施。已接入默认关闭的定时交流、范围内记忆召回、Wake 判断与设置；自主规划工作和执行工作尚未接入。实际部署和授权以运行实例为准。
 
 ## 目标和边界
 
@@ -32,6 +32,7 @@ Drift 发布以下 Gateway 扩展方法：
 - `drift/initiative/pause`、`drift/initiative/resume`：要求 `request_id` 和 `expected_version`。
 - `drift/initiative/config`：读取生产者配置和当前配置输入版本 `input_ref`。
 - `drift/initiative/configure`：用 `request_id` 和 `expected_input` 提交完整配置，交由插件配置 owner 校验、发布和换代。
+- `drift/initiative/config-receipt`：按原请求 ID 查询定时配置的应用回执。
 - `drift/initiative/memory-status`：读取记忆主动联系授权及其版本。
 - `drift/initiative/memory-consent`：显式授权当前 Wake 精确目标或撤销授权；开启须有渠道 owner 的私人目标证明。
 
@@ -47,7 +48,7 @@ Drift 发布以下 Gateway 扩展方法：
 
 一个目标最多保留一条未过期的未完成机会。每个机会最晚在一个小时或当日窗口结束时过期，快照、领取和发送前都会检查；过期行保留作为记录，不阻塞新机会。Wake 用目标范围内最近的真实对话和已送达主动历史决定分享或跳过，并要求不编造用户事实或工作结果。模型决定和 Delivery 回执是不同事实，只有真实送达后才结算提案。
 
-例如，先调用 `drift/initiative/config` 取得 `input_ref`，再向 `drift/initiative/configure` 提交 `request_id`、`expected_input`（该 `input_ref`）以及 `auto_propose`、`interval_seconds`、`start_hour`、`end_hour`。配置更新采用插件配置 owner 的回执；当前没有单独的 Drift 设置页面。Wake 仍依赖其现有模型、发送渠道、EventMail 和 Akasha 兴趣能力。
+设置页提供目标授权、定时窗口、暂停和最近检查结果。程序调用也可先通过 `drift/initiative/config` 取得 `input_ref`，再向 `drift/initiative/configure` 提交版本与完整配置。Wake 仍依赖其现有模型、发送渠道、EventMail 和 Akasha 兴趣能力。
 
 ## 持久化和迁移
 
@@ -67,20 +68,19 @@ Drift 发布以下 Gateway 扩展方法：
 
 后续 `20261031_01_memory_consent` 从 v4 只增加默认关闭的授权和回执表，核对全部旧行；
 v1 仍由原 owner 升级到当前版本。旧版不识别 v5，回退须保留 v5 读取能力与授权意图。
-授权接口本层不启动记忆召回，也不改变旧定时机会行为。
+授权接口自身不启动记忆召回，也不改变旧定时机会行为。
 
 Wake 消费的 Drift 合同升级为 `drift.wake.v3`，以显式传递目标并保护阶段和发送准入；该合同变化需要重新启动使用它的插件组合。控制提交后的变化通知只唤醒重查，SQLite 仍是唯一事实来源。
 Wake 使用 `delivery.guarded-start.v2` 在恢复被暂停的发送时重新检查准入；其他消费者继续使用 v1。
 
 ## 后续接入
 
-1. 读取目标范围上下文，显式召回记忆；内部规划消息使用 drift 身份、internal、learning=excluded。
-2. 产生 none/chat/work 决定；只有交流或已完成工作结果进入 Wake 提案队列。
-3. 工作复用 Source/Reply，按明确授权限定工具与资源；工作完成和消息送达分别依据真实回执。
-4. 增加设置页面、检查原因和产物入口；停用 Drift 不影响 Wake 其他职责。
+1. 设计和实现 work 决定；只有已完成工作结果进入 Wake 提案队列。
+2. 工作复用 Source/Reply，按明确授权限定工具与资源；工作完成和消息送达分别依据真实回执。
+3. 为工作提供检查原因和产物入口；停用 Drift 不影响 Wake 其他职责。
 
 ## 验证
 
 `python scripts/drift_controls_scenario.py` 在临时 workspace 中使用实际旧版 owner 构造提案，经过真实 Yoyo runner、CompositionRoot、Gateway 方法和 SQLite 核对迁移、请求重放、控制竞争与重启。独立 Ledger 原消息逐列比较。`python scripts/drift_target_scenario.py` 检查目标隔离及跨代际暂停竞争和恢复。`python scripts/drift_producer_scenario.py` 以真实 Timer、Wake 和本地测试接收端验证机会、暂停期间没有目标会话消息或渠道发送、告警、恢复和过期，不连接正式渠道。
 
-静态检查包括 Python 类型、插件边界、迁移追加约束和 diff。隔离场景不代表后台工作、正式渠道发送或正式实例迁移已经完成。
+`scripts/drift_memory_wake_scenario.py` 和 `scripts/drift_dashboard_scenario.py` 另验证范围内召回、授权撤销、遗忘、模型决定和设置操作。静态检查包括 Python 类型、插件边界、迁移追加约束和 diff。隔离场景不代表后台工作、正式渠道发送或正式实例迁移已经完成。
