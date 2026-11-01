@@ -71,7 +71,7 @@ class Control:
 
     async def prepare(self, arguments: Mapping[str, object], source: CallSource | None = None) -> Mapping[str, object] | str:
         try:
-            args = Arguments.model_validate(dict(arguments))
+            args = Arguments.model_validate(json_value(arguments))
         except ValidationError as error:
             return str(error)
         if source is None or not source.messages:

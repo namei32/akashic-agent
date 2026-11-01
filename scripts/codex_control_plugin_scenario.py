@@ -125,10 +125,11 @@ async def exercise(folder: Path, endpoint: str, thread_id: str, png: bytes, obse
             writer.expire()
             snapshot = ctx.require(MESSAGE_CATALOG).reader(session).snapshot()
             assert snapshot[-1].message_id == message.message_id
+            stored_call = next(part for part in snapshot[-1].body.parts if isinstance(part, ToolCall))
             source = CallSource(CallRef(message.message_id, 0), snapshot)
             async with bindings.open(binding, TOOLS) as (current, metadata):
                 async with current.open(metadata) as tool:
-                    prepared = await tool.prepare(arguments, source)
+                    prepared = await tool.prepare(stored_call.arguments, source)
                     if isinstance(prepared, str):
                         return prepared, None
                     result = await tool.invoke(source.effect_key, prepared)
