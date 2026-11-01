@@ -55,3 +55,4 @@ class ReplyExecuteV4(Protocol):
 
 
 REPLY_EXECUTE_V4 = ServiceKey[ReplyExecuteV4]("reply.execute.v4")
+REPLY_EXECUTE_GLOBAL_PROMPT = ServiceKey[ReplyExecuteV4]("reply.execute.global-prompt.v1")

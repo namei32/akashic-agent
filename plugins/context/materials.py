@@ -44,9 +44,11 @@ class _Source:
 class MaterialView:
     """固定本次请求的贡献者；只收集材料，不调用模型或修改消息。"""
 
-    def __init__(self, ctx: Context, sources: tuple[tuple[str, _Source], ...]):
+    def __init__(self, ctx: Context, sources: tuple[tuple[str, _Source], ...], *,
+                 global_prompt_only: bool = False):
         self._ctx = ctx
         self._sources = sources
+        self._global_prompt_only = global_prompt_only
         self._active = True
 
     def close(self) -> None:
@@ -100,6 +102,8 @@ class MaterialView:
                 if not owner.prompt:
                     raise PermissionError("此材料 owner 没有 Prompt 贡献权")
                 prompts.append((owner.priority, owner.plugin_id.encode("utf-8"), name.encode("utf-8"), material.system_prompt))
+            if self._global_prompt_only:
+                continue
             collect(owner.plugin_id, material.reminders)
             if material.summary is not None:
                 if not owner.summary:
@@ -127,6 +131,8 @@ class MaterialView:
     ) -> SummaryData | None:
         """只有同一个摘要 owner 能缩减；其余已取得材料保持原样。"""
         self._check_active()
+        if self._global_prompt_only:
+            return None
         current = decode_material(materials)
         for _, owner in self._sources:
             if owner.reduce is not None:
@@ -218,8 +224,13 @@ class ContextMaterials:
         """材料目录的实际注册者随同服务归档；来源仍在 bind 时选择排除项。"""
         return tuple(source.context for source in self._sources.values())
 
+    def global_prompt_contributors(self) -> tuple[Context, ...]:
+        return tuple(source.context for source in self._sources.values()
+                     if source.kind == "context" and source.prompt)
+
     @asynccontextmanager
-    async def bind(self, *, exclude_kinds: frozenset[MaterialKind] = frozenset()) -> AsyncIterator[MaterialView]:
+    async def bind(self, *, exclude_kinds: frozenset[MaterialKind] = frozenset(),
+                   global_prompt_only: bool = False) -> AsyncIterator[MaterialView]:
         """固定 ACTIVE 材料并持有 provider 与贡献者的局部 scope。"""
         if not exclude_kinds <= {"context", "recall", "profile"}:
             raise ValueError("材料用途选择不能包含未知用途")
@@ -230,13 +241,14 @@ class ContextMaterials:
                 name: source
                 for name, source in active.items()
                 if source.kind not in exclude_kinds
+                and (not global_prompt_only or (source.kind == "context" and source.prompt))
             }
-            if self._recall_source is not None and "recall" not in exclude_kinds:
+            if self._recall_source is not None and "recall" not in exclude_kinds and not global_prompt_only:
                 name, plugin_id = self._recall_source
                 selected = sources.get(name)
                 if selected is None or selected.kind != "recall" or selected.plugin_id != plugin_id:
                     raise ValueError(f"所选长期记忆尚未就绪: {plugin_id}；请恢复提供者或显式切换记忆配置")
-            if self._summary_source is not None:
+            if self._summary_source is not None and not global_prompt_only:
                 name, plugin_id = self._summary_source
                 source = sources.get(name)
                 if source is None or not source.summary or source.plugin_id != plugin_id:
@@ -252,7 +264,7 @@ class ContextMaterials:
             async with AsyncExitStack() as scopes:
                 for context in contributors:
                     await scopes.enter_async_context(context.runtime_scope())
-                view = MaterialView(self._ctx, selected)
+                view = MaterialView(self._ctx, selected, global_prompt_only=global_prompt_only)
                 try:
                     yield view
                 finally:
