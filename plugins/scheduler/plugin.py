@@ -68,7 +68,8 @@ _MODE_PROMPT = (
 
 class Config(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    max_steps: int = Field(default=40, gt=0)
+    # 0 表示不限总步数；正数仍按既有预算与续额协议执行。
+    max_steps: int = Field(default=0, ge=0)
     max_output_tokens: int | None = Field(default=None, gt=0)
 
 
