@@ -28,18 +28,32 @@ if (util.split(storage).length !== 2) {
 await writeFile(utilPath, util.replace(storage,
   'const urlForKey = window.__SELKIES_STORAGE_URL__ || window.location.origin + window.location.pathname;'));
 
-// Ctrl+V 必须等待分块文字发送完毕，不能只等待 postMessage 入队。
-const clipboard = 'sendExplicitClipboard(message.text);';
+// 每个有效的面板请求都有回执，包括只读拒绝；回执只证明发送结束，不是远端落地确认。
+const clipboard = `    case 'clipboardUpdateFromUI':
+      console.log('Received clipboardUpdateFromUI message.');
+      if (isSharedMode) {
+        console.log("Shared mode: Clipboard write to server blocked.");
+        break;
+      }
+      sendExplicitClipboard(message.text);
+      break;`;
 const current = await readFile(path, "utf8");
 if (current.split(clipboard).length !== 2) {
   throw new Error("Selkies 2.0.0 clipboard entry changed; check the integration patch");
 }
-await writeFile(path, current.replace(clipboard, `
-      let clipboardError = "";
-      sendExplicitClipboard(message.text, undefined, (reason, code) => {
-        if (code !== "clipboardSkipUnchanged") clipboardError = reason;
-      }).then(() => window.parent.postMessage({
-        type: "computerClipboardSent", id: message.requestId, error: clipboardError
-      }, window.location.origin)).catch(error => window.parent.postMessage({
-        type: "computerClipboardSent", id: message.requestId, error: String(error)
-      }, window.location.origin));`));
+await writeFile(path, current.replace(clipboard, `    case 'clipboardUpdateFromUI': {
+      if (event.source !== window.parent || !Number.isSafeInteger(message.requestId)
+          || typeof message.text !== 'string') break;
+      const reply = error => window.parent.postMessage({
+        type: 'computerClipboardSent', id: message.requestId, error
+      }, window.location.origin);
+      if (isSharedMode) {
+        reply('Computer 当前是只读连接，无法写入剪贴板');
+        break;
+      }
+      let clipboardError = '';
+      Promise.resolve().then(() => sendExplicitClipboard(message.text, undefined, (reason, code) => {
+        if (code !== 'clipboardSkipUnchanged') clipboardError = reason;
+      })).then(() => reply(clipboardError), () => reply('Computer 剪贴板发送失败'));
+      break;
+    }`));
