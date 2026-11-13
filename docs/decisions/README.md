@@ -175,3 +175,5 @@
 - [0137 · Akasha 原地增量发布](0137-akasha-publishes-in-place-increments.md)：上游 accepted / implemented for review；同步移植，图与消费进度仍在同一事务发布。
 
 - [0138 · Akasha 单线程 dense](0138-akasha-dense-is-single-threaded.md)：上游 accepted / implemented for review；固定数值环境并登记有恢复点的历史重放。
+
+- [0141 · Akasha 索引召回](0141-akasha-recall-injects-an-index.md)：上游 accepted / implemented for review；按窗口去重，原文通过受范围约束的 fetch_messages 读取。
