@@ -713,14 +713,14 @@ async def run(ctx: Context, interest: Interest) -> None:
         """消费迁移登记的一次性重放请求；只有成功后才移除凭据。"""
 
         pending = tuple(path for path in rebuild_request_paths if path.exists())
+        if not pending:
+            return
         # 重放是安装期动作，必须留下可读证据：容器日志级别可能看不到插件 logger。
         _note_replay({
             "phase": "scan",
             "checked": [str(path) for path in rebuild_request_paths],
             "pending": [str(path) for path in pending],
         })
-        if not pending:
-            return
         logger.info("Akasha 发现一次性重放请求: %s", [str(path) for path in pending])
         try:
             _note_replay({"phase": "rebuilding", "pending": [str(path) for path in pending]})

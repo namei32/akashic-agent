@@ -69,9 +69,32 @@ async def verify(host, append, workspace: Path, requests) -> dict[str, bool]:
     repeated = await reindex("confirm fill_missing")
     assert repeated["embedded_messages"] == 0 and requests["embedding"] == calls
     assert logical_state_sha256(graph) == before and snapshot(workspace) == rows
+    await host.terminate_all()
+    from agent.plugin_composition.config_input import save_config
+    from agent.plugins.manager import PluginManager
+    save_config(workspace / "plugin-data/akasha-builtin", {
+        "memory_enabled": True, "replay_fill_missing_embeddings": True})
+    request = workspace / "memory/.akasha-replay-request.json"
+    request.write_text(json.dumps({"schema_version": 1, "reason": "scenario-explicit-full-replay"}))
+    restarted = PluginManager([workspace.parent / "sources"], workspace=workspace,
+                              installed_cache_root=workspace.parent / "home/cache")
+    try:
+        await restarted.load_all()
+        current = restarted.live_root
+        assert current is not None
+        async with current.context.require(MATERIALS_V4).bind() as view:
+            await view.prepare((), "conversation")
+        await asyncio.sleep(.1)
+        receipt = json.loads((workspace / "memory/.akasha-replay-status.json").read_text())
+        assert receipt["phase"] == "completed" and not request.exists()
+        assert json.loads(receipt["detail"])["turns"] == 3
+        assert requests["embedding"] == calls and snapshot(workspace) == rows
+    finally:
+        await restarted.terminate_all()
     return {"historical_messages_precede_model": True, "ordinary_rebuild_skips_missing": True,
             "explicit_backfill_learns_all": True, "fixed_vectors_preserved": True,
-            "repeat_has_no_model_calls": True, "source_rows_unchanged": True}
+            "repeat_has_no_model_calls": True, "source_rows_unchanged": True,
+            "startup_replay_receipt_persists": True}
 
 
 if __name__ == "__main__":
