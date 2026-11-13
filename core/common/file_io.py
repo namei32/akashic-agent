@@ -6,7 +6,7 @@ import asyncio
 from contextvars import copy_context
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TypeVar
+from typing import TypeVar, cast
 
 T = TypeVar("T")
 
@@ -54,5 +54,29 @@ async def run_file_io(fn: Callable[[], T]) -> T:
         state.users -= 1
         if state.users == 0:
             del _FILE_IO_SLOTS[loop]
+
+
+async def shield_until_done(
+    work: asyncio.Future[T] | asyncio.Task[T],
+    *,
+    ignore_task_cancel: bool = False,
+) -> T:
+    """屏蔽外层重复取消直到任务物理完成，随后恢复调用方的 CancelledError。"""
+    cancelled = False
+    settled = asyncio.gather(work, return_exceptions=True)
+    while not work.done():
+        try:
+            await asyncio.shield(settled)
+        except asyncio.CancelledError:
+            cancelled = True
+    try:
+        result = work.result()
+    except asyncio.CancelledError:
+        if not ignore_task_cancel:
+            raise
+        result = cast(T, None)
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
 
 

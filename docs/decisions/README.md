@@ -173,3 +173,5 @@
 - [0132 · 长任务步数上限由显式配置决定](0132-step-limits-are-explicit.md)：accepted；回复、调度与子任务默认不限步数，保留正数上限与续额协议；SES-013。
 
 - [0137 · Akasha 原地增量发布](0137-akasha-publishes-in-place-increments.md)：上游 accepted / implemented for review；同步移植，图与消费进度仍在同一事务发布。
+
+- [0138 · Akasha 单线程 dense](0138-akasha-dense-is-single-threaded.md)：上游 accepted / implemented for review；固定数值环境并登记有恢复点的历史重放。
