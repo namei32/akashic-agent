@@ -1,19 +1,39 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime
+import heapq
+import threading
+from typing import Literal
 
 import numpy as np
 
-from plugins.ledger.contract import MessageCatalog, MessageEmbeddings
-from plugins.ledger.contract import Input, Output
+from plugins.ledger.contract import EmbeddingRecords, MessageCatalog, MessageEmbeddings
+from plugins.ledger.contract import Input, Message, Output
 from plugins.akasha.contract import SEMANTIC_INTEREST as SEMANTIC_INTEREST
 
 from .application.consumer import run_memory_job
 from .learning import Learning, LearningConfig
-from .projection import Sample, input_features
+from .projection import CausalKey, Sample, SessionCursor, input_features
 
 type Embed = Callable[[list[str]], Awaitable[list[list[float]]]]
+
+# 兴趣只取 cutoff 前最新的这么多个原型；增量缓存多留一倍，cutoff 过滤后不足且曾截断时整段重算。
+PROTOTYPES = 256
+_KEEP = 2 * PROTOTYPES
+
+
+@dataclass(slots=True)
+class _Prototypes:
+    """同一学习空间与前缀 revision 下的投影续读点、已算原型，以及向量尚未写入、下次重试的样本。"""
+
+    rule: tuple[str, int, tuple[str, ...]]
+    revision: int
+    cursors: dict[str, SessionCursor]
+    items: list[tuple[CausalKey, np.ndarray]]
+    pending: list[Sample]
+    truncated: bool = False
 
 
 class SemanticInterest:
@@ -28,6 +48,9 @@ class SemanticInterest:
         self._select = select
         self._fill_missing = fill_missing
         self._member = member
+        # 每批新 Content 都要评分；按 Session 续读只投影新增闭段，不再每次整段解码全部历史。
+        self._cache: _Prototypes | None = None
+        self._cache_lock = threading.Lock()
 
     async def score(self, texts: Sequence[str], *, cutoff: str) -> tuple[float, ...]:
         """沿用 0.9 输入加 0.1 回复的最大余弦四次方，只采用 cutoff 前的证据。"""
@@ -67,55 +90,143 @@ class SemanticInterest:
                 scores[index] = min(0.999, max(0.0, similarity) ** 4)
         return tuple(scores)
 
-    def _missing(self, rule: LearningConfig, through: datetime):
-        """Support-only mode keeps new Wake evidence without writing a graph."""
+    def _missing(self, rule: LearningConfig, through: datetime) -> tuple[Message, ...]:
+        """支持模式只补最新合资格样本的向量，不持有无关工具全文或启动学习图。"""
+        heads = {session: head for session, head in self._catalog.snapshot_heads().items() if self._member(session)}
+        kept: list[tuple[CausalKey, tuple[Message, ...]]] = []
+        for _, samples, _ in self._learning.iter_samples_since(
+            self._catalog, rule, heads=heads, cursors={}, keep=_complete,
+        ):
+            for sample in samples:
+                if sample.key[0] > through or not self._learning.text(sample.ending).strip():
+                    continue
+                users = tuple(message for message in sample.messages
+                              if isinstance(message.body, Input) and self._learning.text(message).strip())
+                item = (sample.key, (*users, sample.ending) if users else ())
+                if len(kept) < PROTOTYPES:
+                    heapq.heappush(kept, item)
+                elif item[0] > kept[0][0]:
+                    heapq.heapreplace(kept, item)
         records = self._embeddings.bind(self._learning.text)
-        samples = self._learning.samples(self._catalog, rule, heads=self._catalog.snapshot_heads())
-        eligible = [sample for sample in samples
-                    if sample.ending.recorded_at <= through
-                    and self._member(sample.ending.session_id)
-                    and isinstance(sample.ending.body, Output)
-                    and sample.ending.body.finish == "complete"
-                    and self._learning.text(sample.ending).strip()][-256:]
-        messages = {}
-        for sample in eligible:
-            users = [message for message in sample.messages
-                     if isinstance(message.body, Input) and self._learning.text(message).strip()]
-            if not users:
-                continue
-            for message in (*users, sample.ending):
-                if records.read(message, model=rule.embedding_model, dimension=rule.dimension) is None:
-                    messages[message.message_id] = message
-        return tuple(messages.values())
+        messages = {message.message_id: message for _, members in sorted(kept) for message in members}
+        return tuple(message for message in messages.values()
+                     if records.read(message, model=rule.embedding_model, dimension=rule.dimension) is None)
 
     def _prototypes(self, rule: LearningConfig, through: datetime) -> list[np.ndarray]:
         """Read the fixed historical inputs off the host event loop."""
+        with self._cache_lock:
+            # 1. 固定消息上界；前缀被改写或学习空间变化时丢弃缓存，从头投影。
+            heads = {session: head for session, head in self._catalog.snapshot_heads().items() if self._member(session)}
+            revision = self._catalog.prefix_revision()
+            identity = (rule.embedding_model, rule.dimension, tuple(rule.sources))
+            cache = self._cache
+            if cache is None or revision is None or cache.rule != identity or cache.revision != revision:
+                cache = _Prototypes(identity, -1 if revision is None else revision, {}, [], [])
+            # 2. 删除的 Session 不再提供证据；有界堆只留最新 _KEEP 个原型，溢出即记为截断。
+            kept = _Newest(_KEEP, [item for item in cache.items if item[0][1] in heads])
+            records = self._embeddings.bind(self._learning.text)
+            pending: list[Sample] = []
+            cursors: dict[str, SessionCursor] = {}
+
+            def admit(sample: Sample) -> None:
+                if sample.ending.session_id not in heads:
+                    return
+                # cutoff 之后的样本不读向量，留到 cutoff 推进后再算，与原算法同样不受其向量影响。
+                if sample.key[0] > through:
+                    pending.append(_compact(sample))
+                    return
+                prototype = self._prototype(sample, rule, records)
+                if not isinstance(prototype, str):
+                    kept.push(sample.key, prototype)
+                elif prototype == "missing":
+                    pending.append(_compact(sample))
+            for sample in cache.pending:
+                admit(sample)
+            # 3. 学习准入继续由 Akasha 独占；逐 Session 投影续读点之后的闭段并当场归约，冷启动不再整段常驻全部历史。
+            for session, samples, cursor in self._learning.iter_samples_since(
+                self._catalog, rule, heads=heads, cursors=cache.cursors, keep=_complete,
+            ):
+                cursors[session] = cursor
+                for sample in samples:
+                    admit(sample)
+            cache.items, cache.pending, cache.cursors = kept.sorted(), pending, cursors
+            cache.truncated = cache.truncated or kept.dropped
+            if revision is not None:
+                self._cache = cache
+            selected = [vector for key, vector in cache.items if key[0] <= through]
+            if len(selected) < PROTOTYPES and cache.truncated:
+                self._cache = None
+                return self._full(rule, through, heads)
+            return selected[-PROTOTYPES:]
+
+    # 缓存被截断而 cutoff 早于保留窗口时，按原算法整段重算一次，不写缓存；同样逐 Session 归约。
+    def _full(self, rule: LearningConfig, through: datetime, heads: Mapping[str, int]) -> list[np.ndarray]:
         records = self._embeddings.bind(self._learning.text)
-        prototypes: list[np.ndarray] = []
-        # 1. 固定消息上界；学习准入继续由 Akasha 独占，内部和未完成工作没有样本。
-        heads = self._catalog.snapshot_heads()
-        samples: list[Sample] = []
-        for session_id, head in heads.items():
-            samples.extend(self._learning.samples(self._catalog, rule, heads={session_id: head}))
-        samples.sort(key=lambda sample: sample.key)
-        for sample in samples:
-            ending = sample.ending
-            if ending.recorded_at > through or not isinstance(ending.body, Output) or ending.body.finish != "complete":
-                continue
-            users = [message for message in sample.messages
-                     if isinstance(message.body, Input) and self._learning.text(message).strip()]
-            if not users or not self._learning.text(ending).strip():
-                continue
-            vectors = [records.read(message, model=rule.embedding_model, dimension=rule.dimension)
-                       for message in (*users, ending)]
-            if any(vector is None for vector in vectors):
-                continue
-            _, user = input_features(users, text=self._learning.text, embeddings=records,
-                                     embedding_model=rule.embedding_model, dimension=rule.dimension)
-            if user is None:
-                continue
-            combined = 0.9 * user + 0.1 * np.asarray(vectors[-1], dtype=np.float32)
-            norm = float(np.linalg.norm(combined))
-            if norm > 0:
-                prototypes.append(combined / norm)
-        return prototypes[-256:]
+        kept = _Newest(PROTOTYPES, [])
+        for _, samples, _ in self._learning.iter_samples_since(
+            self._catalog, rule, heads=heads, cursors={}, keep=_complete,
+        ):
+            for sample in samples:
+                if sample.key[0] > through:
+                    continue
+                prototype = self._prototype(sample, rule, records)
+                if not isinstance(prototype, str):
+                    kept.push(sample.key, prototype)
+        return [vector for _, vector in kept.sorted()]
+
+    # 0.9 输入加 0.1 回复的归一化原型；"skip" 表示样本永远不提供证据，"missing" 表示固定向量尚未写入。
+    def _prototype(
+        self, sample: Sample, rule: LearningConfig, records: EmbeddingRecords,
+    ) -> np.ndarray | Literal["skip", "missing"]:
+        ending = sample.ending
+        users = [message for message in sample.messages
+                 if isinstance(message.body, Input) and self._learning.text(message).strip()]
+        if not users or not self._learning.text(ending).strip():
+            return "skip"
+        vectors = [records.read(message, model=rule.embedding_model, dimension=rule.dimension)
+                   for message in (*users, ending)]
+        if any(vector is None for vector in vectors):
+            return "missing"
+        _, user = input_features(users, text=self._learning.text, embeddings=records,
+                                 embedding_model=rule.embedding_model, dimension=rule.dimension)
+        if user is None:
+            return "skip"
+        combined = 0.9 * user + 0.1 * np.asarray(vectors[-1], dtype=np.float32)
+        norm = float(np.linalg.norm(combined))
+        return combined / norm if norm > 0 else "skip"
+
+
+# 按因果键只留最新 limit 个原型的最小堆；键含 Session 与 seq，互不相等，向量不参与比较。
+class _Newest:
+    def __init__(self, limit: int, items: list[tuple[CausalKey, np.ndarray]]) -> None:
+        self._limit = limit
+        self._heap = items
+        heapq.heapify(self._heap)
+        self.dropped = False
+        while len(self._heap) > limit:
+            _ = heapq.heappop(self._heap)
+            self.dropped = True
+
+    def push(self, key: CausalKey, vector: np.ndarray) -> None:
+        if len(self._heap) < self._limit:
+            heapq.heappush(self._heap, (key, vector))
+            return
+        self.dropped = True
+        if key > self._heap[0][0]:
+            _ = heapq.heapreplace(self._heap, (key, vector))
+
+    def sorted(self) -> list[tuple[CausalKey, np.ndarray]]:
+        return sorted(self._heap, key=lambda item: item[0])
+
+
+# 只有完整回复的闭段可能成为原型；其余样本不让正文常驻。
+def _complete(sample: Sample) -> bool:
+    ending = sample.ending
+    return isinstance(ending.body, Output) and ending.body.finish == "complete"
+
+
+# 等待向量或晚于 cutoff 的样本只留计算原型要读的输入与回复，不持有工具输出等成员正文。
+def _compact(sample: Sample) -> Sample:
+    kept = tuple(message for message in sample.messages
+                 if isinstance(message.body, Input) or message == sample.ending)
+    return Sample(ending=sample.ending, messages=kept, observations=())

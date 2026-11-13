@@ -15,7 +15,7 @@ from typing import Literal, Self, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from agent.plugin_composition import RUNTIME_STARTED, RUNTIME_STOPPING, Context, ServiceKey
+from agent.plugin_composition import RUNTIME_STARTED, RUNTIME_STOPPING, CompositionError, Context, ServiceKey
 from plugins.akasha.contract import EMBEDDING_MEMORY_PLUGIN, MEMORY_SCOPES
 from plugins.models.contract import EMBEDDINGS
 from plugins.ui.contract import (
@@ -615,6 +615,7 @@ async def run(ctx: Context, interest: Interest) -> None:
                     ensure_graph_directory(memory_path, key), catalog=ctx.require(MESSAGE_CATALOG),
                     embeddings=ctx.require(MESSAGE_EMBEDDINGS), bindings=ctx.require(BINDINGS),
                     config=settings.memory_config(), cutover=key == DEFAULT_GRAPH,
+                    term_cache=ctx.data_root / "terms-cache.db",
                     restore_embeddings=restore_embeddings,
                 )
             except (EmbeddingSpaceMismatchError, MemoryRebuildRequiredError) as error:
@@ -815,7 +816,12 @@ class Interest:
             return "Akasha 已关闭" if self.enabled is False else "请先决定是否开启 Akasha"
         if self.readiness is None:
             return "Akasha 前置能力不可用"
-        return self.readiness()
+        try:
+            return self.readiness()
+        except CompositionError as error:
+            if error.code != "OWNER_UNAVAILABLE":
+                raise
+            return "Akasha 正在启动"
 
     async def score(self, texts: Sequence[str], *, cutoff: str) -> tuple[float, ...]:
         reason = self.status()
