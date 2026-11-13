@@ -59,11 +59,11 @@ from .application.rebuild import manifest_json, rebuild_from_catalog
 from .application.snapshot import read_memory
 from .config import AkashaConfig, resolve_memory_path
 from .domain.model import EmbeddingSpaceMismatchError, MemoryRebuildRequiredError
-from .infrastructure.consumption import load_message_nodes
+from .infrastructure.consumption import load_message_nodes, load_message_sessions
 from .inspector import RecallInspector
 from .interest import SEMANTIC_INTEREST, Embed, SemanticInterest
 from .learning import AKASHA_LEARNING, Learning, LearningConfig
-from .recall_tool import RecallArguments, RecallTool, check_recall
+from .recall_tool import FetchArguments, FetchTool, RecallArguments, RecallTool, check_fetch, check_recall
 from .recalls import RecallRecords, RecallRecordsRead
 from .contract import AKASHA_RECORDS_VIEW
 from .runtime import MessageMemory, prepare_materials
@@ -181,7 +181,7 @@ async def run(ctx: Context, interest: Interest) -> None:
     _ = await ctx.provide(AKASHA_LEARNING, learning)
     _ = await content.register(ctx, {
         "name": "akasha",
-        "content": {"akasha.feedback": check_feedback, "akasha.recall": check_recall},
+        "content": {"akasha.feedback": check_feedback, "akasha.recall": check_recall, "akasha.fetch": check_fetch},
     })
     # 同一 Root 只允许一个 embedding 记忆系统；一个 Akasha 实例管理全部图。
     memories: dict[str, MessageMemory] = {}
@@ -433,7 +433,8 @@ async def run(ctx: Context, interest: Interest) -> None:
             "reminders": (reminder,),
         }
 
-    async def prepare(snapshot: tuple[Message, ...], source: str) -> MaterialData:
+    async def prepare(snapshot: tuple[Message, ...], source: str,
+                      visible_snapshot: tuple[Message, ...] | None = None) -> MaterialData:
         key = policies.route(snapshot[0].session_id).read if snapshot else DEFAULT_GRAPH
         # An explicit policy denial precedes graph startup, embeddings, and receipts.
         if key is None:
@@ -443,7 +444,7 @@ async def run(ctx: Context, interest: Interest) -> None:
                 if not await start_memory(key):
                     return unavailable(key)
                 try:
-                    return await memories[key].prepare(snapshot, source)
+                    return await memories[key].prepare(snapshot, source, visible_snapshot=visible_snapshot)
                 except (EmbeddingSpaceMismatchError, MemoryRebuildRequiredError) as error:
                     set_graph_error(key, str(error))
                     return unavailable(key)
@@ -475,6 +476,7 @@ async def run(ctx: Context, interest: Interest) -> None:
                         bindings=bindings, learning_binding=identity, learning=selected, rule=rule,
                         records=query_records, embed_batch=embedder(rule, model_id),
                         limit=settings.context_recall_limit, max_chars=settings.inject_max_chars,
+                        visible_snapshot=visible_snapshot,
                     )
         except (EmbeddingSpaceMismatchError, MemoryRebuildRequiredError) as error:
             set_graph_error(key, str(error))
@@ -487,7 +489,8 @@ async def run(ctx: Context, interest: Interest) -> None:
         set_graph_error(key, None)
         return result
 
-    _ = await ctx.require(MATERIALS).register(ctx, kind="recall", name="akasha", prepare=prepare, priority=400)
+    _ = await ctx.require(MATERIALS).register(ctx, kind="recall", name="akasha", prepare=prepare,
+                                            prepare_visible=prepare, priority=400)
 
     # 1. Feedback 读取已发布目标；归档调用不依赖正式运行事件或内存指针。
     actions: tuple[Literal["remember", "forget"], ...] = ("remember", "forget")
@@ -528,6 +531,20 @@ async def run(ctx: Context, interest: Interest) -> None:
         return RecallBinding(embedding_binding=identity, unavailable=None).model_dump()
 
     @asynccontextmanager
+    async def live_graph(session_id: str | None, space: tuple[str, int]):
+        key = DEFAULT_GRAPH if session_id is None else policies.route(session_id).read
+        if not running or not graphs_ready.is_set() or key is None or key not in memories:
+            yield None
+            return
+        async with graph_access(key):
+            memory = memories.get(key)
+            if memory is None:
+                yield None
+                return
+            async with memory.view(space) as view:
+                yield view
+
+    @asynccontextmanager
     async def open_recall(captured: Mapping[str, object]) -> AsyncGenerator[RecallTool]:
         selected = RecallBinding.model_validate(dict(captured))
         bindings = ctx.require(BINDINGS)
@@ -544,18 +561,31 @@ async def run(ctx: Context, interest: Interest) -> None:
             memory=read_path, config=settings.memory_config(),
             catalog=ctx.require(MESSAGE_CATALOG), embeddings=ctx.require(MESSAGE_EMBEDDINGS),
             bindings=bindings, select_learning=select, records=records(),
-            open_embedding=partial(SavedEmbedding.open, bindings), max_chars=settings.inject_max_chars,
+            open_embedding=partial(SavedEmbedding.open, bindings), live=live_graph,
+            max_chars=settings.inject_max_chars,
         )
 
     await catalog.register(
         ctx,
         name="recall_memory",
-        description="从记忆图召回历史对话，返回原始 Message 引用",
+        description="从记忆图召回历史对话，返回时间、通道、开头预览和 ref；原文用 fetch_messages 读取",
         parameters=RecallArguments.model_json_schema(),
         open=open_recall,
         capture=capture_recall,
         idempotent=True,
         parallel=True,
+    )
+
+    @asynccontextmanager
+    async def open_fetch(_captured: object) -> AsyncGenerator[FetchTool]:
+        yield FetchTool(memory=read_path, catalog=ctx.require(MESSAGE_CATALOG),
+                        learning=learning, owners=load_message_sessions)
+
+    await catalog.register(
+        ctx, name="fetch_messages",
+        description="按 Akasha 召回给出的 ref 读取消息原文（含时间与作者），一次最多 20 条",
+        parameters=FetchArguments.model_json_schema(), open=open_fetch,
+        idempotent=True, parallel=True,
     )
     # 只读账本按声明的 workspace root 解析学习图；不暴露 writer 或任意路径。
 
