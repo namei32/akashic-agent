@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal, Protocol, Self
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, FiniteFloat, model_validator
@@ -123,3 +124,14 @@ class MemoryScopes(Protocol):
 
 
 MEMORY_SCOPES = ServiceKey[MemoryScopes]("akasha.memory-scopes.v1")
+
+
+class InitiativeMemory(Protocol):
+    async def admit(self, request_id: str, session_id: str, query: str, *,
+                    timestamp: str, limit: int = 4, max_chars: int = 1500) -> dict[str, object]: ...
+    async def prepare(self, request_id: str, session_id: str, query: str, *,
+                      timestamp: str, limit: int = 4, max_chars: int = 1500) -> dict[str, object]: ...
+    def guard(self, request_id: str, session_id: str) -> AbstractAsyncContextManager[str | None]: ...
+
+
+INITIATIVE_MEMORY = ServiceKey[InitiativeMemory]("akasha.initiative.v1")

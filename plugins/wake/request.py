@@ -61,6 +61,7 @@ class Request(BaseModel):
     history: str
     events: tuple[dict[str, object], ...] = ()
     memory_assisted: bool = False
+    memory_provider: Literal["default_memory", "akasha"] = "default_memory"
     memory_query: str = Field(default="", max_length=800)
     memory_source_seq: int | None = Field(default=None, ge=-1)
     memory_blocked: str = ""

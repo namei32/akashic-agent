@@ -177,3 +177,5 @@
 - [0138 · Akasha 单线程 dense](0138-akasha-dense-is-single-threaded.md)：上游 accepted / implemented for review；固定数值环境并登记有恢复点的历史重放。
 
 - [0141 · Akasha 索引召回](0141-akasha-recall-injects-an-index.md)：上游 accepted / implemented for review；按窗口去重，原文通过受范围约束的 fetch_messages 读取。
+
+- [0142 · Wake 固定主动记忆提供者](0142-wake-freezes-initiative-memory-provider.md)：implemented for review；Akasha 的范围快照和短保护延续 Drift 的目标授权及送达协议。
