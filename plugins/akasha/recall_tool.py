@@ -22,7 +22,7 @@ from .application.consumer import run_memory_job
 from .application.cycle import MemoryCycle
 from .application.snapshot import read_memory
 from .infrastructure.consumption import Consumption
-from .domain.model import MemoryConfig
+from .domain.model import MemoryConfig, MemoryRebuildRequiredError
 from .learning import AKASHA_LEARNING, Learning, LearningConfig
 from .scopes import MemoryDisabled
 from .contract import ProgramSource, Recall, ToolSource
@@ -201,6 +201,9 @@ class RecallTool:
     ) -> Recall:
         space = (rule.embedding_model, rule.dimension)
         def query(cycle: MemoryCycle, state: Consumption) -> Recall:
+            for ending in rule.excluded_turn_endings:
+                if state.applied_at(ending) is not None:
+                    raise MemoryRebuildRequiredError("学习图包含明确排除的回合，需要显式重建")
             return query_memory(
                 cycle, state, learning_binding=request.learning_binding, text=request.query,
                 dense=dense, stamp=datetime.now(UTC), source=source, limit=request.limit,

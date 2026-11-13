@@ -213,6 +213,8 @@ def render_materials(
     used = len(header)
     chosen = None if presented is None else set(presented)
     for hit in recall.hits:
+        if hit.message_ids:
+            learning.check_ending(hit.message_ids[-1])
         reader = catalog.reader(hit.session_id)
         for message_id in hit.message_ids:
             if message_id in exclude or (chosen is not None and message_id not in chosen):

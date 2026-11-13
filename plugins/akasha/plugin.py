@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from functools import partial
 from importlib import import_module
 from pathlib import Path
-from typing import Literal, Self, cast
+from typing import Annotated, Literal, Self, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
@@ -95,6 +95,7 @@ class Config(BaseModel):
     model_config = ConfigDict(extra="forbid")
     enabled: bool | None = True
     memory_enabled: bool = True
+    excluded_turn_endings: tuple[Annotated[str, Field(min_length=1)], ...] = ()
     sources: tuple[str, ...] = Field(
         default=("conversation", "programmatic", "legacy-unattributed"), min_length=1,
     )
@@ -110,7 +111,7 @@ class Config(BaseModel):
     forgetting_enabled: bool = AkashaConfig.forgetting_enabled
 
     def settings(self) -> AkashaConfig:
-        settings = AkashaConfig(**self.model_dump(exclude={"sources", "enabled", "memory_enabled"}))
+        settings = AkashaConfig(**self.model_dump(exclude={"sources", "enabled", "memory_enabled", "excluded_turn_endings"}))
         settings.validate()
         return settings
 
@@ -177,6 +178,7 @@ async def run(ctx: Context, interest: Interest) -> None:
     learning = Learning(
         ctx.require(TURN_PROJECTION), owner=ctx.runtime.plugin_id,
         post_commit_effect=content.legacy_post_commit_effect,
+        excluded_turn_endings=config.excluded_turn_endings,
     )
     _ = await ctx.provide(AKASHA_LEARNING, learning)
     _ = await content.register(ctx, {
@@ -346,7 +348,7 @@ async def run(ctx: Context, interest: Interest) -> None:
             health.degrade(str(error))
             raise EmbeddingSpaceMismatchError(str(error)) from error
         rule = LearningConfig(embedding_model=descriptor.identity, dimension=descriptor.dimensions,
-                              sources=config.sources)
+                              sources=config.sources, excluded_turn_endings=config.excluded_turn_endings)
         identity = ctx.require(BINDINGS).bind(AKASHA_LEARNING, rule.model_dump())
         health.recover()
         return identity, rule, descriptor.model_id
@@ -554,7 +556,7 @@ async def run(ctx: Context, interest: Interest) -> None:
                 raise ModelUnavailableError(selected.unavailable).exception()
             saved = SavedEmbedding.read(bindings, selected.embedding_binding)
             rule = LearningConfig(embedding_model=saved.space_identity, dimension=saved.dimensions,
-                                  sources=config.sources)
+                                  sources=config.sources, excluded_turn_endings=config.excluded_turn_endings)
             identity = bindings.bind(AKASHA_LEARNING, rule.model_dump())
             return identity, selected.embedding_binding
         yield RecallTool(
