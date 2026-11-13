@@ -992,6 +992,22 @@ class MessageCatalog:
                 read.heads[key] = heads
             return heads
 
+    def prefix_revision(self) -> int | None:
+        """已提交消息前缀的改写计数；缺少标记时不能复用跨重启续读点。"""
+        log = self._log
+        if not log._has_prefix_revision:
+            return None
+        with log._read(snapshot=False) as connection:
+            return int(connection.execute(
+                "SELECT revision FROM message_prefix_revision WHERE singleton=1"
+            ).fetchone()[0])
+
+    async def snapshot_heads_async(
+        self, *, prefix: str = "", visibility: Literal["listed", "internal"] | None = None,
+    ) -> Mapping[str, int]:
+        self._log._check_async_operation()
+        return await run_file_io(lambda: self.snapshot_heads(prefix=prefix, visibility=visibility))
+
     def reader(self, session_id: str) -> MessageReader:
         return self._log.reader(session_id)
 

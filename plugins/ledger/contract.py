@@ -659,6 +659,12 @@ class MessageCatalog(Protocol):
         self, *, prefix: str = "", visibility: Literal["listed", "internal"] | None = None,
     ) -> Mapping[str, int]: ...
 
+    async def snapshot_heads_async(
+        self, *, prefix: str = "", visibility: Literal["listed", "internal"] | None = None,
+    ) -> Mapping[str, int]: ...
+
+    def prefix_revision(self) -> int | None: ...
+
     def reader(self, session_id: str) -> MessageReader: ...
 
     def attributes(self, session_id: str) -> SessionAttributes: ...
@@ -965,3 +971,60 @@ def detect_supported_image_mime(head: bytes) -> str | None:
     if head.startswith(b"RIFF") and head[8:12] == b"WEBP":
         return "image/webp"
     return None
+
+
+# 已接纳消息的主体判定来自上游 ADR 0145；这里只解释出处，不获得消息写入权限。
+class Actor(StrEnum):
+    USER = "user"
+    MODEL = "model"
+    TOOL = "tool"
+    HOST = "host"
+    AUTOMATION = "automation"
+
+
+RESERVED_AUTHORS: Mapping[str, Actor] = {
+    "user": Actor.USER, "assistant": Actor.MODEL,
+    "tool": Actor.TOOL, "app": Actor.HOST,
+}
+LEGACY_SOURCE = "legacy-unattributed"
+LEGACY_AUTHOR = "legacy-attribution-unknown"
+DIALOGUE_SOURCES: tuple[str, ...] = ("conversation", "programmatic", LEGACY_SOURCE)
+_LEGACY_ROLES: Mapping[str, Actor] = {"user": Actor.USER, "assistant": Actor.MODEL}
+
+
+@dataclass(frozen=True, slots=True)
+class Origin:
+    actor: Actor
+    producer: str
+
+
+def origin(message: Message) -> Origin:
+    """迁移历史按保全的原始角色派生主体，不改写存储的作者。"""
+    author = message.author
+    actor = RESERVED_AUTHORS.get(author)
+    if actor is not None:
+        return Origin(actor, author)
+    if author == LEGACY_AUTHOR and message.source == LEGACY_SOURCE:
+        return Origin(_legacy_actor(message), author)
+    return Origin(Actor.AUTOMATION, author)
+
+
+def is_user_input(message: Message) -> bool:
+    return isinstance(message.body, Input) and origin(message).actor is Actor.USER
+
+
+def _legacy_actor(message: Message) -> Actor:
+    body = message.body
+    if isinstance(body, Control):
+        return Actor.HOST
+    parts = [part for part in body.parts
+             if isinstance(part, ContentPart) and part.kind == "history.provenance"]
+    if not parts:
+        return Actor.MODEL if isinstance(body, Output) else Actor.TOOL if isinstance(body, ToolResult) else Actor.AUTOMATION
+    if len(parts) != 1 or not isinstance(parts[0].value, Mapping):
+        raise ValueError("历史消息必须只有一个 provenance 对象")
+    value = cast(Mapping[str, object], parts[0].value)
+    role = value.get("role")
+    if value.get("schema") != "sessions.messages.v0" or not isinstance(role, str) or role not in _LEGACY_ROLES:
+        raise ValueError("历史 provenance 格式未知")
+    return _LEGACY_ROLES[role]
