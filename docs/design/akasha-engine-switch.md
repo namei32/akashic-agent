@@ -73,6 +73,8 @@ Markdown 档案继续由原插件维护；Default Memory 库保留，可核对�
 `skipped_turns`。完整迁移使用显式 `/akasha_reindex confirm fill_missing`：按固定学习
 规则和原模型空间补齐合资格样本后，仍由同一个消费者重放；已有向量不同值拒绝覆盖。
 这会调用模型并产生成本，不能因普通重建返回成功就宣称完整历史已经补学。
+启动期迁移请求也可通过显式配置 `replay_fill_missing_embeddings=true` 采用同一补缺路径；
+默认关闭。本次切换启用它，使新宿主接纳请求前完成重放，无需写入测试聊天来执行命令。
 
 ## 验收
 

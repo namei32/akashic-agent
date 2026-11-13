@@ -97,6 +97,7 @@ class Config(BaseModel):
     enabled: bool | None = True
     memory_enabled: bool = True
     excluded_turn_endings: tuple[Annotated[str, Field(min_length=1)], ...] = ()
+    replay_fill_missing_embeddings: bool = False
     sources: tuple[str, ...] = Field(
         default=("conversation", "programmatic", "legacy-unattributed"), min_length=1,
     )
@@ -112,7 +113,7 @@ class Config(BaseModel):
     forgetting_enabled: bool = AkashaConfig.forgetting_enabled
 
     def settings(self) -> AkashaConfig:
-        settings = AkashaConfig(**self.model_dump(exclude={"sources", "enabled", "memory_enabled", "excluded_turn_endings"}))
+        settings = AkashaConfig(**self.model_dump(exclude={"sources", "enabled", "memory_enabled", "excluded_turn_endings", "replay_fill_missing_embeddings"}))
         settings.validate()
         return settings
 
@@ -723,7 +724,7 @@ async def run(ctx: Context, interest: Interest) -> None:
         logger.info("Akasha 发现一次性重放请求: %s", [str(path) for path in pending])
         try:
             _note_replay({"phase": "rebuilding", "pending": [str(path) for path in pending]})
-            detail = await rebuild_now()
+            detail = await rebuild_now(fill_missing=config.replay_fill_missing_embeddings)
             _note_replay({"phase": "completed", "detail": detail})
         except BaseException as error:
             if ModelError.matches(error, ModelUnavailableError, DriverUnavailableError) or isinstance(error, EmbeddingSpaceMismatchError):
