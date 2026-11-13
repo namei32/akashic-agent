@@ -187,7 +187,7 @@ def main() -> None:
         persistence.os.fsync, persistence.os.replace = sync, publish
         try:
             try:
-                consumer.publish_snapshot_for(next_state)
+                export(path, consumer.cycle, next_state)
             except OSError as error:
                 assert str(error) == f"scenario: {boundary}"
             else:
