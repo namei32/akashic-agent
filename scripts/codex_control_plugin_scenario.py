@@ -125,10 +125,11 @@ async def exercise(folder: Path, endpoint: str, thread_id: str, png: bytes, obse
             writer.expire()
             snapshot = ctx.require(MESSAGE_CATALOG).reader(session).snapshot()
             assert snapshot[-1].message_id == message.message_id
+            stored_call = next(part for part in snapshot[-1].body.parts if isinstance(part, ToolCall))
             source = CallSource(CallRef(message.message_id, 0), snapshot)
             async with bindings.open(binding, TOOLS) as (current, metadata):
                 async with current.open(metadata) as tool:
-                    prepared = await tool.prepare(arguments, source)
+                    prepared = await tool.prepare(stored_call.arguments, source)
                     if isinstance(prepared, str):
                         return prepared, None
                     result = await tool.invoke(source.effect_key, prepared)
@@ -188,10 +189,30 @@ async def exercise(folder: Path, endpoint: str, thread_id: str, png: bytes, obse
             assert await lease.read_bytes(max_bytes=1024 * 1024) == png
         finally:
             await lease.aclose()
+        cwd = (await observer.call("thread/read", {"threadId": thread_id}))["thread"]["cwd"]
+        created, _ = await call({"action": "create", "cwd": cwd}, repeat=True)
+        new_thread = created["thread_id"]
+        assert created["status"] == "created" and new_thread != thread_id, created
+        sent, _ = await call({"action": "send", "text": "PLUGIN_CREATED_CLI_TASK"})
+        assert sent["thread_id"] == new_thread, sent
+        finished = {"data": []}
+        for _ in range(100):
+            try:
+                finished = await observer.call("thread/turns/list", {"threadId": new_thread, "limit": 3})
+            except RuntimeError as error:
+                if "list_turns is not supported yet" not in str(error) and "no rollout found" not in str(error):
+                    raise
+            if finished["data"] and finished["data"][0]["status"] == "completed":
+                break
+            await asyncio.sleep(0.1)
+        assert finished["data"] and finished["data"][0]["status"] == "completed", finished
+        listed, _ = await call({"action": "list"})
+        assert any(row["id"] == new_thread for row in listed["threads"]), listed
         saved.update(binding=binding, session=session, original=original)
         return {"formal_plugin_install": True, "bound_tool_send": True, "selected_thread_preserved": True,
                 "real_ledger_image": True, "unattached_image_rejected": True, "duplicate_effect_not_resent": True,
-                "desktop_observer_received_completion": True, "existing_input_and_attachment_unchanged": True,
+                "independent_observer_received_completion": True, "existing_input_and_attachment_unchanged": True,
+                "create_select_send_cli_task": True,
                 "lost_ack_is_unknown_not_resent": True, "damaged_image_rejected_before_send": True}
 
     manager = PluginManager([sources], workspace=workspace, installed_cache_root=home / "cache")

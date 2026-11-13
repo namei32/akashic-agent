@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict
 from io import BytesIO
 import json
+from pathlib import PureWindowsPath
 from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -23,7 +24,7 @@ from .client import Client, CodexError
 api_version = 3
 name = "codex_control"
 version = "1.0.0"
-desc = "指挥 Windows 桌面 Codex：选择聊天、发送文字和图片、读结果、调整或中断任务"
+desc = "指挥 Windows 原生 Codex CLI：新建或选择任务、发送文字和图片、读结果、调整或中断"
 inject = (TOOLS, OWNER_STATE, ARTIFACT_READ, MESSAGE_CATALOG)
 
 
@@ -34,7 +35,8 @@ class Config(BaseModel):
 
 class Arguments(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    action: Literal["list", "select", "read", "send", "steer", "interrupt", "approve"]
+    action: Literal["create", "list", "select", "read", "send", "steer", "interrupt", "approve"]
+    cwd: str = Field(default="", max_length=4096)
     thread_id: str = Field(default="", max_length=256)
     text: str = Field(default="", max_length=100_000)
     image_ids: list[str] = Field(default_factory=list, max_length=4)
@@ -69,17 +71,19 @@ class Control:
 
     async def prepare(self, arguments: Mapping[str, object], source: CallSource | None = None) -> Mapping[str, object] | str:
         try:
-            args = Arguments.model_validate(dict(arguments))
+            args = Arguments.model_validate(json_value(arguments))
         except ValidationError as error:
             return str(error)
         if source is None or not source.messages:
             return "Codex 控制需要当前聊天中的明确工具调用"
         parent = source.messages[-1]
         target = await run_file_io(lambda: self.state.read("target:" + parent.session_id))
-        if args.action != "list" and not args.thread_id:
+        if args.action == "create" and not PureWindowsPath(args.cwd).is_absolute():
+            return "新建 CLI 任务需要用户指定的 Windows 绝对项目目录，例如 C:\\Users\\namei\\project"
+        if args.action not in {"list", "create"} and not args.thread_id:
             args.thread_id = str(target.value["thread_id"]) if target is not None else ""
-        if args.action != "list" and not args.thread_id:
-            return "请先列出并明确选择 Windows Codex 聊天"
+        if args.action not in {"list", "create"} and not args.thread_id:
+            return "请先新建 CLI 任务，或列出并明确选择 Windows Codex 聊天"
         if args.action in {"send", "steer"} and not args.text.strip() and not args.image_ids:
             return "请提供要发给 Codex 的文字或图片"
         if args.action in {"steer", "interrupt"} and not args.turn_id:
@@ -115,7 +119,7 @@ class Control:
 
     async def invoke(self, key: str, arguments: Mapping[str, object]) -> Result:
         args = Arguments.model_validate(json_value(arguments["args"]))
-        changing = args.action in {"send", "steer", "interrupt", "approve"}
+        changing = args.action in {"create", "send", "steer", "interrupt", "approve"}
         if changing:
             if not await self.save("command:" + key, {"status": "started", "thread_id": args.thread_id,
                                                        "action": args.action}, new=True):
@@ -135,25 +139,30 @@ class Control:
     async def execute(self, args: Arguments, prepared: Mapping[str, object]) -> dict[str, object]:
         await self.client.open()
         if self.client.server_platform != "windows":
-            raise CodexError("连接目标不是 Windows 原生 Codex；请核对桌面共享入口")
+            raise CodexError("连接目标不是 Windows 原生 Codex；请核对 CLI 启动入口")
         if args.action == "list":
             page = await self.client.call("thread/list", {"limit": args.limit, "archived": False,
+                                                         "sourceKinds": ["cli", "appServer", "vscode", "exec"],
+                                                         "sortKey": "updated_at",
                                                          **({"searchTerm": args.search} if args.search else {})})
             fields = ("id", "name", "preview", "cwd", "status", "updatedAt")
             return {"threads": [{k: row.get(k) for k in fields} for row in page.get("data", [])],
                     "next_cursor": page.get("nextCursor")}
-        if args.action == "select":
-            info = await self.client.call("thread/read", {"threadId": args.thread_id, "includeTurns": False})
+        if args.action in {"select", "create"}:
+            info = await self.client.call("thread/start", {"cwd": args.cwd}) if args.action == "create" else \
+                await self.client.call("thread/read", {"threadId": args.thread_id, "includeTurns": False})
+            identity = str(info["thread"]["id"])
             target_key = "target:" + str(prepared["parent_session_id"])
             def select(tx: OwnerTransaction) -> None:
                 previous = tx.read(target_key)
                 seq = int(str(prepared["parent_seq"]))
                 if previous is not None and int(str(previous.value.get("call_seq", -1))) > seq:
                     raise ValueError("已有更新的 Codex 聊天选择，本次旧选择未提交")
-                tx.save(target_key, {"thread_id": args.thread_id, "call_seq": seq},
+                tx.save(target_key, {"thread_id": identity, "call_seq": seq},
                         expected_version=previous.version if previous else None)
             await self.state.transact_async(select)
-            return {"status": "selected", "thread_id": args.thread_id, "name": info.get("thread", {}).get("name")}
+            return {"status": "created" if args.action == "create" else "selected",
+                    "thread_id": identity, "name": info["thread"].get("name"), "cwd": info["thread"].get("cwd")}
         if args.action == "read":
             return await self.client.read_thread(args.thread_id)
         if args.action == "approve":
@@ -188,7 +197,9 @@ class Control:
             receipt = await self.client.call("turn/steer", {"threadId": args.thread_id,
                                   "expectedTurnId": args.turn_id, "input": content})
             return {"status": "steered", "thread_id": args.thread_id, "turn_id": receipt.get("turnId")}
-        await self.client.call("thread/resume", {"threadId": args.thread_id, "excludeTurns": True})
+        loaded = await self.client.call("thread/loaded/list", {})
+        if args.thread_id not in loaded.get("data", []):
+            await self.client.call("thread/resume", {"threadId": args.thread_id, "excludeTurns": True})
         receipt = await self.client.call("turn/start", {"threadId": args.thread_id, "input": content})
         turn_id = str(receipt["turn"]["id"])
         notification: dict[str, object] = {}
@@ -234,8 +245,9 @@ async def apply(ctx: Context) -> None:
     tools = ctx.require(TOOLS)
     await tools.declare_group(ctx, always_on=True, description=desc)
     await tools.register(ctx, name="codex_control", parameters=Arguments.model_json_schema(), open=open_tool,
-        description=("控制用户 Windows 桌面的现有 Codex 聊天；独立 codex-delegate/CLI 任务不能代替此入口。"
-            "list 搜索聊天，select 为当前 Akashic 会话固定目标，read 查看状态、结果和待审批项；"
+        description=("通过 Windows 原生 Codex CLI 后端执行用户指令。不要绕过本工具另开 codex-delegate 任务。"
+            "create 在用户指定的 Windows 绝对 cwd 新建并选中任务；list 搜索聊天，select 固定当前会话目标，read 读取状态和结果。"
+            "独立 CLI 不能操纵另一个桌面后端的活动任务，不得同时续接桌面正在执行的聊天。"
             "只有用户明确要求时才 send 发新指令，或 steer 调整正在执行的准确 turn_id，interrupt 请求停止。"
             "图片用当前会话已上传的 image_ids，传输原始图片。approve 只用于用户明确同意、拒绝或取消的当前 request_id；"
             "不得自行审批、改变权限或改用其他聊天。accepted 只是接纳；结果未知时读取状态，禁止自动重发。"),
