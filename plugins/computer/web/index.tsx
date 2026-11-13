@@ -137,11 +137,15 @@ function renderComputer(ctx: WebHostContextV1, host: HTMLElement, rawView: unkno
 
   async function paste(value: string) {
     if (!inputOn || !display) throw new Error("Agent 正在使用浏览器，先接管再粘贴");
-    await display.clipboardPasteFrom(value);
-    display.sendKey(0xffe3, "ControlLeft", true);
-    display.sendKey(0x76, "KeyV", true);
-    display.sendKey(0x76, "KeyV", false);
-    display.sendKey(0xffe3, "ControlLeft", false);
+    if (showing) throw new Error("正在切换标签，请稍候再粘贴");
+    const current = display, target = selected, connection = attempt;
+    await current.clipboardPasteFrom(value);
+    if (!inputOn || display !== current || attempt !== connection || selected !== target || showing)
+      throw new Error("Computer 连接、目标或输入权限已变化，本次未发送粘贴按键");
+    current.sendKey(0xffe3, "ControlLeft", true);
+    current.sendKey(0x76, "KeyV", true);
+    current.sendKey(0x76, "KeyV", false);
+    current.sendKey(0xffe3, "ControlLeft", false);
   }
 
   function connect(token = "") {
@@ -195,6 +199,7 @@ function renderComputer(ctx: WebHostContextV1, host: HTMLElement, rawView: unkno
 
   // 地址栏、前进后退、新开和关闭标签：Agent 在用时后端返回 409，提示先接管。
   async function navigate(action: NavAction, value = "") {
+    display?.cancelClipboard("页面正在导航，本次未发送粘贴按键");
     const path = action === "open" ? "open" : action === "close" ? "close" : "navigate";
     const body = action === "open" ? {} : action === "close" ? { target: value }
       : { target: selected, action, ...(action === "go" ? { url: addressToUrl(value) } : {}) };
@@ -220,6 +225,7 @@ function renderComputer(ctx: WebHostContextV1, host: HTMLElement, rawView: unkno
   // 切换标签只把它提到屏幕最前，画面连接不动；失败时回到状态流里的 front。
   async function select(id: string) {
     if (id === selected) return;
+    display?.cancelClipboard("目标标签已变化，本次未发送粘贴按键");
     const previous = selected;
     selected = id;
     showing = id;
@@ -290,6 +296,9 @@ function renderComputer(ctx: WebHostContextV1, host: HTMLElement, rawView: unkno
     const first = !receivedTargets;
     receivedTargets = true;
     known = new Set(state.targets.filter(target => target.agent).map(target => target.id));
+    if (front !== selected || state.targets.find(target => target.id === selected)?.url
+      !== targets.find(target => target.id === selected)?.url)
+      display?.cancelClipboard("目标页面已变化，本次未发送粘贴按键");
     if (JSON.stringify(targets) !== JSON.stringify(state.targets) || front !== selected) {
       targets = state.targets;
       selected = front;

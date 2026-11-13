@@ -222,10 +222,10 @@ export class ComputerDisplay extends EventTarget {
       }
       // 2. 就绪依赖已显示画面，而非空白 canvas 的默认尺寸。
       const video = document?.querySelector("video");
-      const canvas = document?.querySelector<HTMLCanvasElement>("#videoCanvas");
+      const canvases = document?.querySelectorAll<HTMLCanvasElement>("#videoCanvas, #videoWorkerCanvas") ?? [];
       const hasFrame = (video && video.videoWidth > 0 && video.readyState >= 2
         && getComputedStyle(video).display !== "none")
-        || (canvas && getComputedStyle(canvas).display !== "none" && (stream?.fps ?? 0) > 0);
+        || ([...canvases].some(canvas => getComputedStyle(canvas).display !== "none") && (stream?.fps ?? 0) > 0);
       if (!this.connected && transport?.readyState === WebSocket.OPEN && input && hasFrame) {
         this.connected = true;
         window.clearTimeout(this.startupTimer);
@@ -254,6 +254,7 @@ export class ComputerDisplay extends EventTarget {
   setInput(enabled: boolean) {
     if (enabled === this.inputEnabled) return;
     this.inputEnabled = enabled;
+    if (!enabled) this.cancelClipboard("Computer 输入权限已变化，请重新粘贴");
     this.frame.tabIndex = enabled ? 0 : -1;
     this.frame.style.pointerEvents = enabled ? "auto" : "none";
   }
@@ -280,19 +281,39 @@ export class ComputerDisplay extends EventTarget {
       canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error("浏览器没有生成图片")), "image/png"));
   }
 
-  /** 回执到达后才允许发送粘贴按键，断线或超时明确失败。 */
+  /** 发送回执不是远端落地确认；失败不自动重试，也不发送 Ctrl+V。 */
   clipboardPasteFrom(text: string): Promise<void> {
     if (!this.inputEnabled) return Promise.reject(new Error("Agent 正在使用浏览器，先接管再粘贴"));
-    if (!this.connected || this.closed) return Promise.reject(new Error("Computer 尚未连接"));
+    const stream = this.stream;
+    if (!this.connected || this.closed || stream?.selkiesTransport?.readyState !== WebSocket.OPEN)
+      return Promise.reject(new Error("Computer 尚未连接"));
+    if (this.clipboardRequests.size) return Promise.reject(new Error("上一次粘贴尚未结束，请稍候"));
     const requestId = ++this.clipboardId;
     return new Promise((resolve, reject) => {
       const timer = window.setTimeout(() => {
         this.clipboardRequests.delete(requestId);
-        reject(new Error("Computer 剪贴板发送超时"));
+        // 远端可能已经收到文字，但回执迟到；废弃此连接，避免旧请求覆盖后续粘贴。
+        reject(new Error("Computer 剪贴板发送超时，结果未知；请重新连接后确认内容"));
+        this.fail("剪贴板发送超时，请重新连接");
       }, 5_000);
       this.clipboardRequests.set(requestId, { resolve, reject, timer });
-      this.stream!.postMessage({ type: "clipboardUpdateFromUI", text, requestId }, location.origin);
+      try {
+        stream.postMessage({ type: "clipboardUpdateFromUI", text, requestId }, location.origin);
+      } catch {
+        window.clearTimeout(timer);
+        this.clipboardRequests.delete(requestId);
+        reject(new Error("Computer 剪贴板请求发送失败"));
+      }
     });
+  }
+
+  /** 拒绝本地操作，但保留发送占位直到回执或断线，防止两次文字传输交错。 */
+  cancelClipboard(reason: string) {
+    for (const request of this.clipboardRequests.values()) {
+      request.reject(new Error(reason));
+      if (this.closed) window.clearTimeout(request.timer);
+    }
+    if (this.closed) this.clipboardRequests.clear();
   }
 
   sendCtrlAltDel() {
@@ -309,11 +330,7 @@ export class ComputerDisplay extends EventTarget {
     if (this.closed) return;
     this.closed = true;
     this.abort.abort();
-    for (const request of this.clipboardRequests.values()) {
-      window.clearTimeout(request.timer);
-      request.reject(new Error("Computer 连接已关闭"));
-    }
-    this.clipboardRequests.clear();
+    this.cancelClipboard("Computer 连接已关闭");
     window.clearInterval(this.timer);
     window.clearTimeout(this.startupTimer);
     window.removeEventListener("message", this.onMessage);
