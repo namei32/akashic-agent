@@ -16,7 +16,7 @@ from typing import Annotated, Literal, Self, cast
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from agent.plugin_composition import RUNTIME_STARTED, RUNTIME_STOPPING, CompositionError, Context, ServiceKey
-from plugins.akasha.contract import EMBEDDING_MEMORY_PLUGIN, MEMORY_SCOPES
+from plugins.akasha.contract import EMBEDDING_MEMORY_PLUGIN, MEMORY_SCOPES, INITIATIVE_MEMORY
 from plugins.models.contract import EMBEDDINGS
 from plugins.ui.contract import (
     UI_SLOTS,
@@ -63,6 +63,7 @@ from .infrastructure.consumption import load_message_nodes, load_message_session
 from .inspector import RecallInspector
 from .interest import SEMANTIC_INTEREST, Embed, SemanticInterest
 from .learning import AKASHA_LEARNING, Learning, LearningConfig
+from .initiative import Initiative
 from .recall_tool import FetchArguments, FetchTool, RecallArguments, RecallTool, check_fetch, check_recall
 from .recalls import RecallRecords, RecallRecordsRead
 from .contract import AKASHA_RECORDS_VIEW
@@ -791,6 +792,17 @@ async def run(ctx: Context, interest: Interest) -> None:
                     pass
         finally:
             await close_memory()
+
+    async def embed_initiative(rule: LearningConfig, model_id: str, texts: list[str]) -> list[list[float]]:
+        return await embedder(rule, model_id)(texts)
+
+    initiative = Initiative(ctx, scopes=policies, learning=learning, select=select_learning,
+                            embed=embed_initiative, ensure=start_if_available, view=live_graph)
+    class InitiativePort:
+        admit = staticmethod(ctx.entrypoint(initiative.admit))
+        prepare = staticmethod(ctx.entrypoint(initiative.prepare))
+        guard = staticmethod(initiative.guard)
+    await ctx.provide(INITIATIVE_MEMORY, InitiativePort())
 
     _ = await ctx.on(RUNTIME_STARTED, start)
     _ = await ctx.on(RUNTIME_STOPPING, stop)

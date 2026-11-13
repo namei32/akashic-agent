@@ -231,6 +231,7 @@ class Runtime:
             model_id=model.model_id, reasoning_effort=model.reasoning_effort,
             rules=read_archived_rules(ctx.data_root) or "",
             history=history, events=events, memory_assisted=memory_assisted,
+            memory_provider=self.config.memory_provider,
             memory_query=memory_query, memory_source_seq=source_seq, memory_blocked=memory_blocked)
 
     async def follow(self) -> None:

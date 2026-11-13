@@ -52,7 +52,7 @@ from .content import (
     _string,
 )
 from .messages import decision, finished, screened_candidates
-from .initiative_memory import INITIATIVE_MEMORY, PromptUnavailable
+from .initiative_memory import memory_key, PromptUnavailable
 from .request import (
     WAKE_PROGRAM,
     Phase,
@@ -360,8 +360,8 @@ class Source:
 
     async def _memory_snapshot(self, request: Request) -> Mapping[str, object]:
         ctx, target = self.ctx, request.target
-        memory_key = INITIATIVE_MEMORY
-        if memory_key is None:
+        selected_memory = memory_key(request.memory_provider)
+        if selected_memory is None:
             raise _InitiativeUnavailable("memory_provider_unavailable")
         with ctx.borrow(private_target_key(target.channel)) as proof:
             if proof is None:
@@ -373,7 +373,7 @@ class Source:
             # This local receipt contains a fingerprint, not the query. It precedes
             # the Drift guard so the two SQLite writers are never acquired in the
             # opposite order from the delivery guard. No embedding is called here.
-            with ctx.borrow(memory_key) as memory:
+            with ctx.borrow(selected_memory) as memory:
                 if memory is None:
                     raise _InitiativeUnavailable("memory_provider_unavailable")
                 await memory.admit(self._memory_id(request), target.session_id, request.memory_query,
@@ -396,7 +396,7 @@ class Source:
                 await state.transact_async(record)
             # The accepted Drift guard is the model-admission point. Later revoke
             # still invalidates the result at publication and first send.
-            with ctx.borrow(memory_key) as memory:
+            with ctx.borrow(selected_memory) as memory:
                 if memory is None:
                     raise _InitiativeUnavailable("memory_provider_unavailable")
                 result = await memory.prepare(self._memory_id(request), target.session_id, request.memory_query,
@@ -411,8 +411,8 @@ class Source:
     @asynccontextmanager
     async def _memory_guard(self, request: Request) -> AsyncIterator[str | None]:
         ctx, target = self.ctx, request.target
-        memory_key = INITIATIVE_MEMORY
-        if memory_key is None:
+        selected_memory = memory_key(request.memory_provider)
+        if selected_memory is None:
             yield "memory_provider_unavailable"
             return
         with ctx.borrow(private_target_key(target.channel)) as proof:
@@ -426,7 +426,7 @@ class Source:
             if not private:
                 yield "target_unavailable"
                 return
-            with ctx.borrow(memory_key) as memory:
+            with ctx.borrow(selected_memory) as memory:
                 if memory is None:
                     yield "memory_provider_unavailable"
                     return

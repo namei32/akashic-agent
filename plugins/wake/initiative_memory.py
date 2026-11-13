@@ -21,6 +21,13 @@ except ModuleNotFoundError as error:
         raise
     _memory_contract = None
 
+try:
+    import plugins.akasha.contract as _akasha_contract
+except ModuleNotFoundError as error:
+    if error.name not in {"plugins.akasha", "plugins.akasha.contract"}:
+        raise
+    _akasha_contract = None
+
 import plugins.reply_program.contract as _reply_contract
 from plugins.reply_program.contract import ReplyExecuteV4
 
@@ -37,6 +44,18 @@ class InitiativeMemory(Protocol):
 # identity is always declared by Default Memory's public contract, never here.
 INITIATIVE_MEMORY = cast(ServiceKey[InitiativeMemory] | None,
                          getattr(_memory_contract, "INITIATIVE_MEMORY", None))
+AKASHA_INITIATIVE_MEMORY = cast(ServiceKey[InitiativeMemory] | None,
+                                getattr(_akasha_contract, "INITIATIVE_MEMORY", None))
+
+
+def memory_key(provider: str) -> ServiceKey[InitiativeMemory] | None:
+    if provider == "akasha":
+        return AKASHA_INITIATIVE_MEMORY
+    if provider == "default_memory":
+        return INITIATIVE_MEMORY
+    raise ValueError("未知的主动记忆提供者")
+
+
 GLOBAL_PROMPT_REPLY = cast(ServiceKey[ReplyExecuteV4] | None,
                            getattr(_reply_contract, "REPLY_EXECUTE_GLOBAL_PROMPT", None))
 

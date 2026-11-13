@@ -50,7 +50,7 @@ from .request import WAKE_PROGRAM, WAKE_TOOLS_VIEW, check_phase, check_request
 from .runtime import DashboardView, Runtime
 from .tools import SCHEMAS, DecisionTool
 from .contract import WAKE_CONTACT, WAKE_MEMORY_READY, WakeContact
-from .initiative_memory import GLOBAL_PROMPT_REPLY, INITIATIVE_MEMORY
+from .initiative_memory import GLOBAL_PROMPT_REPLY, memory_key
 from plugins.drift.contract import DRIFT_CHANGED
 
 api_version = 3
@@ -109,8 +109,9 @@ async def start_function(ctx: Context) -> None:
     async def memory_ready(child: Context) -> None:
         await child.provide(WAKE_MEMORY_READY, object())
         child.emit(DRIFT_CHANGED, None)
-    if INITIATIVE_MEMORY is not None and GLOBAL_PROMPT_REPLY is not None:
-        await ctx.inject((INITIATIVE_MEMORY, DELIVERY_SCOPED_READ, GLOBAL_PROMPT_REPLY,
+    selected_memory = memory_key(config.memory_provider)
+    if selected_memory is not None and GLOBAL_PROMPT_REPLY is not None:
+        await ctx.inject((selected_memory, DELIVERY_SCOPED_READ, GLOBAL_PROMPT_REPLY,
                           private_target_key(target.channel)),
                          memory_ready, name="memory-initiative")
     _ = await ctx.require(CONTENT).register(

@@ -20,6 +20,38 @@ from tests.support.delivery_sources import sources as delivery_sources
 
 TARGET = {"channel": "test", "recipient": "room", "session_id": "scenario:initiative"}
 
+FEEDBACK_PROBE = '''
+from plugins.ledger.contract import BINDINGS, MESSAGE_CATALOG, ToolCall, ToolResult, CallRef
+from plugins.tools.contract import TOOLS, ALL_TOOLS, CallSource
+original_apply = apply
+inject = (*inject, BINDINGS, MESSAGE_CATALOG, TOOLS, ALL_TOOLS)
+async def apply(ctx):
+    await original_apply(ctx)
+    async def forget(session, identity):
+        tools, bindings = ctx.require(TOOLS), ctx.require(BINDINGS)
+        ref = next(item for item in ctx.require(ALL_TOOLS)().refs if item.name == "forget_memory")
+        binding = await tools.bind(ref, bindings)
+        arguments = {"message_ids": [identity], "reason": "User asked to forget"}
+        async with ctx.require(CONTENT).bind() as view:
+            def check_call(call):
+                bindings.describe(call.binding_id, TOOLS)
+            writer = ctx.require(MESSAGE_WRITERS).bind(ctx, author="assistant", source="conversation",
+                body_types=(Output,), content=view.checks, check_call=check_call)
+            writer(session).append("forget-call", Output((ToolCall(binding, arguments),), "continue"))
+            source = CallSource(CallRef("forget-call", 0), ctx.require(MESSAGE_CATALOG).reader(session).snapshot())
+            async with tools.open(bindings.describe(binding, TOOLS)) as tool:
+                prepared = await tool.prepare(arguments, source)
+                assert isinstance(prepared, dict), prepared
+                result = await tool.invoke(source.effect_key, prepared)
+                assert result.outcome == "success"
+            observations = ctx.require(MESSAGE_WRITERS).bind(ctx, author="tool", source="conversation",
+                body_types=(ToolResult,), content=view.checks)
+            observations(session, call_ref=source.call_ref).append("forget-result",
+                ToolResult(source.call_ref, result.outcome, result.parts))
+            writer(session).append("forget-complete", Output((ContentPart("text", "Done."),), "complete"))
+    await ctx.provide(ServiceKey("scenario.forget"), ctx.entrypoint(forget))
+'''
+
 
 async def wait_for_tool_clock() -> None:
     # ADR-0100 deliberately treats timestamps before process startup as unknown.
@@ -87,7 +119,7 @@ def configure(sources: Path, workspace: Path) -> None:
         "prompt_sources": {"trusted-global": "scenario_private_target"}})
 
 
-async def scenario(memory_source: Path | None) -> dict[str, object]:
+async def scenario(memory_source: Path | None, *, provider: str = "default_memory") -> dict[str, object]:
     entered, release = asyncio.Event(), asyncio.Event()
     model_requests: list[dict] = []
     decision = ["share"]
@@ -126,12 +158,56 @@ async def scenario(memory_source: Path | None) -> dict[str, object]:
 
         root = host.live_root
         assert root is not None
-        memory = root.context.require(DEFAULT_MEMORY)
+        if provider == "akasha":
+            from plugins.context.contract import MATERIALS_V4
+            from plugins.akasha.infrastructure.persistence import load_consumption
+            with sqlite3.connect(workspace / "sessions.db") as db:
+                for project, recall in (("private", True), ("denied", False)):
+                    db.execute("INSERT INTO owner_records VALUES (?,?,1,?)", (
+                        "plugin:akasha:scope-policy", "project=" + project,
+                        json.dumps({"learn": "isolated", "recall": recall})))
+            async with root.context.require(MATERIALS_V4).bind() as view:
+                await view.prepare((), "conversation")
+            async def caught_up(ending):
+                async with asyncio.timeout(15):
+                    while True:
+                        state = load_consumption(workspace / "memory/akasha.db")
+                        if state is not None and state.applied_at(ending) is not None:
+                            return
+                        await asyncio.sleep(.025)
+        else:
+            memory = root.context.require(DEFAULT_MEMORY)
         await append(TARGET["session_id"], "coffee-user", "I prefer coffee without sugar.")
-        await append("scenario:unrelated", "private-other", "Unrelated secret watermelon.", learning="excluded")
-        assert not (await memory.consume())["failures"]
-        with sqlite3.connect(workspace / "memory/default-v2.db") as db:
-            identity = db.execute("SELECT id FROM memory_items WHERE fact LIKE ?", ("%coffee without sugar%",)).fetchone()[0]
+        await append("scenario:unrelated", "private-other", "Unrelated secret watermelon.",
+                     learning="eligible" if provider == "akasha" else "excluded",
+                     scope=(("project", "private"),) if provider == "akasha" else ())
+        if provider == "akasha":
+            await caught_up("coffee-user:reply")
+            identity = "coffee-user:reply"
+            from plugins.akasha.contract import INITIATIVE_MEMORY
+            port = root.context.require(INITIATIVE_MEMORY)
+            timestamp = datetime.now(UTC).isoformat()
+            await port.admit("private-check", "scenario:unrelated", "secret", timestamp=timestamp)
+            private = await port.prepare("private-check", "scenario:unrelated", "secret", timestamp=timestamp)
+            assert "secret watermelon" in private["text"] and "coffee without sugar" not in private["text"]
+            embeddings = requests["embedding"]
+            assert await port.prepare("private-check", "scenario:unrelated", "secret", timestamp=timestamp) == private
+            async with port.guard("private-check", "scenario:unrelated") as reason:
+                assert reason is None
+            assert requests["embedding"] == embeddings
+            async with port.guard("private-check", TARGET["session_id"]) as reason:
+                assert reason == "memory_scope_changed"
+            await append("scenario:denied", "denied", "secret", scope=(("project", "denied"),), finish=False)
+            try:
+                await port.admit("denied-check", "scenario:denied", "secret", timestamp=timestamp)
+            except PermissionError:
+                pass
+            else:
+                raise AssertionError("recall=false admitted initiative memory")
+        else:
+            assert not (await memory.consume())["failures"]
+            with sqlite3.connect(workspace / "memory/default-v2.db") as db:
+                identity = db.execute("SELECT id FROM memory_items WHERE fact LIKE ?", ("%coffee without sugar%",)).fetchone()[0]
 
         async def rpc(name: str, **params):
             method = root.context.require(RpcMethod.key("drift/initiative/" + name))
@@ -188,14 +264,20 @@ async def scenario(memory_source: Path | None) -> dict[str, object]:
         await propose("forget-during-model", 3)
         await append(TARGET["session_id"], "forget-user", "Forget my coffee preference.", finish=False)
         after_forget_request = catalog.reader(TARGET["session_id"]).snapshot()
-        tools, bindings = root.context.require(TOOLS), root.context.require(BINDINGS)
-        ref = next(ref for ref in root.context.require(ALL_TOOLS)().refs if ref.name == "forget_memory")
-        binding = await tools.bind(ref, bindings)
-        messages = root.context.require(MESSAGE_CATALOG).reader(TARGET["session_id"]).snapshot()
-        source = CallSource(CallRef("wake-forget", 0), messages)
-        async with tools.open(bindings.describe(binding, TOOLS)) as bound:
-            prepared = await bound.prepare({"memory_ids": [identity], "reason": "User asked to forget"}, source)
-            assert (await bound.invoke(source.effect_key, prepared)).outcome == "success"
+        if provider == "akasha":
+            from agent.plugin_composition import ServiceKey
+            await root.context.require(ServiceKey("scenario.forget"))(TARGET["session_id"], "coffee-user")
+            await caught_up("forget-complete")
+            after_forget_request = catalog.reader(TARGET["session_id"]).snapshot()
+        else:
+            tools, bindings = root.context.require(TOOLS), root.context.require(BINDINGS)
+            ref = next(ref for ref in root.context.require(ALL_TOOLS)().refs if ref.name == "forget_memory")
+            binding = await tools.bind(ref, bindings)
+            messages = root.context.require(MESSAGE_CATALOG).reader(TARGET["session_id"]).snapshot()
+            source = CallSource(CallRef("wake-forget", 0), messages)
+            async with tools.open(bindings.describe(binding, TOOLS)) as bound:
+                prepared = await bound.prepare({"memory_ids": [identity], "reason": "User asked to forget"}, source)
+                assert (await bound.invoke(source.effect_key, prepared)).outcome == "success"
         release.set()
         await wait_state("forget-during-model", "invalidated")
         assert catalog.reader(TARGET["session_id"]).snapshot() == after_forget_request
@@ -203,10 +285,11 @@ async def scenario(memory_source: Path | None) -> dict[str, object]:
 
         before_delivery = catalog.reader(TARGET["session_id"]).snapshot()
         await propose("fresh-opportunity", 3)
-        with sqlite3.connect(workspace / "memory/default-v2.db") as db:
-            fresh = json.loads(db.execute("SELECT value FROM receipts WHERE key LIKE ? ORDER BY rowid DESC LIMIT 1",
-                                          ("initiative-snapshot:%",)).fetchone()[0])
-        assert identity not in [item["id"] for item in fresh["presented"]]
+        with sqlite3.connect(workspace / ("sessions.db" if provider == "akasha" else "memory/default-v2.db")) as db:
+            query = ("SELECT value FROM owner_records WHERE owner='plugin:akasha' AND key LIKE 'initiative:snapshot:%' ORDER BY rowid DESC LIMIT 1"
+                     if provider == "akasha" else "SELECT value FROM receipts WHERE key LIKE 'initiative-snapshot:%' ORDER BY rowid DESC LIMIT 1")
+            fresh = json.loads(db.execute(query).fetchone()[0])
+        assert identity not in [item["ending" if provider == "akasha" else "id"] for item in fresh["presented"]]
         await rpc("pause", request_id="pause-during-model", expected_version=0)
         release.set()
         await wait_state("fresh-opportunity", "ready_for_delivery")
@@ -290,13 +373,23 @@ async def scenario(memory_source: Path | None) -> dict[str, object]:
                 "durable_recall_admissions": admissions,
                 "original_rows_preserved": True}
 
+    def configure_provider(sources, workspace):
+        configure(sources, workspace)
+        if provider == "akasha":
+            save_config(workspace / "plugin-data/akasha-builtin", {"memory_enabled": True})
+            save_config(workspace / "plugin-data/default_memory-builtin", {"enabled": False})
+            save_config(workspace / "plugin-data/wake-builtin", {
+                "delivery": TARGET, "timezone": "UTC", "memory_provider": "akasha"})
+            with (sources / "memory_probe/plugin.py").open("a") as stream:
+                stream.write(FEEDBACK_PROBE)
     with tempfile.TemporaryDirectory(prefix="dmw-") as directory:
-        return await run(Path(directory), extension=exercise, configure=configure, chat_handler=chat,
+        return await run(Path(directory).resolve(), extension=exercise, configure=configure_provider, chat_handler=chat,
                          memory_source=memory_source, setup_only=True)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--memory-source", type=Path)
+    parser.add_argument("--provider", choices=("default_memory", "akasha"), default="default_memory")
     arguments = parser.parse_args()
-    print(json.dumps(asyncio.run(scenario(arguments.memory_source)), ensure_ascii=False))
+    print(json.dumps(asyncio.run(scenario(arguments.memory_source, provider=arguments.provider)), ensure_ascii=False))

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
@@ -30,6 +31,7 @@ class Config(BaseModel):
     enabled: bool | None = True
     delivery: DeliveryTarget | None = None
     timezone: str = "Asia/Shanghai"
+    memory_provider: Literal["default_memory", "akasha"] = "default_memory"
     investigation_tools: tuple[str, ...] = ("recall_memory", "web_fetch")
 
     @field_validator("timezone")
