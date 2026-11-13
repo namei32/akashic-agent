@@ -111,6 +111,7 @@ class MessageMemory:
             self._check_open()
             async with self._bindings.open(self._learning_binding, AKASHA_LEARNING) as (learning, metadata):
                 rule = LearningConfig.model_validate(dict(metadata))
+                await run_memory_job(lambda: learning.check_selection(self._consumer.state, rule))
                 await run_memory_job(lambda: self._consumer.check_embedding_space(
                     rule.embedding_model, rule.dimension, self._bindings,
                 ))
@@ -132,6 +133,7 @@ async def prepare_materials(
     visible_snapshot: tuple[Message, ...] | None = None,
 ) -> MaterialData:
     """在已核对空间的图上查询真实输入前缀，发布出处后交付材料。"""
+    learning.check_selection(state, rule)
     if not snapshot:
         return {}
     # 1. 使用调用者已经固定的真实区间，后来输入不会进入本次 cue。

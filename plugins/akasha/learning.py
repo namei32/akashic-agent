@@ -12,6 +12,7 @@ from plugins.ledger.contract import MessageCatalog, MessageEmbeddings
 from plugins.ledger.contract import Actor, ContentPart, Input, Message, Output, ToolCall, ToolResult, is_user_input, origin
 from ._boundaries import PostCommitReader, TOOLS, TurnProjection
 from .domain.model import Turn, TurnFeedback
+from .domain.model import MemoryRebuildRequiredError
 from .infrastructure.consumption import Applied, Consumption, message_nodes
 from .infrastructure.lexical import Terms, terms as lexical_terms
 from .projection import (
@@ -24,6 +25,7 @@ class LearningConfig(BaseModel):
     embedding_model: Annotated[str, Field(min_length=1)]
     dimension: Annotated[int, Field(gt=0)]
     sources: tuple[Annotated[str, Field(min_length=1)], ...]
+    excluded_turn_endings: tuple[Annotated[str, Field(min_length=1)], ...] = ()
 
 
 class Feedback(BaseModel):
@@ -39,10 +41,21 @@ class Learning:
     def __init__(
         self, projection: TurnProjection, *, owner: str,
         post_commit_effect: PostCommitReader,
+        excluded_turn_endings: tuple[str, ...] = (),
     ):
         self.projection = projection
         self.owner = owner
         self._post_commit_effect = post_commit_effect
+        self._excluded = frozenset(excluded_turn_endings)
+
+    def check_ending(self, ending: str) -> None:
+        if ending in self._excluded:
+            raise MemoryRebuildRequiredError("学习材料包含明确排除的回合，需要显式重建")
+
+    def check_selection(self, state: Consumption, config: LearningConfig) -> None:
+        for ending in self._excluded.union(config.excluded_turn_endings):
+            if state.applied_at(ending) is not None:
+                raise MemoryRebuildRequiredError("学习图包含明确排除的回合，需要显式重建")
 
     def text(self, message: Message) -> str:
         """只连接用户输入与模型回答的可见正文；插件自动写入的输入、控制与工具协议不成为问答文本。"""
@@ -96,10 +109,14 @@ class Learning:
                 catalog, self.projection, session, head, cursor=cursor,
                 include=lambda _session, source: source in config.sources,
             ):
-                yield session, tuple(sample for sample in samples if self.accepts(sample) and keep(sample)), advanced
+                yield session, tuple(sample for sample in samples
+                    if sample.ending.message_id not in config.excluded_turn_endings
+                    and self.accepts(sample) and keep(sample)), advanced
 
     def accepts(self, sample: Sample) -> bool:
         """一条历史成员被禁止沉淀时，整个问答样本不成为学习材料。"""
+        if sample.ending.message_id in self._excluded:
+            return False
         effects = tuple(self._post_commit_effect(message)
                         for message in (*sample.messages, *sample.observations))
         return "suppress" not in effects
@@ -149,6 +166,8 @@ class Learning:
         *, previous: Sequence[Turn], state: Consumption, bindings: Bindings,
         terms: Callable[[str], Terms] = lexical_terms,
     ) -> Turn | None:
+        if sample.ending.message_id in config.excluded_turn_endings or not self.accepts(sample):
+            return None
         return dialogue_turn(
             sample, node_id=len(previous),
             previous=datetime.fromisoformat(previous[-1].committed_at) if previous else None,
@@ -162,8 +181,9 @@ class Learning:
         if catalog.attributes(entry.session_id).learning != "eligible":
             raise ValueError("已学习样本属于禁止学习的 Session")
         sample = restore_sample(catalog, entry)
-        if not self.accepts(sample):
-            raise ValueError("已学习样本包含禁止沉淀的历史成员")
+        self.check_ending(sample.ending.message_id)
+        if sample.ending.message_id in config.excluded_turn_endings or not self.accepts(sample):
+            raise MemoryRebuildRequiredError("已学习样本包含禁止沉淀的历史成员")
         if sample.ending.source not in config.sources:
             raise ValueError("已学习来源不属于原学习绑定")
         return sample

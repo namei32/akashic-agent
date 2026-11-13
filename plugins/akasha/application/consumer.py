@@ -276,6 +276,7 @@ class MessageConsumer:
         # 1. 实际执行原绑定的纯规则，不能另传一套不相符的算法和配置。
         async with bindings.open(learning_binding, AKASHA_LEARNING) as (learning, metadata):
             rule = LearningConfig.model_validate(dict(metadata))
+            await run_memory_job(lambda: learning.check_selection(self.state, rule))
             # 图空间从原出处恢复；切换模型不能把新向量接到旧图中。
             await run_memory_job(partial(
                 self.check_embedding_space, rule.embedding_model, rule.dimension, bindings,
