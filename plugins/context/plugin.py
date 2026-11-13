@@ -32,6 +32,7 @@ from .api import (
     decode_material,
     settled_prefixes,
     summary_range,
+    summary_cutoff as _summary_cutoff,
 )
 from .materials import ContextMaterials
 
@@ -61,27 +62,6 @@ class Config(BaseModel):
         if any(not item.strip() for item in value):
             raise ValueError("指定材料和插件名称不能为空")
         return value
-
-
-def _summary_cutoff(snapshot: Sequence[Message], summary: Summary | None) -> int:
-    """摘要代替已选择窗口的旧区间，窗口外更早历史不进入请求。"""
-    # 1. 在快照输入边界拒绝混合 Session、重排与重复身份。
-    if snapshot and type(snapshot) is not MessageSnapshot:
-        session = snapshot[0].session_id
-        if any(item.session_id != session for item in snapshot):
-            raise ValueError("Context 快照只能属于一个 Session")
-        if any(a.seq >= b.seq for a, b in zip(snapshot, snapshot[1:])):
-            raise ValueError("Context 快照必须按 seq 严格递增")
-        if len({item.message_id for item in snapshot}) != len(snapshot):
-            raise ValueError("Context 快照消息身份重复")
-    if summary is None:
-        return -1
-    covered = summary_range(snapshot, summary.source_message_ids)
-    # 2. 不让摘要切开 provider 必须成对恢复的工具请求与结果。
-    ends = settled_prefixes(snapshot[:covered.stop])
-    if covered.stop not in ends or covered.start and covered.start not in ends:
-        raise ValueError("摘要不能覆盖尚未结算的工具调用")
-    return snapshot[covered.stop - 1].seq
 
 
 class ContextBuilder:

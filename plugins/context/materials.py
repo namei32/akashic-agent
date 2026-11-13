@@ -11,9 +11,9 @@ from agent.plugin_composition.model import FiberState
 from plugins.models.contract import ContextModel, ModelRequest
 from plugins.models.contract import BoundChatModel
 from agent.plugin_composition.tasks import child_task_context
-from plugins.ledger.contract import Message
+from plugins.ledger.contract import Message, is_user_input
 from plugins.context.contract import (
-    MaterialData, MaterialKind, Prepare, ReductionStatus, SummaryData, SummaryReducer,
+    MaterialData, MaterialKind, Prepare, PrepareVisible, ReductionStatus, SummaryData, SummaryReducer,
 )
 
 from .api import (
@@ -23,6 +23,7 @@ from .api import (
     decode_material,
     decode_summary,
     material_data,
+    summary_cutoff,
 )
 
 
@@ -35,6 +36,7 @@ class _Source:
     summary: bool
     context: Context
     reduce: SummaryReducer | None
+    prepare_visible: PrepareVisible | None = None
 
     @property
     def plugin_id(self) -> str:
@@ -80,9 +82,26 @@ class MaterialView:
             collect(caller.runtime.plugin_id, decode_material({"reminders": reminders}).reminders)
         summary: Summary | None = None
         references: dict[str, Mapping[str, object]] = {}
+        tasks: dict[str, asyncio.Task[Materials | Exception]] = {}
+        summary_name = next((name for name, owner in self._sources if owner.summary), None)
+
         async def prepare_owner(owner: _Source) -> Materials | Exception:
             """Keep each independent contribution inside its actual owner scope."""
             try:
+                if owner.prepare_visible is not None:
+                    selected_summary: Summary | None = None
+                    if summary_name is not None:
+                        summary_material = await tasks[summary_name]
+                        if isinstance(summary_material, Exception):
+                            raise summary_material
+                        selected_summary = summary_material.summary
+                    cutoff = summary_cutoff(snapshot, selected_summary)
+                    latest = next((message.message_id for message in reversed(snapshot)
+                                   if message.source == source and is_user_input(message)), None)
+                    visible = tuple(message for message in snapshot
+                                    if message.seq > cutoff or message.message_id == latest)
+                    async with owner.context.runtime_scope():
+                        return decode_material(await owner.prepare_visible(snapshot, source, visible))
                 async with owner.context.runtime_scope():
                     return decode_material(await owner.prepare(snapshot, source))
             except Exception as error:
@@ -91,10 +110,11 @@ class MaterialView:
 
         # Preparation may overlap; merging still follows the frozen source order.
         async with asyncio.TaskGroup() as group:
-            tasks = [group.create_task(prepare_owner(owner), context=child_task_context())
-                     for _, owner in self._sources]
-        for (name, owner), task in zip(self._sources, tasks, strict=True):
-            material = task.result()
+            ordered_sources = sorted(self._sources, key=lambda item: item[0] != summary_name)
+            for name, owner in ordered_sources:
+                tasks[name] = group.create_task(prepare_owner(owner), context=child_task_context())
+        for name, owner in self._sources:
+            material = tasks[name].result()
             if isinstance(material, Exception):
                 raise material
             self._check_active()
@@ -180,6 +200,7 @@ class ContextMaterials:
         self, ctx: Context, *, name: str, prepare: Prepare,
         kind: MaterialKind, priority: int = 0, prompt: bool = False,
         reduce: SummaryReducer | None = None,
+        prepare_visible: PrepareVisible | None = None,
     ) -> Effect:
         """Register an independent owner; priority orders output, not execution.
 
@@ -211,11 +232,13 @@ class ContextMaterials:
                 raise PermissionError("只有获授的摘要材料 owner 能注册缩减")
             if not callable(reduce):
                 raise TypeError("摘要缩减必须可调用")
+        if prepare_visible is not None and (kind != "recall" or not callable(prepare_visible)):
+            raise TypeError("可见原文准备回调只供召回材料 owner 使用")
 
         def setup():
             if name in self._sources:
                 raise ValueError(f"材料 owner 重复: {name}")
-            self._sources[name] = _Source(prepare, priority, kind, prompt, summary, ctx, reduce)
+            self._sources[name] = _Source(prepare, priority, kind, prompt, summary, ctx, reduce, prepare_visible)
             return lambda: self._sources.pop(name)
 
         return await ctx.effect(setup, label=f"materials:{name}")
