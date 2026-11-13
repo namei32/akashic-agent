@@ -160,12 +160,14 @@ async def run(ctx: Context, interest: Interest) -> None:
     _ = await catalog.declare_group(ctx, description=desc)
 
     async def request_reindex(invocation: CommandInvocation) -> CommandResult:
-        if invocation.raw_input.strip().casefold() != "confirm":
+        option = invocation.raw_input.strip().casefold()
+        if option not in {"confirm", "confirm fill_missing"}:
             return CommandResult(
                 "error",
-                "Akasha 重建会用 canonical 来源整体替换派生学习图；确认后以 /akasha_reindex confirm 执行。",
+                "Akasha 重建会整体替换派生学习图；以 /akasha_reindex confirm 执行。"
+                "若授权调用原模型补齐缺失向量，使用 /akasha_reindex confirm fill_missing。",
             )
-        return await run_rebuild()
+        return await run_rebuild(fill_missing=option == "confirm fill_missing")
 
     settings = config.settings()
     memory_path = resolve_memory_path(ctx.workspace_root("memory"), settings.db_path)
@@ -653,7 +655,7 @@ async def run(ctx: Context, interest: Interest) -> None:
         async with graph_access(key):
             return await start_memory(key)
 
-    async def rebuild_now() -> str:
+    async def rebuild_now(*, fill_missing: bool = False) -> str:
         """全量重放 canonical 来源；失败时已发布学习图保持不变。"""
         nonlocal memory_rule
         # 1. 先确认 embedding 空间可用，避免无谓地停掉在线学习。
@@ -678,6 +680,7 @@ async def run(ctx: Context, interest: Interest) -> None:
                             bindings=ctx.require(BINDINGS), config=settings.memory_config(),
                             learning_binding=identity, embed_batch=embedder(rule, model_id),
                             memory_path=path, backup_root=backup_root, member=member(key),
+                            skip_missing_embeddings=not fill_missing,
                         )
                         set_graph_error(key, None)
                         reports.append(manifest_json(report))
@@ -688,9 +691,9 @@ async def run(ctx: Context, interest: Interest) -> None:
             raise RuntimeError("Akasha 重建后无法重新装载学习图")
         return "\n".join(reports)
 
-    async def run_rebuild() -> CommandResult:
+    async def run_rebuild(*, fill_missing: bool = False) -> CommandResult:
         """操作者显式确认后全量重建。"""
-        return CommandResult("success", "Akasha 重建完成：" + await rebuild_now())
+        return CommandResult("success", "Akasha 重建完成：" + await rebuild_now(fill_missing=fill_missing))
 
     def _note_replay(payload: Mapping[str, object]) -> None:
         """把重放状态写进 memory root；这是安装期唯一稳定可读的证据面。"""
