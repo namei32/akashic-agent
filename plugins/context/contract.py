@@ -18,6 +18,8 @@ SummaryData = Mapping[str, object]
 ReductionStatus = Callable[[str, bool], Awaitable[None]]
 # 回调第二个参数声明诊断是否随本次 Output 保留；False 只更新临时进度。
 Prepare = Callable[[tuple[Message, ...], str], Awaitable[MaterialData]]
+# 召回 owner 同时取得真实日志和本次可见原文；前者核对出处，后者只用于去重。
+PrepareVisible = Callable[[tuple[Message, ...], str, tuple[Message, ...]], Awaitable[MaterialData]]
 
 
 class SummaryReducer(Protocol):
@@ -105,6 +107,7 @@ class ContextMaterialsV4(Protocol):
         priority: int = 0,
         prompt: bool = False,
         reduce: SummaryReducer | None = None,
+        prepare_visible: PrepareVisible | None = None,
     ) -> Effect: ...
     def bind(
         self, *, exclude_kinds: frozenset[MaterialKind] = frozenset(),

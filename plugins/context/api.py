@@ -12,11 +12,31 @@ from plugins.ledger.contract import (
     ContentReferences,
     Control,
     Message,
+    MessageSnapshot,
     Output,
     ToolCall,
     ToolResult,
 )
 from plugins.context.contract import MaterialData
+
+
+def summary_cutoff(snapshot: Sequence[Message], summary: Summary | None) -> int:
+    """请求组装与召回去重共用的摘要切点；不改变来源消息或回合归属。"""
+    if snapshot and type(snapshot) is not MessageSnapshot:
+        session = snapshot[0].session_id
+        if any(item.session_id != session for item in snapshot):
+            raise ValueError("Context 快照只能属于一个 Session")
+        if any(a.seq >= b.seq for a, b in zip(snapshot, snapshot[1:])):
+            raise ValueError("Context 快照必须按 seq 严格递增")
+        if len({item.message_id for item in snapshot}) != len(snapshot):
+            raise ValueError("Context 快照消息身份重复")
+    if summary is None:
+        return -1
+    covered = summary_range(snapshot, summary.source_message_ids)
+    ends = settled_prefixes(snapshot[:covered.stop])
+    if covered.stop not in ends or covered.start and covered.start not in ends:
+        raise ValueError("摘要不能覆盖尚未结算的工具调用")
+    return snapshot[covered.stop - 1].seq
 
 
 def settled_prefixes(messages: Sequence[Message]) -> tuple[int, ...]:
