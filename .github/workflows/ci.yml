@@ -75,6 +75,11 @@ jobs:
         run: |
           .venv/bin/pytest -q tests/
           .venv/bin/python scripts/runtime_diagnostics_scenario.py
+          for entrypoint in reply scheduler subagent; do
+            .venv/bin/python scripts/react_budget_recovery_workflow.py --entrypoint "$entrypoint" --steps 45
+            .venv/bin/python scripts/react_budget_recovery_workflow.py --entrypoint "$entrypoint" --max-steps 0 --steps 45
+            .venv/bin/python scripts/react_budget_recovery_workflow.py --entrypoint "$entrypoint" --max-steps 40
+          done
 
       - name: Run frontend typecheck
         run: |
