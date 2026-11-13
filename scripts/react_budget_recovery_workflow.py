@@ -5,13 +5,14 @@ import argparse
 import asyncio
 from contextlib import asynccontextmanager
 import json
+from importlib import import_module
 from pathlib import Path
 import sqlite3
 import sys
 import tempfile
 
 
-async def run(folder: Path, limit: int) -> dict:
+async def run(folder: Path, limit: int, *, complete_after: int | None = None) -> dict:
     import httpx
     from agent.plugin_composition.tasks import Tasks
     from core.net.http import HttpClient
@@ -37,7 +38,7 @@ async def run(folder: Path, limit: int) -> dict:
 
     requests, effects, handlers = [], [], set()
     entered, released = asyncio.Event(), asyncio.Event()
-    holds, final, reject_next = 2, False, False
+    holds, final, reject_next = (0 if complete_after is not None else 2), False, False
 
     async def serve(reader, writer):
         nonlocal holds, reject_next
@@ -63,11 +64,12 @@ async def run(folder: Path, limit: int) -> dict:
             call = {"index": 0, "id": f"write-{number}", "type": "function", "function": {
                 "name": "write_file", "arguments": json.dumps({
                     "path": str(folder / f"receipt-{number}.txt"), "content": f"effect-{number}\n"})}}
-            message = {"role": "assistant", "content": "recovered" if final else None}
-            if not final:
+            finished = final or (complete_after is not None and len(effects) >= complete_after)
+            message = {"role": "assistant", "content": "recovered" if finished else None}
+            if not finished:
                 message["tool_calls"] = [{key: value for key, value in call.items() if key != "index"}]
             data = json.dumps({"id": f"response-{len(requests)}", "choices": [{
-                "index": 0, "message": message, "finish_reason": "stop" if final else "tool_calls"}],
+                "index": 0, "message": message, "finish_reason": "stop" if finished else "tool_calls"}],
                 "usage": {"prompt_tokens": 12, "completion_tokens": 4, "total_tokens": 16}}).encode()
             writer.write(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(data)}\r\nConnection: close\r\n\r\n".encode() + data)
             await writer.drain()
@@ -185,6 +187,29 @@ async def run(folder: Path, limit: int) -> dict:
     try:
         conversation = source()
         await conversation.accept("first", Input((ContentPart("text", "write numbered receipts"),)))
+        if complete_after is not None:
+            protected = rows()
+            await asyncio.wait_for((await conversation.start(program)).join(), 60)
+            output = log.reader("scenario").snapshot()[-1].body
+            assert isinstance(output, Output) and output.finish == "complete"
+            assert len(effects) == complete_after and len(set(effects)) == len(effects)
+            assert len(requests) == complete_after + 1
+            assert sum(row["role"] == "tool" for row in requests[-1]["messages"]) == complete_after
+            assert all((folder / f"receipt-{i}.txt").read_text() == f"effect-{i}\n"
+                       for i in range(1, complete_after + 1))
+            committed = rows()
+            assert committed[:len(protected)] == protected, "既有消息被改写"
+            assert mutations and set(mutations) == {sqlite3.SQLITE_INSERT}, "出现旧消息 UPDATE/DELETE 尝试"
+            await tasks.close()
+            log.close()
+            log, tasks = MessageLog(folder / "sessions.db"), Tasks()
+            log._connection.set_authorizer(observe)
+            assert rows() == committed, "账本重开后消息改变"
+            assert not await source().needs_reply(log.reader("scenario"), "conversation")
+            return {"max_steps": limit, "file_effects": len(effects), "http_requests": len(requests),
+                    "completed_without_step_limit": True, "message_update_delete_attempts": 0,
+                    "original_rows_preserved": len(protected), "reopened_rows": len(committed),
+                    "old_tools_not_replayed": True}
         active = await conversation.start(program)
         await asyncio.wait_for(entered.wait(), 10)
         await conversation.pause("pause")
@@ -273,9 +298,25 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--steps", type=int, default=2)
+    parser.add_argument("--entrypoint", choices=("reply", "scheduler", "subagent"),
+                        help="从真实入口 Config 读取缺省步数；0 时完成 --steps 次工具操作")
+    parser.add_argument("--max-steps", type=int, help="向选定入口显式传入 max_steps 配置")
     args = parser.parse_args()
     if args.steps < 2:
         parser.error("--steps 必须至少为 2，供中途暂停和插话场景使用")
     sys.path.insert(0, str(args.source_root.resolve()))
+    if args.max_steps is not None and args.entrypoint is None:
+        parser.error("--max-steps 需要 --entrypoint")
+    limit = args.steps
+    if args.entrypoint:
+        config_type = import_module(f"plugins.{args.entrypoint}.plugin").Config
+        config = config_type.model_validate({} if args.max_steps is None else {"max_steps": args.max_steps})
+        limit = config.max_steps
+    complete_after = args.steps if limit == 0 or (args.entrypoint and args.max_steps is None) else None
+    if complete_after is None and limit < 2:
+        parser.error("有界恢复场景需要至少 2 步，供中途暂停和插话场景使用")
     with tempfile.TemporaryDirectory(prefix="react-budget-workflow-") as temporary:
-        print(json.dumps(asyncio.run(run(Path(temporary), args.steps)), ensure_ascii=False, indent=2))
+        result = asyncio.run(run(Path(temporary), limit, complete_after=complete_after))
+        if args.entrypoint:
+            result["entrypoint"] = args.entrypoint
+        print(json.dumps(result, ensure_ascii=False, indent=2))

@@ -167,3 +167,7 @@
 - [0128 · Codex 回合通知经本机 Gateway 写入独立会话](0128-codex-notifications-use-local-gateway.md)
 
 - [0129 · 回复循环耗尽后由新输入续额](0129-exhausted-react-budget-renews-on-new-input.md)：accepted；只续循环额度，保留 Turn、旧消息和工具结果；SES-013。
+
+- [0131 · Codex 指挥使用 Windows 原生 CLI 后端](0131-codex-control-uses-shared-desktop-backend.md)：proposed；明确目标、原始图片、外部回执与独立 CLI 的运行边界。
+
+- [0132 · 长任务步数上限由显式配置决定](0132-step-limits-are-explicit.md)：accepted；回复、调度与子任务默认不限步数，保留正数上限与续额协议；SES-013。

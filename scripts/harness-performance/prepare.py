@@ -76,7 +76,7 @@ async def install_and_configure(side: Side) -> None:
     from plugins.gateway.contract import RpcMethod
     from scripts.install_plugin_distribution import ensure_bundle
 
-    # 1. 新建 workspace 与 base 组合；reply 的 max_steps=0 表示不设步数上限（默认 40 跑不完 100 轮）。
+    # 1. 新建 workspace 与 base 组合；显式设为不限步数，保持新旧版本的比较条件一致。
     workspace, config = side.state / "workspace", side.state / "config.toml"
     (side.state / "home").mkdir()
     _ = config.write_text("[runtime]\n")

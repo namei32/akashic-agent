@@ -5,6 +5,7 @@
 - 范围：ReAct 预算投影；[SES-013](../projectneed.md#ses-013-回复循环耗尽后由新输入续额)
 - 部分修订：[消息设计 §5.3](../design/0902-reviewed-v4.md)、[工具展示纠错预算](../design/plugin-tool-view.md)
 - 关联：[0092](0092-model-generation-recovers-until-output.md)、[0100](0100-message-tool-calls-recover-at-turn-granularity.md)
+- 默认 40 次的选择 superseded by [0132](0132-step-limits-are-explicit.md)；显式上限耗尽后的续额协议保留。
 
 ## 问题与选择
 
