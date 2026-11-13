@@ -87,6 +87,8 @@ Issue 1179 的当前实现与重大决定见 [边界②③审查入口](design/p
 
 [Default Memory 当前插件与历史保全迁移](design/default-memory-current-plugin.md) 说明结构化记忆替换、完整历史补学与回退。
 
+[切换到新版 Akasha](design/akasha-engine-switch.md) 说明定向移植、历史保全、Drift 适配与切换验收。
+
 ## 4. 数据任务的额外入口
 
 涉及消息、记忆、附件、配置、凭据、调度、plugin-data，或裁切、压缩、重建、同步、迁移、覆盖、卸载、删除时，先读 [持久化状态地图](design/persistence-state-map.md) 的相关对象及其勘误，再按 STA-003 核对本次增、改、减与恢复方式。地图中的推断和未知不能充当删除依据。
