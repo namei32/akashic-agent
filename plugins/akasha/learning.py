@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import datetime
 from typing import Annotated, Literal, cast
 
@@ -9,12 +9,13 @@ from pydantic import BaseModel, ConfigDict, Field
 from agent.plugin_composition import ServiceKey
 from plugins.ledger.contract import Bindings
 from plugins.ledger.contract import MessageCatalog, MessageEmbeddings
-from plugins.ledger.contract import ContentPart, Input, Message, Output, ToolCall, ToolResult
+from plugins.ledger.contract import Actor, ContentPart, Input, Message, Output, ToolCall, ToolResult, is_user_input, origin
 from ._boundaries import PostCommitReader, TOOLS, TurnProjection
 from .domain.model import Turn, TurnFeedback
 from .infrastructure.consumption import Applied, Consumption, message_nodes
+from .infrastructure.lexical import Terms, terms as lexical_terms
 from .projection import (
-    Sample, SessionCursor, dialogue_turn, project_session, restore_sample,
+    Sample, SessionCursor, dialogue_turn, iter_session, restore_sample,
 )
 
 
@@ -44,8 +45,11 @@ class Learning:
         self._post_commit_effect = post_commit_effect
 
     def text(self, message: Message) -> str:
-        """只连接可见正文；控制、工具协议和内部模型事实不成为问答文本。"""
-        if not isinstance(message.body, (Input, Output)):
+        """只连接用户输入与模型回答的可见正文；插件自动写入的输入、控制与工具协议不成为问答文本。"""
+        if isinstance(message.body, Input):
+            if not is_user_input(message):
+                return ""
+        elif not isinstance(message.body, Output) or origin(message).actor is not Actor.MODEL:
             return ""
         return "".join(
             part.value for part in message.body.parts
@@ -65,22 +69,34 @@ class Learning:
         """只投影续读点之后的闭段；新续读点由调用者在成功消费后才采用。"""
         found: list[Sample] = []
         advanced: dict[str, SessionCursor] = {}
+        for session, samples, cursor in self.iter_samples_since(
+            catalog, config, heads=heads, cursors=cursors, keep=keep,
+        ):
+            advanced[session] = cursor
+            found.extend(samples)
+        return tuple(sorted(found, key=lambda sample: sample.key)), advanced
+
+    # 逐 Session、分块产出新闭段与续读点；调用者可边读边归约，正文不必整段常驻。
+    def iter_samples_since(
+        self, catalog: MessageCatalog, config: LearningConfig, *, heads: Mapping[str, int],
+        cursors: Mapping[str, SessionCursor], keep: Callable[[Sample], bool],
+    ) -> Iterator[tuple[str, tuple[Sample, ...], SessionCursor]]:
         for session, head in heads.items():
             cursor = cursors.get(session)
             # 1. 没有新消息的 Session 连学习资格也不再读取；资格在接纳时固定，不必解码禁止学习的正文。
             if cursor is not None and cursor.head == head:
-                advanced[session] = cursor
+                yield session, (), cursor
                 continue
             if catalog.attributes(session).learning != "eligible":
-                advanced[session] = SessionCursor(head, {})
+                yield session, (), SessionCursor(head, {})
                 continue
-            samples, advanced[session] = project_session(
+            # 2. 来源和历史 effect 仍由原学习规则筛选；keep 只丢弃调用者本来就跳过的样本，不让其正文常驻。
+            #    同一 Session 可能分块产出多次，最后一次的续读点才覆盖到 head。
+            for samples, advanced in iter_session(
                 catalog, self.projection, session, head, cursor=cursor,
                 include=lambda _session, source: source in config.sources,
-            )
-            # 2. 来源和历史 effect 仍由原学习规则筛选；keep 只丢弃调用者本来就跳过的样本，不让其正文常驻。
-            found.extend(sample for sample in samples if self.accepts(sample) and keep(sample))
-        return tuple(sorted(found, key=lambda sample: sample.key)), advanced
+            ):
+                yield session, tuple(sample for sample in samples if self.accepts(sample) and keep(sample)), advanced
 
     def accepts(self, sample: Sample) -> bool:
         """一条历史成员被禁止沉淀时，整个问答样本不成为学习材料。"""
@@ -131,13 +147,14 @@ class Learning:
     def make_turn(
         self, sample: Sample, config: LearningConfig, embeddings: MessageEmbeddings,
         *, previous: Sequence[Turn], state: Consumption, bindings: Bindings,
+        terms: Callable[[str], Terms] = lexical_terms,
     ) -> Turn | None:
         return dialogue_turn(
             sample, node_id=len(previous),
             previous=datetime.fromisoformat(previous[-1].committed_at) if previous else None,
             text=self.text, embeddings=embeddings.bind(self.text),
             embedding_model=config.embedding_model, dimension=config.dimension,
-            feedback=self.feedback(sample, previous, state, bindings),
+            feedback=self.feedback(sample, previous, state, bindings), terms=terms,
         )
 
     def load_sample(self, catalog: MessageCatalog, config: LearningConfig, entry: Applied) -> Sample:
@@ -154,10 +171,11 @@ class Learning:
     def restore(
         self, sample: Sample, embeddings: MessageEmbeddings,
         config: LearningConfig, *, previous: Sequence[Turn],
-        state: Consumption, bindings: Bindings,
+        state: Consumption, bindings: Bindings, terms: Callable[[str], Terms] = lexical_terms,
     ) -> Turn:
         """用已验证的样本还原材料，不写图或重放学习事件。"""
-        turn = self.make_turn(sample, config, embeddings, previous=previous, state=state, bindings=bindings)
+        turn = self.make_turn(sample, config, embeddings, previous=previous, state=state,
+                              bindings=bindings, terms=terms)
         if turn is None:
             raise ValueError("原学习规则不再接纳已经学习的样本")
         return turn
@@ -178,6 +196,7 @@ def resolve_feedback(
             elif identity in targets:
                 node = targets[identity]
             else:
+                # 不能由目标缺席推断它曾被合法排除；历史重放先审计实际出处。
                 raise ValueError("反馈目标没有对应的已学习消息")
             (remember if item.action == "remember" else forget).add(node)
     if remember & forget:
