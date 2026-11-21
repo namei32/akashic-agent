@@ -77,7 +77,8 @@ class Request(BaseModel):
     def check_choices(self) -> Self:
         if self.source_policy or self.source_evidence or self.memory_source_session or self.source_config_revision:
             if (self.owner != "drift" or not self.source_policy or not self.source_config_revision
-                    or len(self.source_evidence) > 3
+                    or len(self.source_evidence) > 4
+                    or len({e.session_id for e in self.source_evidence}) != len(self.source_evidence)
                     or (self.memory_assisted and self.source_evidence and self.memory_source_session != self.source_evidence[0].session_id)
                     or (not self.memory_assisted and self.memory_source_session)):
                 raise ValueError("自动来源必须固定 Drift 的授权与实际证据")

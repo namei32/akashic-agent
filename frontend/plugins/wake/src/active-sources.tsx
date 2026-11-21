@@ -2,9 +2,9 @@ import type { FormProps } from "../../shared/src/configuration";
 
 type Policy = {
   enabled: boolean; revision: number; excluded: string[]; preferred: string[];
-  window_days: number; max_sessions: number;
+  fixed_session: string | null; window_days: number; max_sessions: number;
 };
-const defaults: Policy = {enabled: false, revision: 0, excluded: [], preferred: [], window_days: 7, max_sessions: 3};
+const defaults: Policy = {enabled: false, revision: 0, excluded: [], preferred: [], fixed_session: null, window_days: 7, max_sessions: 3};
 
 export function ActiveSourcesFields({values, change, status}: FormProps) {
   const policy = {...defaults, ...values.active_sources as Partial<Policy>};
@@ -16,7 +16,7 @@ export function ActiveSourcesFields({values, change, status}: FormProps) {
   });
   const options = new Map(status.targets?.filter(item => item.channel === "akashic")
     .map(item => [item.session_id, item.label]));
-  for (const identity of [...policy.preferred, ...policy.excluded]) {
+  for (const identity of [...policy.preferred, ...policy.excluded, ...(policy.fixed_session ? [policy.fixed_session] : [])]) {
     if (!options.has(identity)) options.set(identity, `${identity}（当前未列出，仍保留设置）`);
   }
   return <section aria-label="主动交流的会话来源">
@@ -36,9 +36,15 @@ export function ActiveSourcesFields({values, change, status}: FormProps) {
         <label className="config-field"><span>活跃统计窗口（天）</span>
           <input type="number" min="1" max="30" step="1" required value={Number.isFinite(policy.window_days) ? policy.window_days : ""}
             onChange={event => update({window_days: event.target.valueAsNumber})} /></label>
-        <label className="config-field"><span>每次最多取材会话数</span>
+        <label className="config-field"><span>每次最多取材会话数（不含固定会话）</span>
           <input type="number" min="1" max="3" step="1" required value={Number.isFinite(policy.max_sessions) ? policy.max_sessions : ""}
             onChange={event => update({max_sessions: event.target.valueAsNumber})} /></label>
+        <label className="config-field"><span>固定取材会话（另计 1 个）</span>
+          <select value={policy.fixed_session ?? ""} onChange={event => update({fixed_session: event.target.value || null})}>
+            <option value="">不固定</option>
+            {[...options].map(([id, label]) => <option key={id} value={id}>{label}</option>)}
+          </select></label>
+        <p>固定会话仍须有窗口内的用户发言；排除和隐私限制优先。固定取材不会改变投递目标。</p>
         <p>优先会话也必须满足身份、范围和活跃条件；排除会话不会参与自动取材。</p>
         {[...options].map(([identity, label]) => <label className="config-field" key={identity}>
           <span>{label}</span><select aria-label={`${label}的取材方式`}

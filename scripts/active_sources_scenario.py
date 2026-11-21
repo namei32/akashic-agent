@@ -17,7 +17,7 @@ from default_memory_scenario import run
 from drift_memory_wake_scenario import configure as base_configure, wait_for_tool_clock
 
 TARGET = {"channel": "akashic", "recipient": "destination", "session_id": "akashic:destination"}
-POLICY = {"enabled": True, "revision": 1, "excluded": ["akashic:excluded"], "max_sessions": 1}
+POLICY = {"enabled": True, "revision": 1, "excluded": ["akashic:excluded"], "max_sessions": 3, "fixed_session": TARGET["session_id"]}
 
 
 def configure(sources, workspace):
@@ -104,6 +104,7 @@ async def scenario(provider="default_memory"):
         await append(TARGET["session_id"], "target-user", "Destination only.")
         for day in range(3):
             await append("akashic:active", "active-" + str(day), "I prefer coffee without sugar.")
+        await append("akashic:third", "third-user", "A third conversation.")
         for i in range(12):
             await append("akashic:burst", "burst-" + str(i), "ONE_DAY_BURST")
         # Historical timestamps are fixture construction in this disposable DB.
@@ -174,6 +175,9 @@ async def scenario(provider="default_memory"):
             assert tuple(m for m in after if m.message_id in {r.message_id for r in rows}) == rows
         first = [read_request(catalog.reader(sid).snapshot()) for sid in catalog.snapshot_heads(prefix="wake:")]
         assert first[-1].source_evidence[0].session_id == "akashic:active"
+        assert first[-1].target.session_id == TARGET["session_id"]
+        ids = [e.session_id for e in first[-1].source_evidence]
+        assert len(ids) == 4 and set(ids) == {"akashic:active", "akashic:burst", "akashic:third", TARGET["session_id"]}, ids
         first_ids = first[-1].source_evidence[0].message_ids
         # Same real evidence is not counted twice when a second opportunity runs.
         await rpc("memory-consent", enabled=True, target=TARGET, request_id="grant", expected_version=0)

@@ -9,7 +9,7 @@ type Snapshot = {
   control: { paused: boolean; control_version: number };
   consent: { enabled: boolean; target: Target | null; consent_version: number };
   config: { input_ref: string; producer: Producer };
-  wake: { enabled: boolean | null; ready: boolean; reason: string; values: { delivery: Target | null; timezone: string; active_sources?: {enabled: boolean; window_days: number; max_sessions: number} };
+  wake: { enabled: boolean | null; ready: boolean; reason: string; values: { delivery: Target | null; timezone: string; active_sources?: {enabled: boolean; window_days: number; max_sessions: number; fixed_session?: string | null} };
     targets?: (Target & { label: string })[] };
   memory_ready: boolean;
   latest: { outcome: string; fired_at: string; memory_status: string | null; delivery_status: string | null; reason: string | null } | null;
@@ -191,7 +191,7 @@ export function InitiativePage({ctx}: {ctx: WebHostContextV1}) {
       </section>
       <section aria-labelledby="initiative-sources"><h2 id="initiative-sources">聊天依据</h2>
         <p>{data.wake.values.active_sources?.enabled
-          ? `已开启按用户活跃度取材：最近 ${data.wake.values.active_sources.window_days} 天，每次最多 ${data.wake.values.active_sources.max_sessions} 个同范围私人 Web 会话。`
+          ? `已开启按用户活跃度取材：最近 ${data.wake.values.active_sources.window_days} 天，每次最多 ${data.wake.values.active_sources.max_sessions} 个活跃会话${data.wake.values.active_sources.fixed_session ? "，另加 1 个符合条件的固定会话" : ""}。`
           : "自动会话取材未开启，仅以接收目标会话为聊天依据。"}</p>
         <p className="initiative-footnote">在“功能设置 → 主动联系设置”中更改开关、排除或优先会话；不会改变消息发送目标。记忆使用仍需单独授权。</p>
       </section>

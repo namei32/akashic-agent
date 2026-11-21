@@ -28,6 +28,7 @@ class SourcePolicy(BaseModel):
     revision: int = Field(default=0, ge=0)
     excluded: tuple[str, ...] = ()
     preferred: tuple[str, ...] = ()
+    fixed_session: str | None = None
     window_days: int = Field(default=7, ge=1, le=30)
     max_sessions: int = Field(default=3, ge=1, le=3)
 
@@ -155,14 +156,19 @@ class ActiveSources:
                 self.entries.clear()
                 raise RuntimeError("active_sources_prefix_changed_during_capture")
             candidates.sort(key=lambda item: (item[0], item[1], item[2], item[3]), reverse=True)
+            # The fixed conversation is additional, not a priority boost within the quota.
+            # Keep the most active source first for scoped memory queries.
+            fixed = [item for item in candidates if item[3] == policy.fixed_session]
+            ranked = [item for item in candidates if item[3] != policy.fixed_session]
+            chosen = ranked[:policy.max_sessions] + fixed
             evidence, passive, queries = [], [], {}
             # Character budgets cover each serialized row, not just its text.
             budget = 6000
-            for _, score, _, session_id, rows in candidates[:policy.max_sessions]:
+            for _, score, _, session_id, rows in chosen:
                 last_user = max(i for i, m in enumerate(rows) if is_user_input(m))
                 # Assistant/background tails must not push real user evidence out.
                 selected = rows[max(0, last_user - 8):last_user + 3]
-                remaining, rendered, used = min(2000, budget), [], []
+                remaining, rendered, used = min(2000, 6000 // len(chosen), budget), [], []
                 # Reserve room for the user before surrounding assistant messages.
                 ordered = sorted(selected, key=lambda m: (is_user_input(m), m.seq), reverse=True)
                 for m in ordered:
