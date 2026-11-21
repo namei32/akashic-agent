@@ -74,6 +74,23 @@
 .job-list__stop:disabled { opacity: 0.5; cursor: progress; }
 .job-list__stop:focus-visible { outline: 2px solid var(--ak-rule-focus); outline-offset: 2px; }
 .job-list__dot[data-status="stopping"] { background: var(--ak-color-status-warning); }
+.job-list__expand { display: flex; align-items: center; gap: 4px; min-width: 0; padding: 0; border: 0; background: transparent; text-align: start; color: inherit; font: inherit; cursor: pointer; }
+.job-list__expand svg { flex: none; }
+.job-list__expand[aria-expanded="false"] svg { transform: rotate(-90deg); }
+.job-list__subagent { grid-column: 2 / -1; display: grid; gap: 5px; margin-block-start: 4px; padding-block-start: 6px; border-top: 1px solid var(--chat-line); overflow-wrap: anywhere; }
+.job-list__subagent dl { display: flex; flex-wrap: wrap; gap: 4px 20px; }
+.job-list__subagent :is(dl, dd, p, ol) { margin: 0; }
+.job-list__subagent :is(dt, time) { color: var(--chat-faint); }
+.job-list__subagent dd { color: var(--chat-ink); }
+.job-list__subagent ol { list-style: none; padding: 0; }
+.job-list__subagent li { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 8px; }
+.job-list__subagent time { font-variant-numeric: tabular-nums; }
+.job-list__reason { color: var(--ak-color-status-error); }
+.job-list__report { justify-self: start; min-height: 32px; padding: 0 6px; border: 0; border-radius: 6px; color: var(--chat-ink); background: transparent; font: inherit; text-decoration: underline; cursor: pointer; }
+.job-list__report:hover { background: var(--chat-chip); }
+.job-list__report:focus-visible { outline: 2px solid var(--ak-rule-focus); outline-offset: 2px; }
 @media (max-width: 820px), (hover: none) {
   .job-list__stop { min-width: 40px; min-height: 40px; }
+  .job-list__expand { min-height: 44px; }
+  .job-list__report { min-height: 44px; }
 }

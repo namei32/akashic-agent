@@ -18,7 +18,7 @@ from .inputs import CONTENT, CHECK_ORIGIN
 from .inputs import CONVERSATION_COMPLETE
 from .inputs import DELIVERY
 from .inputs import REPLY_PROGRAM
-from plugins.ledger.contract import MessageConflict, MessageReader, OwnerRecord, OwnerTransaction, SessionAttributes
+from plugins.ledger.contract import MessageCatalog, MessageConflict, MessageReader, OwnerRecord, OwnerTransaction, SessionAttributes
 from plugins.ledger.contract import ContentPart, Control, Input, Message, Output
 from plugins.ledger.contract import json_value
 from plugins.sources.contract import (
@@ -26,6 +26,7 @@ from plugins.sources.contract import (
 )
 
 from .request import Request, check_request
+from .panel import SubagentPanel
 
 logger = logging.getLogger(__name__)
 # 私有程序 binding：tools.py 固定身份，恢复路径经 Bindings.open 读取，不提供外部 SDK。
@@ -42,13 +43,19 @@ class Subagents:
 
     def __init__(self, ctx: Context):
         self.ctx = ctx
+        self.panel = SubagentPanel(self)
 
     def read(self, key: str) -> tuple[OwnerRecord, Request, MessageReader] | None:
         record = self.ctx.require(OWNER_STATE).open(self.ctx).read(key)
         if record is None:
             return None
+        request, reader, _ = self.read_admitted(record, self.ctx.require(MESSAGE_CATALOG))
+        return record, request, reader
+
+    @staticmethod
+    def read_admitted(record: OwnerRecord, catalog: MessageCatalog) -> tuple[Request, MessageReader, Message]:
         session_id, input_id, _ = _pointer(record)
-        reader = self.ctx.require(MESSAGE_CATALOG).reader(session_id)
+        reader = catalog.reader(session_id)
         message = reader.get(input_id)
         if message is None or not isinstance(message.body, Input):
             raise ValueError("子任务原输入缺失")
@@ -58,7 +65,7 @@ class Subagents:
         request = Request.model_validate(json_value(requests[0].value))
         if (request.session_id, request.input_id) != (reader.session_id, message.message_id):
             raise ValueError("子任务请求与恢复指针不一致")
-        return record, request, reader
+        return request, reader, message
 
     async def accept(self, key: str, request: Request, text: str) -> None:
         """同一来源准入锁覆盖容量检查与持久提交，重放不再占额。"""
@@ -210,13 +217,13 @@ class Subagents:
         finally:
             writer.expire()
 
-    async def cancel(self, job_id: str) -> bool:
+    async def cancel(self, job_id: str, *, parent_id: str | None = None) -> bool:
         """取消意图先保存，再撤销新决策并等待原效果排空。"""
         for key, _ in self.ctx.require(OWNER_STATE).open(self.ctx).list():
             found = self.read(key)
             assert found is not None
             record, request, reader = found
-            if request.job_id != job_id:
+            if request.job_id != job_id or (parent_id is not None and request.parent_session_id != parent_id):
                 continue
             stopped: Task | None = None
 
@@ -334,6 +341,7 @@ class Subagents:
         """正式生命周期追赶持久输入；短通知不持有工具归档或运行 generation。"""
         attempted: dict[str, tuple[int, int]] = {}
         active: dict[str, Task] = {}
+        previous_heads: Mapping[str, int] = {}
         async def wait(key: str, task: Task) -> None:
             try:
                 try:
@@ -353,8 +361,18 @@ class Subagents:
                             outcome = await self.outcome(reader)
                             if outcome is None:
                                 raise RuntimeError("子任务没有可回传的终态")
-                            if await self._announce(key, request, reader, outcome):
-                                await self._settle(key)
+                            try:
+                                if await self._announce(key, request, reader, outcome):
+                                    await self._settle(key)
+                            except Exception:
+                                current = self.read(key)
+                                if current is not None and not current[0].value["settled"]:
+                                    self.panel.report_failures.add(request.session_id)
+                                raise
+                            else:
+                                self.panel.report_failures.discard(request.session_id)
+                            finally:
+                                self.panel.notify(request.parent_session_id)
                 except CompositionError as error:
                     if entered or error.code != "OWNER_UNAVAILABLE":
                         raise
@@ -370,18 +388,18 @@ class Subagents:
                 del active[key]
         try:
             async with asyncio.TaskGroup() as group:
-                async for _ in self.ctx.require(MESSAGE_CATALOG).follow():
+                async for message_heads in self.ctx.require(MESSAGE_CATALOG).follow():
                     entered = False
                     try:
                         async with self.ctx.runtime_scope():
                             entered = True
                             for key, _record in self.ctx.require(OWNER_STATE).open(self.ctx).list():
-                                if key in active:
-                                    continue
                                 found = self.read(key)
                                 assert found is not None
                                 record, request, reader = found
-                                if record.value["settled"]:
+                                if message_heads.get(request.session_id) != previous_heads.get(request.session_id):
+                                    self.panel.notify(request.parent_session_id)
+                                if key in active or record.value["settled"]:
                                     continue
                                 parent = self.ctx.require(MESSAGE_CATALOG).reader(request.parent_session_id)
                                 heads = (reader.head(), parent.head())
@@ -392,6 +410,7 @@ class Subagents:
                                 if task is not None:
                                     active[key] = task
                                     _ = group.create_task(wait(key, task))
+                            previous_heads = message_heads
                     except CompositionError as error:
                         if entered or error.code != "OWNER_UNAVAILABLE":
                             raise

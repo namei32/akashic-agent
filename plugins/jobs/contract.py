@@ -10,12 +10,21 @@ from agent.plugin_composition import ServiceKey
 
 JobStatus = Literal["completed", "failed", "timeout", "killed", "unknown"]
 JobSnapshotStatus = Literal["running", "stopping", "completed", "failed", "timeout", "killed", "unknown"]
+SubagentReport = Literal["inline", "waiting", "delivered", "failed"]
 
 
 @dataclass(frozen=True, slots=True)
 class JobOutcome:
     status: JobStatus
     detail: str
+
+
+@dataclass(frozen=True, slots=True)
+class SubagentProgress:
+    steps: int
+    actions: tuple[tuple[int, str], ...]
+    report: SubagentReport
+    report_message_id: str | None = None
 
 
 # settled 在任务结算时返回结果；返回 None 表示模型已收走结果或任务被显式停止，不再通知。
@@ -53,13 +62,28 @@ class JobSnapshot:
     started_at: int
     finished_at: int | None = None
     stoppable: bool = False
+    subagent: SubagentProgress | None = None
 
     def to_wire(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "id": self.job_id, "kind": self.kind, "label": self.label, "status": self.status,
             "detail": self.detail, "started_at": self.started_at, "finished_at": self.finished_at,
             "stoppable": self.stoppable,
         }
+        if self.subagent is not None:
+            result["subagent"] = {
+                "steps": self.subagent.steps,
+                "actions": [{"at": at, "label": label} for at, label in self.subagent.actions],
+                "report": self.subagent.report,
+                "report_message_id": self.subagent.report_message_id,
+            }
+        return result
+
+
+class JobPanelSource(Protocol):
+    def follow_jobs(self, session_id: str) -> AsyncGenerator[tuple[JobSnapshot, ...], None]: ...
+
+    async def stop_job(self, session_id: str, job_id: str) -> bool: ...
 
 
 class JobNotices(Protocol):

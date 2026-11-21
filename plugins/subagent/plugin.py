@@ -46,7 +46,7 @@ from .prompts import build_spawn_subagent_prompt
 from .request import PROFILE_TOOLS, Request, SpawnInput
 from .runtime import SUBAGENT_PROGRAM, Subagents
 from .tools import Manage, ManageInput, Spawn
-from .contract import SUBAGENT_WAITING
+from .contract import SUBAGENT_PANEL, SUBAGENT_WAITING
 
 api_version = 3
 name = "subagent"
@@ -89,6 +89,7 @@ async def apply(ctx: Context) -> None:
     watcher: asyncio.Task[None] | None = None
     jobs = Subagents(ctx)
     _ = await ctx.provide(SUBAGENT_WAITING, jobs.waiting)
+    _ = await ctx.provide(SUBAGENT_PANEL, jobs.panel)
     catalog = ctx.require(TOOLS)
     _ = await catalog.declare_group(ctx, description=desc)
 
@@ -171,6 +172,7 @@ async def apply(ctx: Context) -> None:
 
     async def stop(_event: object) -> None:
         nonlocal watcher
+        jobs.panel.close()
         if watcher is not None:
             _ = watcher.cancel()
             try:

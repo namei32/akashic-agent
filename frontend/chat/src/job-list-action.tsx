@@ -2,7 +2,14 @@ import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { ChevronDown, Square } from "lucide-react";
 import "./job-list-action.css";
 
-export type JobStatus = "running" | "stopping" | "completed" | "failed" | "timeout" | "killed";
+export type JobStatus = "running" | "stopping" | "completed" | "failed" | "timeout" | "killed" | "unknown";
+
+type SubagentProgress = {
+  steps: number;
+  actions: { at: number; label: string }[];
+  report: "inline" | "waiting" | "delivered" | "failed";
+  report_message_id?: string | null;
+};
 
 /** 后台任务只读镜像的一行；时间为 epoch 毫秒。 */
 export interface JobView {
@@ -14,6 +21,7 @@ export interface JobView {
   started_at: number;
   finished_at: number | null;
   stoppable: boolean;
+  subagent?: SubagentProgress;
 }
 
 export interface SessionJobs {
@@ -28,17 +36,37 @@ const STATUS_LABEL: Record<JobStatus, string> = {
   failed: "失败",
   timeout: "超时",
   killed: "已停止",
+  unknown: "状态未知",
 };
+
+const REPORT_LABEL: Record<SubagentProgress["report"], string> = {
+  inline: "随当前回复返回",
+  waiting: "等待回报",
+  delivered: "已回报",
+  failed: "回报失败",
+};
+
+function isSubagentProgress(value: unknown): value is SubagentProgress {
+  if (typeof value !== "object" || value === null) return false;
+  const progress = value as Record<string, unknown>;
+  return typeof progress.steps === "number" && Number.isSafeInteger(progress.steps) && progress.steps >= 0
+    && typeof progress.report === "string" && Object.hasOwn(REPORT_LABEL, progress.report)
+    && (progress.report_message_id == null || typeof progress.report_message_id === "string")
+    && Array.isArray(progress.actions) && progress.actions.every((action: unknown) =>
+      typeof action === "object" && action !== null && "at" in action
+      && Number.isSafeInteger(action.at) && "label" in action && typeof action.label === "string");
+}
 
 const isJob = (value: unknown): value is JobView => {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const row = value as Record<string, unknown>;
   return typeof row.id === "string" && row.id.length > 0
     && typeof row.kind === "string" && typeof row.label === "string" && typeof row.detail === "string"
-    && typeof row.status === "string" && row.status in STATUS_LABEL
+    && typeof row.status === "string" && Object.hasOwn(STATUS_LABEL, row.status)
     && Number.isSafeInteger(row.started_at)
     && (row.finished_at === null || Number.isSafeInteger(row.finished_at))
-    && typeof row.stoppable === "boolean";
+    && typeof row.stoppable === "boolean"
+    && (row.subagent === undefined || isSubagentProgress(row.subagent));
 };
 
 /** 只在 WebSocket 边界检查后台任务快照；其他消息继续交给原协议解析器。 */
@@ -105,23 +133,62 @@ function StopButton({ job, onStop }: { job: JobView; onStop: (jobId: string) => 
   </button>;
 }
 
-function JobRow({ job, now, onStop }: { job: JobView; now: number; onStop: (jobId: string) => Promise<boolean> }) {
+const actionTime = new Intl.DateTimeFormat(undefined, {
+  hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+});
+
+function JobRow({ job, now, onStop, expanded, onToggle, openReport }: {
+  job: JobView;
+  now: number;
+  onStop: (jobId: string) => Promise<boolean>;
+  expanded: boolean;
+  onToggle: () => void;
+  openReport?: () => void;
+}) {
+  const detailId = useId();
   const running = isLive(job);
   const duration = formatDuration((running ? now : job.finished_at ?? job.started_at) - job.started_at);
   // 正常完成只说状态；失败、超时、停止时附上 detail 便于判断原因。
   const note = job.status === "completed" || !job.detail ? STATUS_LABEL[job.status] : `${STATUS_LABEL[job.status]} · ${job.detail}`;
   const stoppable = job.status === "running" && job.stoppable;
+  const progress = job.subagent;
+  const summary = progress
+    ? [STATUS_LABEL[job.status], `${progress.steps} 步`, progress.report === "failed" ? REPORT_LABEL.failed : null,
+      job.detail || progress.actions[0]?.label].filter(Boolean).join(" · ")
+    : note;
+  const report = progress && (running && progress.report === "waiting" ? "执行结束后回报" : REPORT_LABEL[progress.report]);
   return <li className="job-list__row" data-status={job.status} data-stoppable={stoppable || undefined}>
     <span className="job-list__dot" data-status={job.status} aria-hidden="true" />
-    <span className="job-list__label" title={job.label}>{job.label}</span>
+    {progress
+      ? <button type="button" className="job-list__expand" aria-expanded={expanded} aria-controls={expanded ? detailId : undefined}
+          onClick={onToggle}><span className="job-list__label" title={job.label}>{job.label}</span><ChevronDown size={12} aria-hidden="true" /></button>
+      : <span className="job-list__label" title={job.label}>{job.label}</span>}
     <span className="job-list__duration" title={running ? `已运行 ${duration}` : `耗时 ${duration}`}>{duration}</span>
-    <span className="job-list__meta" title={note}>{job.kind} · {note}</span>
+    <span className="job-list__meta" title={summary}>{job.kind} · {summary}</span>
     {stoppable ? <StopButton job={job} onStop={onStop} /> : null}
+    {progress && expanded ? <div id={detailId} className="job-list__subagent">
+      <dl>
+        <div><dt>执行状态</dt><dd>{STATUS_LABEL[job.status]}</dd></div>
+        <div><dt>主会话回报</dt><dd>{report}</dd></div>
+      </dl>
+      {job.detail ? <p className="job-list__reason">{job.detail}</p> : null}
+      {progress.actions.length ? <>
+        <p>最近动作</p>
+        <ol>{progress.actions.map((action, index) => <li key={`${action.at}:${index}`}>
+          <time dateTime={new Date(action.at).toISOString()}>{actionTime.format(action.at)}</time><span>{action.label}</span>
+        </li>)}</ol>
+      </> : null}
+      {openReport ? <button type="button" className="job-list__report" onClick={openReport}>查看主会话回报</button> : null}
+    </div> : null}
   </li>;
 }
 
+function subagentNeedsAttention(job: JobView): boolean {
+  return job.subagent !== undefined && (job.status === "failed" || job.subagent.report === "failed");
+}
+
 // 面板分"进行中 / 已结束"两组：有任务运行时已结束组默认折叠；清空只隐藏本页已有的结束行，之后新结束的任务照常出现。
-function JobPanel({ id, live, settled, now, settledOpen, onToggleSettled, onClear, onStop }: {
+function JobPanel({ id, live, settled, now, settledOpen, onToggleSettled, onClear, onStop, reportAction }: {
   id: string;
   onStop: (jobId: string) => Promise<boolean>;
   live: readonly JobView[];
@@ -130,11 +197,21 @@ function JobPanel({ id, live, settled, now, settledOpen, onToggleSettled, onClea
   settledOpen: boolean;
   onToggleSettled: () => void;
   onClear: () => void;
+  reportAction: (job: JobView) => (() => void) | undefined;
 }) {
+  const [selection, setSelection] = useState<string | null>();
+  const selected = selection === undefined
+    ? (settledOpen ? settled.find(subagentNeedsAttention)?.id : undefined)
+      ?? live.find((job) => job.subagent)?.id
+      ?? (settledOpen ? settled.find((job) => job.subagent)?.id : undefined)
+    : selection;
+  const renderRow = (job: JobView) => <JobRow key={job.id} job={job} now={now} onStop={onStop}
+    expanded={job.id === selected} onToggle={() => setSelection(job.id === selected ? null : job.id)}
+    openReport={reportAction(job)} />;
   return <div id={id} className="job-list__panel" role="group" aria-label="后台任务" data-escape-layer="">
     {live.length ? <>
       <p className="job-list__section" aria-hidden="true">进行中</p>
-      <ul>{live.map((job) => <JobRow key={job.id} job={job} now={now} onStop={onStop} />)}</ul>
+      <ul>{live.map(renderRow)}</ul>
     </> : null}
     {settled.length ? <>
       <div className="job-list__section">
@@ -143,13 +220,18 @@ function JobPanel({ id, live, settled, now, settledOpen, onToggleSettled, onClea
         </button>
         <button type="button" className="job-list__clear" onClick={onClear}>清空</button>
       </div>
-      {settledOpen ? <ul>{settled.map((job) => <JobRow key={job.id} job={job} now={now} onStop={onStop} />)}</ul> : null}
+      {settledOpen ? <ul>{settled.map(renderRow)}</ul> : null}
     </> : null}
   </div>;
 }
 
 // 标题行右侧的安静标记：有任务运行时显示呼吸点和数量，只剩已结束任务时退为淡色计数。
-export function JobListAction({ jobs, onStop }: { jobs: readonly JobView[]; onStop: (jobId: string) => Promise<boolean> }) {
+export function JobListAction({ jobs, onStop, loadedMessages, onOpenReport }: {
+  jobs: readonly JobView[];
+  onStop: (jobId: string) => Promise<boolean>;
+  loadedMessages: ReadonlySet<string>;
+  onOpenReport: (messageId: string) => void;
+}) {
   const [open, setOpen] = useState(false);
   const [now, setNow] = useState(() => Date.now());
   const [settledOpen, setSettledOpen] = useState<boolean | undefined>(undefined);
@@ -195,6 +277,7 @@ export function JobListAction({ jobs, onStop }: { jobs: readonly JobView[]; onSt
   const latest = live.length ? "running" : settled[0].status;
   const summary = live.length ? `${live.length} 个任务运行中` : `${visible} 个后台任务`;
   const outcome = latest === "running" || latest === "completed" ? "" : `，最近一个${STATUS_LABEL[latest]}`;
+  const showSettled = settledOpen ?? (live.length === 0 || settled.some(subagentNeedsAttention));
   return <div className="job-list" ref={rootRef}>
     <button ref={triggerRef} type="button" className="job-list__trigger" data-live={live.length > 0 || undefined}
       aria-expanded={open} aria-controls={open ? panelId : undefined} aria-label={`后台任务：${summary}${outcome}`}
@@ -204,8 +287,16 @@ export function JobListAction({ jobs, onStop }: { jobs: readonly JobView[]; onSt
       <span className="job-list__count" aria-hidden="true">{live.length || visible}</span>
     </button>
     {open ? <JobPanel id={panelId} live={live} settled={settled} now={now} onStop={onStop}
-      settledOpen={settledOpen ?? live.length === 0}
-      onToggleSettled={() => setSettledOpen(!(settledOpen ?? live.length === 0))}
+      settledOpen={showSettled}
+      reportAction={(job) => {
+        const messageId = job.subagent?.report_message_id;
+        if (job.subagent?.report !== "delivered" || !messageId || !loadedMessages.has(messageId)) return undefined;
+        return () => {
+          setOpen(false);
+          onOpenReport(messageId);
+        };
+      }}
+      onToggleSettled={() => setSettledOpen(!showSettled)}
       onClear={() => {
         setCleared((current) => new Set([...current, ...settled.map((job) => job.id)]));
         if (live.length) triggerRef.current?.focus();

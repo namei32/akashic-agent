@@ -20,6 +20,7 @@ import uvicorn
 from agent.plugin_composition import (
     Context,
     Effect,
+    ServiceKey,
 )
 from plugins.models.contract import MODEL_CATALOG
 from plugins.channels.contract import (
@@ -36,7 +37,8 @@ from plugins.channels.contract import (
     StopReceipt,
 )
 from plugins.ledger.contract import MESSAGE_CATALOG, SESSION_ADMIN
-from plugins.jobs.contract import JOB_NOTICES, JobNotices
+from plugins.jobs.contract import JOB_NOTICES, JobPanelSource, JobSnapshot
+from plugins.subagent.contract import SUBAGENT_PANEL
 
 from .capabilities import (
     MESSAGE_DISPLAY,
@@ -388,29 +390,62 @@ class _GenerationAkashicAdapter:
 
     # 1. 每代 jobs owner 借一次订阅并长跟随；2. owner 关闭时 follow 结束，先发空快照让前端失效；
     # 3. 再重新借用，插件缺席期间退避等待，新一代出现后从其基线继续。
-    async def _follow_jobs(self, session_id: str) -> AsyncGenerator[dict[str, object], None]:
+    async def _follow_job_source(
+        self, session_id: str, key: ServiceKey[JobPanelSource],
+    ) -> AsyncGenerator[tuple[JobSnapshot, ...], None]:
         delay = _JOBS_RETRY_MIN_S
         while True:
             async with self._open_request_scope() as scope:
-                with scope.borrow(JOB_NOTICES) as service:
-                    notices = None if service is None else cast(JobNotices, service)
+                with scope.borrow(key) as service:
+                    notices = None if service is None else cast(JobPanelSource, service)
             if notices is None:
+                yield ()
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, _JOBS_RETRY_MAX_S)
                 continue
             delay = _JOBS_RETRY_MIN_S
             async with aclosing(notices.follow_jobs(session_id)) as snapshots:
                 async for snapshot in snapshots:
-                    yield {"session_id": session_id, "jobs": [job.to_wire() for job in snapshot]}
-            yield {"session_id": session_id, "jobs": []}
+                    yield snapshot
+            yield ()
             await asyncio.sleep(delay)
 
+    async def _follow_jobs(self, session_id: str) -> AsyncGenerator[dict[str, object], None]:
+        changed = asyncio.Event()
+        frames: dict[ServiceKey[JobPanelSource], tuple[JobSnapshot, ...]] = {}
+        keys = (cast(ServiceKey[JobPanelSource], JOB_NOTICES), SUBAGENT_PANEL)
+
+        async def collect(key: ServiceKey[JobPanelSource]) -> None:
+            async with aclosing(self._follow_job_source(session_id, key)) as stream:
+                async for frame in stream:
+                    if frames.get(key) != frame:
+                        frames[key] = frame
+                        changed.set()
+
+        workers = tuple(asyncio.create_task(collect(key)) for key in keys)
+        for worker in workers:
+            worker.add_done_callback(lambda _: changed.set())
+        try:
+            while True:
+                await changed.wait()
+                changed.clear()
+                for worker in workers:
+                    if worker.done():
+                        worker.result()
+                yield {"session_id": session_id,
+                       "jobs": [row.to_wire() for key in keys for row in frames.get(key, ())]}
+        finally:
+            for worker in workers:
+                worker.cancel()
+            _ = await asyncio.gather(*workers, return_exceptions=True)
+
     async def _stop_job(self, session_id: str, job_id: str) -> bool:
+        key = SUBAGENT_PANEL if job_id.startswith("subagent:") else cast(ServiceKey[JobPanelSource], JOB_NOTICES)
         async with self._open_request_scope() as scope:
-            with scope.borrow(JOB_NOTICES) as service:
+            with scope.borrow(key) as service:
                 if service is None:
                     return False
-                return await cast(JobNotices, service).stop_job(session_id, job_id)
+                return await cast(JobPanelSource, service).stop_job(session_id, job_id)
 
     async def _read_model_call_stats(self, call_id: str) -> ModelCallStats:
         """借用实际统计 owner；缺席不关闭聊天，也不获取模型修改权限。"""
