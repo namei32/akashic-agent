@@ -1,6 +1,7 @@
 # 0074 · 部署者拥有备份、插件映射与迁移选择
 
 > 后续勘误：[0082](0082-distribution-owned-plugin-composition.md) 修改内置代码随部署和迁移策略：选择版本即接受 Core/内置 Yoyo，外置迁移自理，不再逐 ID 审批。数据保留、显式外置版本目标和可选备份不变。以下保留原决策历史。
+> 原生 WSL 启动失败的有限自动回退见 [0145](0145-wsl-rolls-back-proven-startup-failures.md)，修订第 5 项。
 - 状态：accepted
 - 备份范围补充：[0083](0083-short-workflow-preserves-design-intent.md) 按实际不可重建数据风险备份，不因源码或前端更新默认全状态备份。
 - 日期：2026-09-25

@@ -14,15 +14,16 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from uuid import uuid4
 from urllib.error import URLError
 from urllib.request import ProxyHandler, build_opener
 
+from agent.plugins.distribution_sources import is_distribution_owned
 from agent.plugins.files import encode_tree, tree_entries
 from agent.plugins.reload_journal import check_pending_publication
 from agent.plugins.selection import PluginSelection
-from bootstrap.workspace_lock import WorkspaceMaintenanceLock
+from bootstrap.workspace_lock import PluginPublicationLock, WorkspaceMaintenanceLock
 from plugins.gateway.runtime_stop import StopParams
 from scripts.akashic_release.manifest import read_json, release_lock, write_json
 from scripts.akashic_release.self_deploy import _request_path, _user_environment, stop_rpc
@@ -83,7 +84,7 @@ class Host:
             return json.loads(run(BRIDGE, "status"))["service"]
         return dict(line.split("=", 1) for line in run(
             "systemctl", "--user", "show", self.unit,
-            "-p", "Id,ActiveState,MainPID,InvocationID,ControlGroup,Result,KillMode",
+            "-p", "Id,ActiveState,SubState,MainPID,InvocationID,ControlGroup,Result,KillMode",
         ).splitlines())
 
     def control(self, verb: str, invocation: str = "") -> None:
@@ -181,17 +182,17 @@ class Host:
         return record
 
     def launch(self) -> None:
-        pointer = read_json(self.launch_path)
-        if pointer.get("blocked") or ("root" in pointer and self.selection.read() != pointer["root"]):
-            raise RuntimeError("发布尚未结算，使用 WSL resume 或核对回执")
         if os.geteuid() == 0:
             raise PermissionError("Core 必须以普通运行用户启动")
-        release = self.release(pointer["commit"])
-        core, python = Path(release["core"]), release["python"]
         os.umask(0o077)
         startup_lock = os.open(self.state / ".startup.lock", os.O_CREAT | os.O_RDWR, 0o600)
         fcntl.flock(startup_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         os.set_inheritable(startup_lock, True)  # The Supervisor owns this lock until it exits.
+        pointer = read_json(self.launch_path)
+        if pointer.get("blocked") or ("root" in pointer and self.selection.read() != pointer["root"]):
+            raise RuntimeError("发布尚未结算，使用 WSL resume 或核对回执")
+        release = self.release(pointer["commit"])
+        core, python = Path(release["core"]), release["python"]
         os.chdir(core)
         env = {**os.environ, "AKASHIC_RUNTIME_COMMIT": release["commit"],
                "AKASHIC_PLUGIN_DISTRIBUTION": release["distribution"],
@@ -277,17 +278,20 @@ class Host:
             raise RuntimeError(result.stderr.rstrip().splitlines()[-1] if result.stderr.strip() else "发行版安装器退出失败")
         return json.loads(result.stdout)
 
-    def activate(self, commit: str, root: str) -> dict[str, Any]:
+    def activate(self, commit: str, root: str, *, previous_boot_id: str | None = None) -> dict[str, Any]:
         if self.selection.read() != root:
             raise RuntimeError("实际 Root 与发布回执不符")
         write_json(self.launch_path, {"commit": commit, "root": root})
-        if self.service()["ActiveState"] not in {"active", "activating"}:
+        status = self.service()
+        if status["ActiveState"] not in {"active", "activating"}:
             self.control("start")
-        ready = self.wait_for_activation(commit, root)
+        ready = self.wait_for_activation(commit, root, previous_boot_id=previous_boot_id,
+                                         await_restart=status["SubState"] == "auto-restart")
         write_json(self.launch_path, {"commit": commit})
         return ready
 
-    def wait_for_activation(self, commit: str, root: str, *, previous_boot_id: str | None = None) -> dict[str, Any]:
+    def wait_for_activation(self, commit: str, root: str, *, previous_boot_id: str | None = None,
+                            await_restart: bool = False) -> dict[str, Any]:
         deadline = time.monotonic() + 60
         last = "服务未就绪"
         while time.monotonic() < deadline:
@@ -309,7 +313,9 @@ class Host:
                 return ready
             except (OSError, URLError, RuntimeError, TimeoutError) as error:
                 last = str(error)
-                if self.service()["ActiveState"] in {"inactive", "failed"}:
+                status = self.service()
+                if (status["ActiveState"] in {"inactive", "failed"}
+                        or (not await_restart and status["SubState"] == "auto-restart")):
                     break
                 time.sleep(0.3)
         raise RuntimeError(f"启动验收未完成：{last}")
@@ -369,6 +375,7 @@ class Host:
                 if ack["state"] != "drained" or ack["bootId"] != old["bootId"] or self.ready() != old:
                     raise RuntimeError("原实例未完成排空，或者发布基线已变化")
                 check_pending_publication(self.workspace)
+                previous_inputs = {ref: self.selection.read_input(ref) for ref in self.selection.components(old["root"])}
                 record["status"] = "stopping"
                 write_json(path, record)
             except Exception as error:
@@ -411,11 +418,83 @@ class Host:
                                                      backup=folder / "backup" if request["backup"] else None)
                 record["status"] = "selected_not_started"
                 write_json(path, record)
-                return self.finish(path, record)
             except Exception as error:
                 record["error"] = str(error)
                 write_json(path, record)
                 raise
+            return self.finish(path, record, previous_inputs=previous_inputs)
+
+    def rollback_failed_start(self, path: Path, record: dict[str, Any],
+                              previous_inputs: dict[str, Mapping[str, object]]) -> dict[str, Any]:
+        request, preflight, published = record["request"], record["preflight"], record["publication"]
+        old, target = request["old"], request["commit"]
+        for receipt in (preflight, published):
+            if receipt.get("migration_ids") != []:
+                raise RuntimeError("无法确认本次发布没有待执行迁移")
+            if receipt.get("target_ids") != []:
+                raise RuntimeError("无法确认本次发布没有外置插件变更")
+            if (receipt.get("old_root_ref") != old["root"]
+                    or receipt.get("distribution_source_commit") != target):
+                raise RuntimeError("发布回执与本次请求不符")
+        if (preflight.get("status") != "preflight_ok" or published.get("status") != "selected_not_started"
+                or not preflight.get("plan_sha256") or preflight["plan_sha256"] != published.get("plan_sha256")):
+            raise RuntimeError("缺少与预检一致的完整发布回执")
+        self.release(old["sourceCommit"])
+        with (self.state / ".startup.lock").open("a+b") as startup:
+            fcntl.flock(startup.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            root = self.restore_previous_selection(path, record, previous_inputs)
+        return self.activate(old["sourceCommit"], root, previous_boot_id=old["bootId"])
+
+    def restore_previous_selection(self, path: Path, record: dict[str, Any],
+                                   previous_inputs: dict[str, Mapping[str, object]]) -> str:
+        request, published = record["request"], record["publication"]
+        old, target = request["old"], request["commit"]
+        candidate, components = published["new_root_ref"], tuple(published["ordered_components"])
+        status = self.service()
+        group = status["ControlGroup"]
+        waiting = status["ActiveState"] == "activating" and status["SubState"] == "auto-restart"
+        if status["MainPID"] != "0" or not (waiting or status["ActiveState"] in {"inactive", "failed"}):
+            raise RuntimeError("无法确认候选实例已退出")
+        if group:
+            events = Path("/sys/fs/cgroup" + group) / "cgroup.events"
+            try:
+                if "populated 0" not in events.read_text().splitlines():
+                    raise RuntimeError("候选实例的 cgroup 仍有进程")
+            except FileNotFoundError:
+                pass
+        maintenance = WorkspaceMaintenanceLock(self.workspace)
+        publication = PluginPublicationLock(self.state / "plugin-home")
+        maintenance.acquire()
+        try:
+            publication.acquire()
+            try:
+                if (self.selection.read() != candidate or self.selection.components(candidate) != components
+                        or (candidate != old["root"] and not self.selection.transition_committed(old["root"], components))
+                        or read_json(self.launch_path) != {"commit": target, "root": candidate}):
+                    raise RuntimeError("当前插件组合或启动指针不属于本次发布")
+                active = read_json(self.root / "active.json")
+                if active["sourceCommit"] != old["sourceCommit"] or active["bootId"] != old["bootId"]:
+                    raise RuntimeError("最后一次就绪回执已变化")
+                external = {ref for ref in components if not is_distribution_owned(self.selection.read_input(ref))}
+                if external != {ref for ref, item in previous_inputs.items() if not is_distribution_owned(item)}:
+                    raise RuntimeError("发布前后的外置插件输入不一致")
+                check_pending_publication(self.workspace)
+                restored = tuple(self.selection.prepare(item) for item in previous_inputs.values())
+                if restored != tuple(previous_inputs):
+                    raise RuntimeError("此前的插件输入身份不符")
+                record["status"] = "rolling_back"
+                record["startup_error"] = record.pop("error")
+                write_json(path, record)
+                root = self.selection.commit(restored, expected_ref=candidate) if restored != components else candidate
+                record["rollback"] = {"old_root_ref": candidate, "new_root_ref": root,
+                                      "ordered_components": list(restored)}
+                write_json(path, record)
+                write_json(self.launch_path, {"commit": old["sourceCommit"], "root": root})
+            finally:
+                publication.release()
+        finally:
+            maintenance.release()
+        return root
 
     def capture_previous(self, folder: Path, targets: list[dict[str, Any]]) -> None:
         previous = []
@@ -434,9 +513,27 @@ class Host:
                              "bundle_sha256": sha256(folder / name), "target_commit": commit})
         write_json(folder / "previous.json", {"targets": previous})
 
-    def finish(self, path: Path, record: dict[str, Any]) -> dict[str, Any]:
+    def finish(self, path: Path, record: dict[str, Any], *,
+               previous_inputs: dict[str, Mapping[str, object]] | None = None) -> dict[str, Any]:
         publication = record["publication"]
-        record["ready"] = self.activate(record["request"]["commit"], publication["new_root_ref"])
+        try:
+            record["ready"] = self.activate(record["request"]["commit"], publication["new_root_ref"])
+        except Exception as error:
+            record["error"] = str(error)
+            if previous_inputs is not None:
+                try:
+                    ready = self.rollback_failed_start(path, record, previous_inputs)
+                except Exception as rollback_error:
+                    status = "failed" if record["status"] == "rolling_back" else "skipped"
+                    record["recovery"] = {"status": status, "error": str(rollback_error)}
+                else:
+                    record.update(status="rolled_back", ready=ready, recovery={"status": "restored"})
+            record["error"] = str(error)
+            try:
+                write_json(path, record)
+            except OSError as receipt_error:
+                error.add_note(f"无法保存启动失败回执: {receipt_error}")
+            raise
         record["status"] = "active"
         record.pop("error", None)
         write_json(path, record)
@@ -490,6 +587,7 @@ class Host:
                 root = receipt["new_root_ref"]
             record.update(status="rolled_back", ready=self.activate(old["sourceCommit"], root))
             record.pop("error", None)
+            record.pop("recovery", None)
             write_json(path, record)
             return record
 

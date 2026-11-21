@@ -51,8 +51,8 @@ def reconcile(host: Host, request_id: str) -> dict[str, Any]:
             if time.time() - path.stat().st_mtime < 35 or unit_state(request["unit"]) in {"active", "activating", "deactivating"}:
                 return {"status": "waiting", "phase": phase}
             error = "宿主 worker 已退出，缺少完整发布回执"
-            if stop_error := record.get("stop_error"):
-                error = f"{stop_error}。{error}"
+            if original_error := record.get("stop_error") or record.get("startup_error"):
+                error = f"{original_error}。{error}"
         folder = host.root / "notices" / request_id
         enqueue(host, request_id, record, folder, error)
         deliveries = sorted(folder.glob("*.json"), key=lambda file: file.stat().st_mtime_ns)
@@ -77,7 +77,7 @@ def enqueue(host: Host, request_id: str, record: dict[str, Any], folder: Path, e
         title = "Akashic 发布成功"
     elif phase == "rolled_back" and not error:
         title = "Akashic 已回退"
-    elif phase == "failed_stop" and recovery.get("status") == "restored":
+    elif phase in {"failed_stop", "rolled_back"} and recovery.get("status") == "restored":
         title = "Akashic 发布失败，旧版已恢复"
     else:
         title = "Akashic 发布失败"

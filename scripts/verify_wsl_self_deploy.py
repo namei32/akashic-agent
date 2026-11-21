@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -33,6 +34,7 @@ from scripts.verify_self_deploy_runtime import configure_model, start_model_serv
 RECEIPT_FAILURE_SESSION = "programmatic:wsl-stop-receipt"
 RECEIPT_FAILURE_INPUT = "Submit the fixture release with a stop receipt write failure."
 AFTER_RECEIPT_FAILURE = "Confirm that this instance accepts new work."
+MIGRATION = "20990101_01_wsl_rollback_probe"
 
 
 def run(*argv: str, cwd: Path | None = None, timeout: float = 300) -> str:
@@ -68,6 +70,11 @@ def releases(folder: Path, wheels: Path) -> list[tuple[str, Path, Path]]:
         commits.append(commit(repo, f"Jobs {version}"))
     contract.write_text(original_contract)
     commits.append(commit(repo, "Remove the interface consumed by the retained external plugin"))
+    contract.write_text(original_contract + "\nRELEASE_PROBE_API = 1\n")
+    (repo / "migrations/core" / f"{MIGRATION}.py").write_text(
+        'from yoyo import step\nsteps = [step("CREATE TABLE wsl_rollback_probe (value INTEGER)"),'
+        ' step("INSERT INTO wsl_rollback_probe VALUES (79)")]\n')
+    commits.append(commit(repo, "Add a migration before candidate startup"))
 
     def package(sha: str) -> tuple[str, Path, Path]:
         destination = folder / sha
@@ -251,6 +258,77 @@ async def report_items(host: Host, session: str, request_id: str, expected: str)
             await asyncio.sleep(0.2)
 
 
+async def verify_rollback_chat(host: Host) -> str:
+    session = "akashic:" + uuid4().hex
+    secret = host.workspace / "web-auth/secret"
+    headers = {"Authorization": "Bearer " + secret.read_text().strip()} if secret.exists() else {}
+    async with web_connect(f"ws://127.0.0.1:{host.port}/ws", additional_headers=headers, proxy=None) as web:
+        await web.send(json.dumps({"type": "message.send", "request_id": uuid4().hex, "session_id": session,
+                                   "text": AFTER_RECEIPT_FAILURE}))
+        async with asyncio.timeout(25):
+            while json.loads(await web.recv()).get("type") != "message.accepted":
+                pass
+            async with await connect(host) as client:
+                while True:
+                    page = await client.message_read(session, limit=30)
+                    if any(row["body"].get("finish") == "complete"
+                           and "Admission restored." in str(row["body"]["parts"]) for row in page["items"]):
+                        return session
+                    await asyncio.sleep(0.2)
+
+
+async def verify_automatic_rollback(host: Host, folder: Path, candidate: str, migration: str,
+                                    fail_candidate: Path, cli: list[str], history_session: str) -> None:
+    old = host.ready()
+    old_components = host.selection.components(old["root"])
+    old_inputs = {ref: dict(host.selection.read_input(ref)) for ref in old_components}
+    async with await connect(host) as client:
+        history = (await client.message_read(history_session, limit=100))["items"]
+    write_json(fail_candidate, {"commit": candidate})
+    auto_session = "programmatic:wsl-auto-rollback"
+    job, result = await submit(host, folder, ["submit", "--commit", candidate], auto_session, status="rolled_back")
+    assert result["error"] and result["recovery"]["status"] == "restored"
+    ready = host.ready()
+    assert ready["sourceCommit"] == old["sourceCommit"] and ready["bootId"] != old["bootId"]
+    assert ready["root"] == result["rollback"]["new_root_ref"] and ready == result["ready"], (ready, result["ready"])
+    assert host.selection.components(ready["root"]) == old_components
+    assert {ref: dict(host.selection.read_input(ref)) for ref in old_components} == old_inputs
+    reports = await report_items(host, auto_session, job.stem, "发布失败，旧版已恢复")
+    assert len(reports) == 1 and result["error"] in str(reports[0]["body"]["parts"])
+    await verify_rollback_chat(host)
+    async with await connect(host) as client:
+        assert (await client.message_read(history_session, limit=100))["items"] == history
+    print("AUTO ROLLBACK restored ordered inputs and completed a new Web chat", flush=True)
+
+    write_json(fail_candidate, {"commit": candidate, "change_root": True})
+    job, result = await submit(host, folder, ["submit", "--commit", candidate],
+                               "programmatic:wsl-root-mismatch", status="selected_not_started")
+    published = result["publication"]["new_root_ref"]
+    replacement = read_json(folder / "fixture-root.json")["root"]
+    assert replacement != published and host.selection.read() == replacement
+    assert "本次发布" in result["recovery"]["error"] and result["recovery"]["status"] == "skipped"
+    assert "rollback" not in result and read_json(host.launch_path) == {"commit": candidate, "root": published}
+    assert read_json(host.root / "active.json") == ready
+    print("ROOT MISMATCH preserved the newer selection and failed launch", flush=True)
+    fail_candidate.unlink()
+    write_json(host.launch_path, {"commit": candidate, "root": replacement})
+    await asyncio.to_thread(host.activate, candidate, replacement)
+
+    write_json(fail_candidate, {"commit": migration})
+    job, result = await submit(host, folder, ["submit", "--commit", migration],
+                               "programmatic:wsl-migration", status="selected_not_started")
+    assert result["preflight"]["migration_ids"] == result["publication"]["migration_ids"] == [MIGRATION]
+    assert result["recovery"]["status"] == "skipped" and "迁移" in result["recovery"]["error"]
+    assert "rollback" not in result
+    published = result["publication"]["new_root_ref"]
+    assert host.selection.read() == published and read_json(host.launch_path) == {"commit": migration, "root": published}
+    with sqlite3.connect(f"file:{host.workspace / 'migrations.sqlite3'}?mode=ro", uri=True) as ledger:
+        assert ledger.execute("SELECT value FROM wsl_rollback_probe").fetchall() == [(79,)]
+    print("MIGRATION preserved the migrated ledger and failed candidate", flush=True)
+    fail_candidate.unlink()
+    await asyncio.to_thread(run, *cli, "resume", job.stem)
+
+
 async def rejected_callback(host: Host, folder: Path, target: str) -> None:
     session = "akashic:" + uuid4().hex
     (folder / "next.json").write_text(json.dumps(["submit", "--commit", target]))
@@ -293,7 +371,8 @@ async def desktop_notice(host: Host, request_id: str) -> None:
         print("DESKTOP Windows confirmed displaying the release failure", flush=True)
 
 
-async def scenario(folder: Path, compiled: list[tuple[str, Path, Path]], probe: list[tuple[str, Path]], *, desktop: bool) -> None:
+async def scenario(folder: Path, compiled: list[tuple[str, Path, Path]], probe: list[tuple[str, Path]], *,
+                   desktop: bool, auto_rollback_only: bool = False) -> None:
     state, root, home = folder / "state", folder / "releases", folder / "home"
     for path in (state, root, home):
         path.mkdir()
@@ -318,15 +397,43 @@ async def scenario(folder: Path, compiled: list[tuple[str, Path, Path]], probe: 
     unit_root.mkdir(parents=True, exist_ok=True)
     unit_file = unit_root / unit
     hold = folder / "hold-start"
+    fail_candidate = folder / "fail-candidate.json"
+    start_check = folder / "check-start.py"
+    start_check.write_text(f"""from pathlib import Path
+from scripts.akashic_release.manifest import read_json, write_json
+from scripts.akashic_release.wsl import Host
+from bootstrap.workspace_lock import PluginPublicationLock, WorkspaceMaintenanceLock
+
+fault = Path({str(fail_candidate)!r})
+if fault.exists():
+    host = Host(Path({str(profile)!r}))
+    mode = read_json(fault)
+    launch = read_json(host.launch_path)
+    if launch['commit'] == mode['commit']:
+        if mode.get('change_root'):
+            maintenance = WorkspaceMaintenanceLock(host.workspace)
+            publication = PluginPublicationLock(host.state / 'plugin-home')
+            maintenance.acquire()
+            publication.acquire()
+            root = launch['root']
+            replacement = host.selection.commit(host.selection.components(root), expected_ref=root)
+            write_json(fault.with_name('fixture-root.json'), {{'root': replacement}})
+            publication.release()
+            maintenance.release()
+        raise SystemExit('Isolated candidate startup failure')
+""")
     unit_text = f"""[Unit]
 Description=Isolated Akashic native deployment test
 [Service]
 Type=exec
 KillMode=mixed
+Restart=always
+RestartSec=15
 WorkingDirectory={ROOT}
 Environment=HOME={home}
 Environment=PYTHONPATH={pythonpath}
 ExecStartPre=/usr/bin/test ! -e {hold}
+ExecStartPre={sys.executable} -B {start_check}
 ExecStart={sys.executable} -B -m scripts.akashic_release.wsl --profile {profile} launch
 """
     base, base_dist, base_core = compiled[0]
@@ -366,6 +473,12 @@ ExecStart={sys.executable} -B -m scripts.akashic_release.wsl --profile {profile}
         assert host.ready()["bootId"] == first["bootId"]
         hot_input = (await plugins(host))["release_probe@local"]["input_ref"]
         print("HOT active without restarting", flush=True)
+
+        if auto_rollback_only:
+            history_session = await verify_rollback_chat(host)
+            await verify_automatic_rollback(host, folder, compiled[2][0], compiled[4][0],
+                                            fail_candidate, cli, history_session)
+            return
 
         builtin, _, _ = compiled[1]
         await rejected_callback(host, folder, builtin)
@@ -410,7 +523,10 @@ ExecStart={sys.executable} -B -m scripts.akashic_release.wsl --profile {profile}
         job, failed = await submit(host, folder, ["submit", "--commit", mixed, "--plan", str(plan), "--inputs", str(folder)],
                                    "programmatic:wsl-mixed", status="selected_not_started")
         assert host.selection.read() == failed["publication"]["new_root_ref"]
-        assert "recovery" not in failed
+        assert failed["recovery"]["status"] == "skipped" and "外置" in failed["recovery"]["error"]
+        assert "rollback" not in failed and (await asyncio.to_thread(host.service))["SubState"] == "auto-restart"
+        assert read_json(host.launch_path) == {"commit": mixed, "root": failed["publication"]["new_root_ref"]}
+        print("EXTERNAL CHANGE preserved the published candidate for manual recovery", flush=True)
         if desktop:
             await desktop_notice(host, job.stem)
         # Recreate the durable launch state immediately after publication and before activation.
@@ -447,6 +563,8 @@ ExecStart={sys.executable} -B -m scripts.akashic_release.wsl --profile {profile}
         assert any("deploy-akashic" in str(message.get("content")) and "原生 WSL" in str(message.get("content"))
                    for request in requests for message in request["messages"] if message["role"] in {"system", "developer"})
         print("ROLLBACK recovered directly from a failed startup", flush=True)
+
+        await verify_automatic_rollback(host, folder, mixed, compiled[4][0], fail_candidate, cli, bad_session)
 
         # A real cleanup failure can leave the plugin journal pending. Run this case last.
         async with await connect(host) as client:
@@ -501,13 +619,15 @@ if __name__ == "__main__":
     parser.add_argument("wheels", type=Path)
     parser.add_argument("--reuse", type=Path, help="Reuse built fixture releases in an earlier evidence directory")
     parser.add_argument("--desktop", action="store_true", help="Show an actual failure notification on this Windows desktop")
+    parser.add_argument("--auto-rollback-only", action="store_true")
     args = parser.parse_args()
     folder = Path(tempfile.mkdtemp(prefix="ak-wsl-"))
     print("EVIDENCE", folder, flush=True)
     if args.reuse:
         fixture = args.reuse.resolve(strict=True)
-        commits = run("git", "-C", str(fixture / "source"), "log", "-4", "--reverse", "--format=%H").splitlines()
+        commits = run("git", "-C", str(fixture / "source"), "log", "-5", "--reverse", "--format=%H").splitlines()
         compiled = [(sha, fixture / sha / "distribution", fixture / sha / "core") for sha in commits]
     else:
         compiled = releases(folder, args.wheels.resolve(strict=True))
-    asyncio.run(scenario(folder, compiled, external(folder), desktop=args.desktop))
+    asyncio.run(scenario(folder, compiled, external(folder), desktop=args.desktop,
+                         auto_rollback_only=args.auto_rollback_only))
